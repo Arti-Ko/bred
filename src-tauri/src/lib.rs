@@ -15,6 +15,17 @@ use tauri::{Emitter, Manager};
 
 use crate::{app::App, domain::Id, net::Notice};
 
+/// Причина, по которой приложение не смогло подняться.
+///
+/// Раньше ошибка запуска летела из `setup` наружу и превращалась в abort —
+/// человек видел отчёт о падении вместо объяснения. Теперь окно открывается
+/// всегда, а причина показывается в интерфейсе.
+static STARTUP_ERROR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+pub fn startup_error() -> Option<String> {
+    STARTUP_ERROR.get().cloned()
+}
+
 /// Имя события, по которому UI слушает изменения.
 const NOTICE_EVENT: &str = "bred://notice";
 
@@ -64,6 +75,44 @@ impl From<Notice> for UiNotice {
     }
 }
 
+/// Поднимает хранилище, личность и сеть. Ошибка здесь не должна ронять окно:
+/// приложение локальное, и показать историю оно обязано даже когда что-то
+/// пошло не так.
+fn start_core(handle: &tauri::AppHandle) -> anyhow::Result<()> {
+    // BRED_DATA_DIR позволяет держать несколько независимых профилей:
+    // без него два экземпляра на одной машине подхватили бы один ключ
+    // и оказались бы одним и тем же узлом.
+    let data_dir = match std::env::var_os("BRED_DATA_DIR") {
+        Some(custom) => std::path::PathBuf::from(custom),
+        None => handle.path().app_data_dir()?,
+    };
+    let db_path = data_dir.join("bred.sqlite");
+    tracing::info!(dir = %data_dir.display(), "каталог данных");
+
+    let handle = handle.clone();
+    tauri::async_runtime::block_on(async move {
+        let (application, mut notices) = App::start(&db_path).await?;
+
+        // Уборка при запуске: файлы могли осиротеть, пока приложение
+        // было закрыто (например, автор удалил сообщение).
+        let janitor = application.clone();
+        handle.manage(application);
+        tauri::async_runtime::spawn(async move {
+            if let Err(err) = janitor.collect_garbage().await {
+                tracing::debug!(%err, "уборка вложений не удалась");
+            }
+        });
+
+        let emitter = handle.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some(notice) = notices.recv().await {
+                let _ = emitter.emit(NOTICE_EVENT, UiNotice::from(notice));
+            }
+        });
+        anyhow::Ok(())
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tracing_subscriber::fmt()
@@ -80,38 +129,10 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
             let handle = app.handle().clone();
-            // BRED_DATA_DIR позволяет держать несколько независимых профилей:
-            // без него два экземпляра на одной машине подхватили бы один ключ
-            // и оказались бы одним и тем же узлом.
-            let data_dir = match std::env::var_os("BRED_DATA_DIR") {
-                Some(custom) => std::path::PathBuf::from(custom),
-                None => handle.path().app_data_dir()?,
-            };
-            let db_path = data_dir.join("bred.sqlite");
-            tracing::info!(dir = %data_dir.display(), "каталог данных");
-
-            tauri::async_runtime::block_on(async move {
-                let (application, mut notices) = App::start(&db_path).await?;
-                let janitor = application.clone();
-                handle.manage(application);
-
-                // Уборка при запуске: файлы могли осиротеть, пока приложение
-                // было закрыто (например, автор удалил сообщение).
-                tauri::async_runtime::spawn(async move {
-                    if let Err(err) = janitor.collect_garbage().await {
-                        tracing::debug!(%err, "уборка вложений не удалась");
-                    }
-                });
-
-                let emitter = handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    while let Some(notice) = notices.recv().await {
-                        let _ = emitter.emit(NOTICE_EVENT, UiNotice::from(notice));
-                    }
-                });
-                anyhow::Ok(())
-            })?;
-
+            if let Err(err) = start_core(&handle) {
+                tracing::error!(%err, "не удалось поднять ядро");
+                let _ = STARTUP_ERROR.set(format!("{err:#}"));
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -152,5 +173,9 @@ pub fn run() {
             commands::media_stream,
         ])
         .run(tauri::generate_context!())
-        .expect("не удалось запустить БРЕД");
+        .unwrap_or_else(|err| {
+            // Сюда попадаем, только если не удалось создать само окно.
+            tracing::error!(%err, "БРЕД не смог открыть окно");
+            std::process::exit(1);
+        });
 }

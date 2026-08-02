@@ -55,7 +55,7 @@ impl Store {
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.execute_batch(schema::SCHEMA)?;
+        schema::migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             me: Mutex::new(Id::ZERO),

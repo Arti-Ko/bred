@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use super::model::{AttachmentRow, MessageRow, ReactionRow, ReplyPreview};
 use crate::domain::Id;
 
-pub const SCHEMA: &str = r#"
+const BASE: &str = r#"
 CREATE TABLE IF NOT EXISTS settings (
     k TEXT PRIMARY KEY,
     v BLOB NOT NULL
@@ -124,6 +124,40 @@ CREATE TABLE IF NOT EXISTS reads (
     read_lamport  INTEGER NOT NULL DEFAULT 0
 );
 "#;
+
+/// Приведение базы к текущей схеме.
+///
+/// `CREATE TABLE IF NOT EXISTS` создаёт только отсутствующие таблицы и **не
+/// добавляет колонки в уже существующие**. Без этого шага любая база от
+/// прошлой версии роняет запуск на первом же запросе с новой колонкой —
+/// именно так и падало приложение после обновления.
+pub fn migrate(conn: &Connection) -> Result<()> {
+    conn.execute_batch(BASE)?;
+
+    // Колонки, появившиеся после первых сборок. Каждая новая правка схемы —
+    // ещё одна строка здесь, а не молчаливое изменение BASE.
+    add_column(conn, "spaces", "direct", "BLOB")?;
+    add_column(conn, "peers", "avatar", "BLOB")?;
+    add_column(conn, "peers", "dh", "BLOB")?;
+
+    Ok(())
+}
+
+/// Добавляет колонку, если её ещё нет. SQLite не умеет `ADD COLUMN IF NOT
+/// EXISTS`, поэтому сверяемся со схемой сами.
+fn add_column(conn: &Connection, table: &str, column: &str, kind: &str) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let present = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .filter_map(Result::ok)
+        .any(|name| name == column);
+
+    if !present {
+        conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))?;
+        tracing::info!(table, column, "схема базы дополнена");
+    }
+    Ok(())
+}
 
 const MESSAGE_COLUMNS: &str = "
     m.id, m.channel, m.author, COALESCE(p.nick, ''), m.body, m.ts, m.lamport,
@@ -332,4 +366,79 @@ fn attach_files(conn: &Connection, rows: &mut [MessageRow]) -> Result<()> {
 
 fn opt_id(raw: Option<Vec<u8>>) -> Option<Id> {
     raw.and_then(|b| Id::from_slice(&b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// База, созданная ранней версией: часть колонок ещё не существует.
+    fn legacy() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE spaces (id BLOB PRIMARY KEY, name TEXT NOT NULL, key BLOB NOT NULL);
+             CREATE TABLE peers (id BLOB NOT NULL, space BLOB NOT NULL, nick TEXT,
+                                 last_seen INTEGER NOT NULL DEFAULT 0,
+                                 PRIMARY KEY (id, space));",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn columns(conn: &Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect()
+    }
+
+    #[test]
+    fn old_database_gains_missing_columns() {
+        let conn = legacy();
+        migrate(&conn).unwrap();
+
+        assert!(columns(&conn, "spaces").contains(&"direct".to_string()));
+        assert!(columns(&conn, "peers").contains(&"avatar".to_string()));
+        assert!(columns(&conn, "peers").contains(&"dh".to_string()));
+    }
+
+    #[test]
+    fn query_that_used_to_crash_now_works() {
+        let conn = legacy();
+        migrate(&conn).unwrap();
+        // Ровно тот запрос, на котором приложение падало после обновления.
+        conn.prepare("SELECT id, name, key, direct FROM spaces ORDER BY rowid")
+            .expect("запрос обязан выполняться на старой базе");
+    }
+
+    #[test]
+    fn migration_is_idempotent() {
+        let conn = legacy();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(
+            columns(&conn, "peers")
+                .iter()
+                .filter(|c| *c == "dh")
+                .count(),
+            1,
+            "повторный прогон не должен дублировать колонки"
+        );
+    }
+
+    #[test]
+    fn fresh_database_gets_the_full_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        for table in ["events", "messages", "channels", "emojis", "forks", "blobs"] {
+            assert!(
+                !columns(&conn, table).is_empty(),
+                "таблица {table} должна создаваться с нуля"
+            );
+        }
+    }
 }

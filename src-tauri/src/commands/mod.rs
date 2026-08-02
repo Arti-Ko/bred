@@ -35,7 +35,14 @@ pub struct NetStatus {
 }
 
 #[tauri::command]
-pub fn bootstrap(app: State<'_, Arc<App>>) -> Answer<Bootstrap> {
+pub fn bootstrap(handle: tauri::AppHandle) -> Answer<Bootstrap> {
+    use tauri::Manager;
+
+    // Ядро могло не подняться — тогда честно отдаём причину, а не молчим.
+    let Some(app) = handle.try_state::<Arc<App>>() else {
+        return Err(crate::startup_error().unwrap_or_else(|| "ядро не запустилось".to_string()));
+    };
+
     Ok(Bootstrap {
         me: app.me(),
         nick: app.nick(),
