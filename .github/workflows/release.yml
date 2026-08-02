@@ -81,3 +81,55 @@ jobs:
           releaseDraft: false
           prerelease: false
           args: --target ${{ matrix.target }}
+
+  # Манифест обновления собираем отдельным шагом, а не в матрице: три задачи
+  # писали бы один и тот же файл наперегонки, и он терялся.
+  manifest:
+    name: Манифест обновления
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Собрать latest.json
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          BASE="https://github.com/$REPO/releases/download/$TAG"
+          mkdir manifest && cd manifest
+          gh release download "$TAG" --repo "$REPO" --pattern '*.sig'
+
+          # Имена файлов теряют кириллицу из названия приложения, поэтому
+          # ищем по суффиксу, а не по полному имени.
+          sig() { cat "$(ls | grep -- "$1")"; }
+          url() { echo "$BASE/$(ls | grep -- "$1" | sed 's/\.sig$//')"; }
+
+          cat > latest.json <<JSON
+          {
+            "version": "$VERSION",
+            "notes": "Подробности — в описании релиза $TAG.",
+            "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "platforms": {
+              "darwin-aarch64": {
+                "signature": "$(sig 'aarch64.app.tar.gz.sig')",
+                "url": "$(url 'aarch64.app.tar.gz.sig')"
+              },
+              "darwin-x86_64": {
+                "signature": "$(sig 'x64.app.tar.gz.sig')",
+                "url": "$(url 'x64.app.tar.gz.sig')"
+              },
+              "windows-x86_64": {
+                "signature": "$(sig 'x64-setup.exe.sig')",
+                "url": "$(url 'x64-setup.exe.sig')"
+              }
+            }
+          }
+          JSON
+
+          python3 -c "import json,sys; json.load(open('latest.json'))" \
+            || { echo 'манифест невалиден'; cat latest.json; exit 1; }
+
+          gh release upload "$TAG" latest.json --repo "$REPO" --clobber
+          echo "манифест опубликован"
