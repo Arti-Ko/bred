@@ -1,0 +1,48 @@
+# Проверки на каждый push и pull request.
+#
+# Гоняем только на Linux: тесты не трогают ни камеру, ни микрофон, ни окно —
+# им достаточно любой машины, а сборка под три платформы нужна лишь для релиза.
+
+name: Проверки
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # Системные зависимости webkit нужны даже для проверки типов Rust:
+      # крейт tauri без них не собирается.
+      - name: Зависимости системы
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev patchelf libxdo-dev
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm check
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+      - run: cargo test --manifest-path src-tauri/Cargo.toml

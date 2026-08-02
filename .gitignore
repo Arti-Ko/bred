@@ -1,0 +1,8 @@
+node_modules/
+dist/
+src-tauri/target/
+.DS_Store
+*.log
+
+# Приватный ключ подписи обновлений — только в секретах CI, никогда в репозитории
+src-tauri/updater.key

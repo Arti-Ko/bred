@@ -1,0 +1,55 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "БРЕД",
+  "version": "0.1.0",
+  "identifier": "dev.bred.app",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "БРЕД",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 720,
+        "minHeight": 480,
+        "theme": "Dark",
+        "backgroundColor": "#0A0A0A",
+        "label": "main"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": [
+      "app",
+      "dmg",
+      "nsis",
+      "msi"
+    ],
+    "icon": [
+      "icons/icon.png"
+    ],
+    "category": "SocialNetworking",
+    "shortDescription": "Мессенджер без сервера",
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDVDQUNFQzk4OUZFRDc3MTAKUldRUWQrMmZtT3lzWEw1VHFZMStoYnpkaDZqQWZGVlZqUUxvTmxlL1NmZG0zV1Q2b1RYc1E5elUK",
+      "endpoints": [
+        "https://github.com/Arti-Ko/bred/releases/latest/download/latest.json"
+      ],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

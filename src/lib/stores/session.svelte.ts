@@ -1,0 +1,654 @@
+// Состояние сессии. Один объект на приложение: панелей мало, а связей между
+// ними много, и таскать пропсы через четыре уровня было бы дороже.
+
+import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
+import {
+  isPermissionGranted,
+  requestPermission,
+  sendNotification,
+} from '@tauri-apps/plugin-notification';
+
+import {
+  api,
+  errorText,
+  onNotice,
+  type Attachment,
+  type ChannelRow,
+  type Id,
+  type MemberRow,
+  type EmojiRow,
+  type MessageRow,
+  type Notice,
+  type SpaceRow,
+} from '../ipc';
+import { call } from './call.svelte';
+import { forgetPreviews, shouldAutoFetch } from '../previews';
+import { updates } from './updates.svelte';
+
+/** Сколько живёт отметка «печатает…» без подтверждения. */
+const TYPING_TTL = 4000;
+/** Окно склейки обновлений: при досинхронизации событий прилетают сотни. */
+const REFRESH_WINDOW = 60;
+/** Должно совпадать с `app::PAGE` в ядре. */
+const PAGE = 200;
+
+export class Session {
+  me = $state<Id>('');
+  nick = $state('');
+  endpoint = $state('');
+  online = $state(false);
+
+  spaces = $state<SpaceRow[]>([]);
+  channels = $state<ChannelRow[]>([]);
+  messages = $state<MessageRow[]>([]);
+  members = $state<MemberRow[]>([]);
+
+  spaceId = $state<Id | null>(null);
+  channelId = $state<Id | null>(null);
+
+  /** Кто сейчас печатает в открытом канале. */
+  typing = $state<string[]>([]);
+  /** Последняя строка для статус-бара: ошибки и подтверждения. */
+  status = $state('');
+  /** Сообщение, на которое отвечаем. */
+  replyTo = $state<MessageRow | null>(null);
+  /** Файлы, прикреплённые к черновику и ещё не отправленные. */
+  pending = $state<Attachment[]>([]);
+  /** Кто в каком голосовом канале: [участник, канал]. */
+  voice = $state<Array<[Id, Id]>>([]);
+  /** Свои эмодзи и стикеры текущего пространства. */
+  emojis = $state<EmojiRow[]>([]);
+  /** Открытая ветка: корень и все ответы. */
+  thread = $state<MessageRow[]>([]);
+  threadRoot = $state<Id | null>(null);
+  /** Есть ли что подгружать выше по ленте. */
+  hasOlder = $state(false);
+  loadingOlder = $state(false);
+
+  #canNotify = false;
+  #typingSeen = new Map<Id, { nick: string; at: number }>();
+  #refreshTimer: number | null = null;
+  #typingTimer: number | null = null;
+
+  get channel(): ChannelRow | null {
+    return this.channels.find((c) => c.id === this.channelId) ?? null;
+  }
+
+  get space(): SpaceRow | null {
+    return this.spaces.find((s) => s.id === this.spaceId) ?? null;
+  }
+
+  /** Обычные пространства и личные переписки показываются раздельно. */
+  get rooms(): SpaceRow[] {
+    return this.spaces.filter((s) => !s.direct);
+  }
+
+  get directs(): SpaceRow[] {
+    return this.spaces.filter((s) => s.direct);
+  }
+
+  /** Быстрый доступ к своим эмодзи по имени — для разбора `:имя:`. */
+  get emojiMap(): Record<string, EmojiRow> {
+    return Object.fromEntries(this.emojis.map((e) => [e.name, e]));
+  }
+
+  /** Открыть личную переписку с участником. */
+  async openDirect(peer: Id): Promise<void> {
+    if (peer === this.me) return;
+    try {
+      const space = await api.openDirect(peer);
+      this.spaces = await api.listSpaces();
+      await this.selectSpace(space);
+    } catch (error) {
+      this.status = errorText(error);
+    }
+  }
+
+  /** Добавить свой эмодзи или стикер. */
+  async addEmoji(name: string, sticker: boolean): Promise<void> {
+    if (!this.spaceId) {
+      this.status = 'сначала выберите пространство';
+      return;
+    }
+    if (!name) {
+      this.status = sticker ? 'нужно имя: /стикер котик' : 'нужно имя: /эмодзи паррот';
+      return;
+    }
+    try {
+      const picked = await openFileDialog({
+        multiple: false,
+        title: sticker ? 'Картинка стикера' : 'Картинка эмодзи',
+        filters: [{ name: 'Картинки', extensions: ['png', 'gif', 'webp', 'jpg', 'jpeg'] }],
+      });
+      if (!picked) return;
+      await api.addEmoji(this.spaceId, name, Array.isArray(picked) ? picked[0] : picked, sticker);
+      await this.#loadEmojis();
+      this.status = `добавлено :${name}:`;
+    } catch (error) {
+      this.status = errorText(error);
+    }
+  }
+
+  async #loadEmojis(): Promise<void> {
+    if (!this.spaceId) return;
+    this.emojis = await api.listEmojis(this.spaceId).catch(() => []);
+    // Картинки эмодзи нужны сразу: без них в тексте будут голые `:имена:`.
+    for (const emoji of this.emojis) {
+      await api.downloadAttachment(this.spaceId, emoji.hash).catch(() => undefined);
+    }
+  }
+
+  /** Кто сидит в конкретном голосовом канале. */
+  voiceMembers(channel: Id): string[] {
+    return this.voice
+      .filter(([, room]) => room === channel)
+      .map(([who]) => this.members.find((m) => m.id === who)?.nick ?? who.slice(0, 8));
+  }
+
+  get unreadTotal(): number {
+    return this.channels.reduce((sum, c) => sum + c.unread, 0);
+  }
+
+  /** Каналы, сгруппированные по категориям, в порядке появления. */
+  get grouped(): Array<{ category: string; items: ChannelRow[] }> {
+    const order: string[] = [];
+    const map = new Map<string, ChannelRow[]>();
+    for (const channel of this.channels) {
+      const key = channel.voice ? 'голос' : channel.category || 'общее';
+      if (!map.has(key)) {
+        map.set(key, []);
+        order.push(key);
+      }
+      map.get(key)!.push(channel);
+    }
+    return order.map((category) => ({ category, items: map.get(category)! }));
+  }
+
+  /** Разрешение на уведомления спрашиваем один раз при старте. */
+  async #setupNotifications(): Promise<void> {
+    try {
+      this.#canNotify = await isPermissionGranted();
+      if (!this.#canNotify) {
+        this.#canNotify = (await requestPermission()) === 'granted';
+      }
+    } catch {
+      this.#canNotify = false;
+    }
+  }
+
+  /** Сообщение из фона — повод дёрнуть человека, но только чужое. */
+  async #notify(event: Id): Promise<void> {
+    if (!this.#canNotify || document.hasFocus()) return;
+    try {
+      const message = await api.getMessage(event);
+      if (!message || message.author === this.me || message.deleted) return;
+      const channel = this.channels.find((c) => c.id === message.channel);
+      sendNotification({
+        title: channel ? `#${channel.name} · ${message.nick}` : message.nick,
+        body: message.body.slice(0, 160) || 'вложение',
+      });
+    } catch {
+      // Уведомление — приятный бонус, ронять из-за него ничего не будем.
+    }
+  }
+
+  async init(): Promise<void> {
+    try {
+      const boot = await api.bootstrap();
+      this.me = boot.me;
+      this.nick = boot.nick;
+      this.endpoint = boot.endpoint;
+      this.spaces = boot.spaces;
+
+      await onNotice((notice) => this.#onNotice(notice));
+      void this.#setupNotifications();
+      void this.#pollNet();
+
+      if (boot.spaces.length > 0) {
+        await this.selectSpace(boot.spaces[0].id);
+      }
+    } catch (error) {
+      this.status = errorText(error);
+    }
+  }
+
+  async selectSpace(space: Id): Promise<void> {
+    this.spaceId = space;
+    this.channelId = null;
+    this.messages = [];
+    await this.#loadChannels();
+    await this.#loadMembers();
+    await this.#loadVoice();
+    await this.#loadEmojis();
+
+    const first = this.channels.find((c) => !c.voice);
+    if (first) await this.selectChannel(first.id);
+  }
+
+  async selectChannel(channel: Id): Promise<void> {
+    this.channelId = channel;
+    this.replyTo = null;
+    this.closeThread();
+    await this.#loadMessages();
+    await api.markRead(channel).catch(() => undefined);
+    await this.#loadChannels();
+  }
+
+  async send(body: string): Promise<void> {
+    const text = body.trim();
+    if (!this.spaceId || !this.channelId) return;
+    if (!text && this.pending.length === 0) return;
+
+    // Команды набираются в том же поле — отдельного режима нет.
+    if (text.startsWith('/')) {
+      await this.#runCommand(text);
+      return;
+    }
+
+    try {
+      await api.sendMessage(
+        this.spaceId,
+        this.channelId,
+        text,
+        this.replyTo?.id ?? null,
+        // Открытая ветка перехватывает ввод: писать «в канал», глядя в ветку,
+        // почти всегда не то, чего человек хотел.
+        this.threadRoot,
+        this.pending,
+      );
+      this.replyTo = null;
+      this.pending = [];
+      this.status = '';
+    } catch (error) {
+      this.status = errorText(error);
+    }
+  }
+
+  /** Поставить картинку профиля. Годится и анимированный GIF. */
+  async setAvatar(): Promise<void> {
+    try {
+      const picked = await openFileDialog({
+        multiple: false,
+        title: 'Картинка профиля',
+        filters: [{ name: 'Картинки', extensions: ['png', 'jpg', 'jpeg', 'gif', 'webp'] }],
+      });
+      if (!picked) return;
+      await api.setAvatar(Array.isArray(picked) ? picked[0] : picked);
+      await this.#loadMembers();
+      this.status = 'аватар обновлён';
+    } catch (error) {
+      this.status = errorText(error);
+    }
+  }
+
+  /** Скачиваем чужие аватары сами: иначе в списке будут пустые квадраты. */
+  async #prefetchAvatars(): Promise<void> {
+    if (!this.spaceId) return;
+    for (const member of this.members) {
+      if (member.avatar) {
+        await api.downloadAttachment(this.spaceId, member.avatar).catch(() => undefined);
+      }
+    }
+  }
+
+  /** Выбрать файлы и подготовить их к отправке. */
+  async attach(): Promise<void> {
+    if (!this.spaceId) {
+      this.status = 'сначала выберите пространство';
+      return;
+    }
+    try {
+      const picked = await openFileDialog({ multiple: true, title: 'Что отправить' });
+      if (!picked) return;
+      const paths = Array.isArray(picked) ? picked : [picked];
+
+      const prepared: Attachment[] = [];
+      for (const path of paths) {
+        prepared.push(await api.attachFile(path));
+      }
+      this.pending = [...this.pending, ...prepared];
+      this.status = `прикреплено: ${prepared.map((a) => a.name).join(', ')}`;
+    } catch (error) {
+      this.status = errorText(error);
+    }
+  }
+
+  dropAttachment(hash: Id): void {
+    this.pending = this.pending.filter((a) => a.hash !== hash);
+  }
+
+  /** Скачать вложение у того, у кого оно есть. */
+  async download(hash: Id): Promise<void> {
+    if (!this.spaceId) return;
+    this.status = 'качаем…';
+    try {
+      const path = await api.downloadAttachment(this.spaceId, hash);
+      this.status = `сохранено: ${path}`;
+      await this.#loadMessages();
+    } catch (error) {
+      this.status = errorText(error);
+    }
+  }
+
+  /** Войти в голосовой канал. Он же комната звонка. */
+  async joinVoice(channel: Id, withVideo = false): Promise<void> {
+    if (!this.spaceId) return;
+    if (call.active) await call.leave();
+    await call.join(this.spaceId, channel, withVideo);
+    if (call.status) this.status = call.status;
+    await this.#loadVoice();
+  }
+
+  async toggleReaction(message: MessageRow, emoji: string): Promise<void> {
+    if (!this.spaceId) return;
+    const mine = message.reactions.some((r) => r.emoji === emoji && r.mine);
+    try {
+      await api.react(this.spaceId, message.id, emoji, mine);
+    } catch (error) {
+      this.status = errorText(error);
+    }
+  }
+
+  async invite(): Promise<void> {
+    if (!this.spaceId) return;
+    try {
+      const ticket = await api.spaceInvite(this.spaceId);
+      await navigator.clipboard.writeText(ticket);
+      this.status = 'ссылка-приглашение скопирована в буфер';
+    } catch (error) {
+      this.status = errorText(error);
+    }
+  }
+
+  notifyTyping(): void {
+    if (this.spaceId && this.channelId) {
+      void api.typing(this.spaceId, this.channelId).catch(() => undefined);
+    }
+  }
+
+  // ── команды ───────────────────────────────────────────────────────────────
+
+  async #runCommand(line: string): Promise<void> {
+    const [command, ...rest] = line.slice(1).split(' ');
+    const argument = rest.join(' ').trim();
+    try {
+      switch (command) {
+        case 'простор':
+        case 'space':
+          if (!argument) throw new Error('нужно название: /простор Орбита');
+          await this.#refreshSpaces(await api.createSpace(argument));
+          break;
+        case 'канал':
+        case 'channel': {
+          if (!this.spaceId) throw new Error('сначала выберите пространство');
+          if (!argument) throw new Error('нужно название: /канал баги');
+          await api.createChannel(this.spaceId, argument, 'общее', false);
+          await this.#loadChannels();
+          break;
+        }
+        case 'голос':
+        case 'voice': {
+          if (!this.spaceId) throw new Error('сначала выберите пространство');
+          if (!argument) throw new Error('нужно название: /голос стендап');
+          await api.createChannel(this.spaceId, argument, 'голос', true);
+          await this.#loadChannels();
+          break;
+        }
+        case 'звонок':
+        case 'call': {
+          const room = this.channels.find((c) => c.voice && c.name === argument);
+          if (!room) throw new Error(`голосового канала «${argument}» нет`);
+          await this.joinVoice(room.id, false);
+          break;
+        }
+        case 'файл':
+        case 'file':
+          await this.attach();
+          break;
+        case 'аватар':
+        case 'avatar':
+          await this.setAvatar();
+          break;
+        case 'эмодзи':
+        case 'emoji':
+          await this.addEmoji(argument, false);
+          break;
+        case 'стикер':
+        case 'sticker':
+          await this.addEmoji(argument, true);
+          break;
+        case 'лс':
+        case 'dm': {
+          const who = this.members.find(
+            (m) => m.nick === argument || m.id.startsWith(argument),
+          );
+          if (!who) throw new Error(`не нашёл участника «${argument}»`);
+          await this.openDirect(who.id);
+          break;
+        }
+        case 'войти':
+        case 'join':
+          await this.#refreshSpaces(await api.joinSpace(argument));
+          break;
+        case 'имя':
+        case 'nick':
+          await api.setNick(argument);
+          this.nick = argument;
+          await this.#loadMembers();
+          break;
+        case 'обновление':
+        case 'update':
+          await updates.check();
+          this.status =
+            updates.stage === 'available'
+              ? `доступна версия ${updates.next} — открой настройки (^,)`
+              : updates.stage === 'current'
+                ? 'установлена последняя версия'
+                : (updates.error || 'проверяем…');
+          break;
+        case 'позвать':
+        case 'invite':
+          await this.invite();
+          break;
+        case 'покинуть':
+        case 'leave': {
+          if (!this.spaceId) throw new Error('пространство не выбрано');
+          const leaving = this.spaceId;
+          await api.leaveSpace(leaving);
+          this.spaces = await api.listSpaces();
+          this.spaceId = null;
+          this.channelId = null;
+          this.messages = [];
+          this.channels = [];
+          this.members = [];
+          if (this.spaces.length > 0) await this.selectSpace(this.spaces[0].id);
+          forgetPreviews();
+          await api.collectGarbage().catch(() => undefined);
+          this.status = 'вы вышли, история этого пространства стёрта';
+          break;
+        }
+        case 'экран':
+        case 'screen':
+          await call.toggleScreen();
+          break;
+        default:
+          throw new Error(`неизвестная команда /${command}`);
+      }
+      if (!this.status) this.status = '';
+    } catch (error) {
+      this.status = errorText(error);
+    }
+  }
+
+  async #refreshSpaces(select: Id): Promise<void> {
+    this.spaces = await api.listSpaces();
+    await this.selectSpace(select);
+  }
+
+  // ── реакция на уведомления ядра ───────────────────────────────────────────
+
+  #onNotice(notice: Notice): void {
+    switch (notice.kind) {
+      case 'applied':
+        void this.#notify(notice.event);
+        if (notice.space === this.spaceId) this.#scheduleRefresh();
+        else void this.#refreshSpaceBadges();
+        break;
+      case 'presence':
+        if (notice.space === this.spaceId) {
+          void this.#loadMembers();
+          void this.#loadVoice();
+        }
+        break;
+      case 'typing':
+        if (notice.space === this.spaceId && notice.channel === this.channelId) {
+          this.#noteTyping(notice.author, notice.nick);
+        }
+        break;
+      case 'fork': {
+        // Тихо это проглатывать нельзя: узел либо сломан, либо переписывает
+        // свою историю, и человек должен об этом узнать.
+        const who = this.members.find((m) => m.id === notice.author)?.nick ?? notice.author.slice(0, 8);
+        this.status = `внимание: ${who} выдал два разных события под одним номером — вторая версия отвергнута`;
+        break;
+      }
+      case 'net':
+        void this.#pollNet();
+        break;
+    }
+  }
+
+  /** События приходят пачками — перерисовываем один раз на окно. */
+  #scheduleRefresh(): void {
+    if (this.#refreshTimer !== null) return;
+    this.#refreshTimer = window.setTimeout(async () => {
+      this.#refreshTimer = null;
+      await this.#loadMessages();
+      await this.#reloadThread();
+      await this.#loadChannels();
+      await this.#loadEmojis();
+      // Читателем считаем только того, кто действительно смотрит на окно:
+      // иначе непрочитанное обнуляется, пока приложение висит в фоне.
+      if (this.channelId && document.hasFocus()) {
+        await api.markRead(this.channelId).catch(() => undefined);
+        await this.#loadChannels();
+      }
+    }, REFRESH_WINDOW);
+  }
+
+  #noteTyping(author: Id, nick: string): void {
+    if (author === this.me) return;
+    this.#typingSeen.set(author, { nick, at: Date.now() });
+    this.#recomputeTyping();
+
+    if (this.#typingTimer === null) {
+      this.#typingTimer = window.setInterval(() => {
+        this.#recomputeTyping();
+        if (this.#typingSeen.size === 0 && this.#typingTimer !== null) {
+          window.clearInterval(this.#typingTimer);
+          this.#typingTimer = null;
+        }
+      }, 1000);
+    }
+  }
+
+  #recomputeTyping(): void {
+    const now = Date.now();
+    for (const [id, seen] of this.#typingSeen) {
+      if (now - seen.at > TYPING_TTL) this.#typingSeen.delete(id);
+    }
+    this.typing = [...this.#typingSeen.values()].map((v) => v.nick);
+  }
+
+  async #loadChannels(): Promise<void> {
+    if (!this.spaceId) return;
+    this.channels = await api.listChannels(this.spaceId);
+  }
+
+  async #loadMessages(): Promise<void> {
+    if (!this.channelId) return;
+    const page = await api.listMessages(this.channelId);
+    this.messages = page;
+    // Полная страница означает, что выше почти наверняка есть ещё.
+    this.hasOlder = page.length >= PAGE;
+    void this.#prefetchImages(page);
+  }
+
+  /** Подгрузка вверх по курсору. Возвращает, сколько добавилось. */
+  async loadOlder(): Promise<number> {
+    if (!this.channelId || this.loadingOlder || !this.hasOlder) return 0;
+    const oldest = this.messages[0];
+    if (!oldest) return 0;
+
+    this.loadingOlder = true;
+    try {
+      const page = await api.listMessages(this.channelId, oldest.lamport);
+      this.hasOlder = page.length >= PAGE;
+      if (page.length > 0) {
+        this.messages = [...page, ...this.messages];
+        void this.#prefetchImages(page);
+      }
+      return page.length;
+    } catch (error) {
+      this.status = errorText(error);
+      return 0;
+    } finally {
+      this.loadingOlder = false;
+    }
+  }
+
+  /** Небольшие картинки тянем заранее — иначе лента дырявая до клика. */
+  async #prefetchImages(page: MessageRow[]): Promise<void> {
+    if (!this.spaceId) return;
+    for (const message of page) {
+      for (const file of message.attachments) {
+        if (shouldAutoFetch(file)) {
+          await api.downloadAttachment(this.spaceId, file.hash).catch(() => undefined);
+        }
+      }
+    }
+  }
+
+  // ── ветки ─────────────────────────────────────────────────────────────────
+
+  async openThread(root: Id): Promise<void> {
+    this.threadRoot = root;
+    this.thread = await api.listThread(root).catch(() => []);
+  }
+
+  closeThread(): void {
+    this.threadRoot = null;
+    this.thread = [];
+  }
+
+  async #reloadThread(): Promise<void> {
+    if (this.threadRoot) this.thread = await api.listThread(this.threadRoot).catch(() => []);
+  }
+
+  async #loadMembers(): Promise<void> {
+    if (!this.spaceId) return;
+    this.members = await api.listMembers(this.spaceId);
+    void this.#prefetchAvatars();
+  }
+
+  async #loadVoice(): Promise<void> {
+    if (!this.spaceId) return;
+    this.voice = await api.voiceMap(this.spaceId);
+  }
+
+  async #refreshSpaceBadges(): Promise<void> {
+    this.spaces = await api.listSpaces();
+  }
+
+  async #pollNet(): Promise<void> {
+    try {
+      const status = await api.netStatus();
+      this.online = status.online;
+      this.endpoint = status.endpoint;
+    } catch {
+      this.online = false;
+    }
+  }
+}
+
+export const session = new Session();

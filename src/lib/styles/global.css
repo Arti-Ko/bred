@@ -1,0 +1,149 @@
+@import './tokens.css';
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: var(--mono);
+  font-size: var(--text);
+  line-height: 1.5;
+  letter-spacing: 0.01em;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+  /* Текст выделяется, интерфейс — нет: случайное выделение панелей раздражает */
+  user-select: none;
+  cursor: default;
+}
+
+#app {
+  height: 100vh;
+}
+
+/* Едва заметная зернистость люминофора. Один статичный слой, не анимируется. */
+body::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  pointer-events: none;
+  opacity: 0.35;
+  background-image: radial-gradient(rgba(255, 255, 255, 0.05) 0.5px, transparent 0.5px);
+  background-size: 2px 2px;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+}
+
+input {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  outline: none;
+}
+
+/* Фокус виден всегда — приложение задумано как клавиатурное */
+:focus-visible {
+  outline: 1px solid var(--fg);
+  outline-offset: 1px;
+}
+
+.selectable {
+  user-select: text;
+  cursor: text;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--fg-faint);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--fg-dimmer);
+}
+
+/* Общие примитивы, которые повторяются во всех панелях */
+.pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.pane-head {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--gap-3);
+  padding: 5px var(--gap-4);
+  border-bottom: 1px solid var(--line);
+  color: var(--fg-dimmer);
+  font-size: var(--text-label);
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.pane-head b {
+  color: var(--fg-dim);
+  font-weight: 400;
+}
+
+.pane-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--gap-3) 0;
+}
+
+.group {
+  padding: 12px var(--gap-4) var(--gap-2);
+  color: var(--fg-faint);
+  font-size: var(--text-label);
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.group::after {
+  content: ' ────────────────────────────';
+}
+
+.rule {
+  height: 1px;
+  background: var(--line);
+  margin: var(--gap-4) 0;
+}
+
+.blink {
+  animation: blink 1.1s steps(1) infinite;
+}
+
+@keyframes blink {
+  0%,
+  49% {
+    opacity: 1;
+  }
+  50%,
+  100% {
+    opacity: 0;
+  }
+}
