@@ -41,6 +41,10 @@ export class Session {
   nick = $state('');
   endpoint = $state('');
   online = $state(false);
+  /** Ретранслятор, внешний адрес и соседи — для раздела «сеть» в настройках. */
+  relay = $state<string | null>(null);
+  external = $state<string | null>(null);
+  neighbors = $state(0);
 
   spaces = $state<SpaceRow[]>([]);
   channels = $state<ChannelRow[]>([]);
@@ -791,6 +795,9 @@ export class Session {
       const status = await api.netStatus();
       this.online = status.online;
       this.endpoint = status.endpoint;
+      this.relay = status.relay;
+      this.external = status.external;
+      this.neighbors = status.neighbors;
     } catch {
       this.online = false;
     }

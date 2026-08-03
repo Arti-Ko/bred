@@ -105,6 +105,12 @@ export interface NetStatus {
   endpoint: string;
   online: boolean;
   spaces: number;
+  /** Ретранслятор, через который нас видно снаружи. */
+  relay: string | null;
+  /** Внешний адрес, каким нас видит интернет. */
+  external: string | null;
+  /** Живые соседи во всех пространствах. */
+  neighbors: number;
 }
 
 export type Notice =

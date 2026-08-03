@@ -32,6 +32,13 @@ pub struct NetStatus {
     pub endpoint: String,
     pub online: bool,
     pub spaces: usize,
+    /// Ретранслятор, через который нас видно снаружи. Пусто — беда: связь
+    /// останется только внутри своей сети.
+    pub relay: Option<String>,
+    /// Внешний адрес, каким нас видит интернет.
+    pub external: Option<String>,
+    /// Живые соседи во всех пространствах.
+    pub neighbors: usize,
 }
 
 #[tauri::command]
@@ -57,6 +64,9 @@ pub fn net_status(app: State<'_, Arc<App>>) -> Answer<NetStatus> {
         endpoint: app.net.endpoint_id().to_string(),
         online: app.net.reachable(),
         spaces: app.ctx.space_list().len(),
+        relay: app.net.relay_now(),
+        external: app.net.external_now(),
+        neighbors: app.net.neighbor_count(),
     })
 }
 

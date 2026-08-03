@@ -108,6 +108,18 @@
       <span class="k">состояние</span>
       <span class="v">{session.online ? 'в сети' : 'поднимается'}</span>
     </div>
+    <div class="row">
+      <span class="k">ретранслятор</span>
+      <span class="v selectable">{session.relay ?? 'нет — связь только внутри своей сети'}</span>
+    </div>
+    <div class="row">
+      <span class="k">внешний адрес</span>
+      <span class="v selectable">{session.external ?? 'не определён'}</span>
+    </div>
+    <div class="row">
+      <span class="k">соседей на связи</span>
+      <span class="v">{session.neighbors}</span>
+    </div>
 
     <div class="group">обновление</div>
     <div class="row">
