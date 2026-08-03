@@ -190,6 +190,7 @@ pub fn run() {
             commands::list_messages,
             commands::list_thread,
             commands::attachment_url,
+            commands::ensure_attachment,
             commands::save_attachment,
             commands::collect_garbage,
             commands::get_message,

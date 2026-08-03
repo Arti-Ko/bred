@@ -1,6 +1,6 @@
 [package]
 name = "bred"
-version = "0.1.8"
+version = "0.1.9"
 description = "БРЕД — Быстрая Ретрансляция Электронных Данных"
 edition = "2021"
 rust-version = "1.82"

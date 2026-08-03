@@ -84,6 +84,21 @@ pub fn list_thread(app: State<'_, Arc<App>>, root: Id) -> Answer<Vec<MessageRow>
     app.thread(root).map_err(fail)
 }
 
+/// Убедиться, что файл есть на диске, и вернуть его адрес.
+///
+/// Одной командой, а не двумя: иначе интерфейс вставлял адрес в картинку
+/// раньше, чем файл успевал скачаться, получал 404 и рисовал битую картинку —
+/// а повторить попытку было некому.
+#[tauri::command]
+pub async fn ensure_attachment(
+    app: State<'_, Arc<App>>,
+    space: SpaceId,
+    hash: Id,
+) -> Answer<String> {
+    app.download(space, hash).await.map_err(fail)?;
+    Ok(app.attachment_url(hash))
+}
+
 /// Адрес вложения для показа в ленте. Файл отдаётся схемой `bredfile://`,
 /// а не через мост команд: сырой ответ на десятки мегабайт рвал IPC.
 #[tauri::command]

@@ -24,18 +24,42 @@ export function shouldAutoFetch(file: AttachmentRow): boolean {
   return isViewable(file) && !file.local && file.size <= AUTO_FETCH_LIMIT;
 }
 
-/** Адрес картинки, которая уже лежит на диске. */
-export async function previewUrl(hash: Id): Promise<string | null> {
+/**
+ * Идущие сейчас загрузки: иначе один и тот же файл тянулся бы по разу на
+ * каждый компонент, который его показывает.
+ */
+const inflight = new Map<Id, Promise<string | null>>();
+
+/**
+ * Адрес картинки. Если файла ещё нет — сначала забираем его у того, у кого он
+ * есть, и только потом отдаём адрес.
+ *
+ * Раньше адрес отдавался сразу: у получателя файл ещё не был скачан, браузер
+ * получал 404 и рисовал вопросительный знак — навсегда, повторять было некому.
+ */
+export async function previewUrl(hash: Id, space: Id | null): Promise<string | null> {
   const ready = cache.get(hash);
   if (ready) return ready;
+  if (!space) return null;
 
-  try {
-    const url = await api.attachmentUrl(hash);
-    cache.set(hash, url);
-    return url;
-  } catch {
-    return null;
-  }
+  const running = inflight.get(hash);
+  if (running) return running;
+
+  const task = (async () => {
+    try {
+      const url = await api.ensureAttachment(space, hash);
+      cache.set(hash, url);
+      return url;
+    } catch {
+      // Ещё не у кого забрать — попробуем снова, когда человек появится.
+      return null;
+    } finally {
+      inflight.delete(hash);
+    }
+  })();
+
+  inflight.set(hash, task);
+  return task;
 }
 
 export function forgetPreviews(): void {

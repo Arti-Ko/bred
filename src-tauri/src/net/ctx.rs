@@ -276,6 +276,7 @@ mod tests {
     fn presence(author: u8, ts: i64) -> Presence {
         Presence {
             author: Id([author; 32]),
+            addr: Vec::new(),
             nick: "кто-то".into(),
             voice: Some(Id([9u8; 32])),
             ts,

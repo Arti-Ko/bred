@@ -30,6 +30,21 @@ const KEYFRAME_EVERY = 60;
 
 export type TrackKind = 'audio' | 'video' | 'screen' | 'screen-audio';
 
+/**
+ * Закрыть кодировщик или декодер, чем бы это ни кончилось.
+ *
+ * Повторный `close()` бросает исключение, и оно уносит с собой всё, что должно
+ * было выполниться дальше. Из-за этого не срабатывала кнопка «выйти» и не
+ * включалась камера: остановка захвата падала на середине.
+ */
+function shut(codec: { state: string; close(): void } | null | undefined): void {
+  try {
+    if (codec && codec.state !== 'closed') codec.close();
+  } catch {
+    // Уже закрыт или закрывается — ровно то, чего мы и хотели.
+  }
+}
+
 export interface IncomingFrame {
   author: string;
   track: TrackKind;
@@ -142,9 +157,17 @@ export class Capture {
 
   stop(): void {
     this.stopScreen();
-    for (const stop of this.#stopFns.splice(0)) stop();
-    this.#audioEncoder?.close();
-    this.#videoEncoder?.close();
+    // Каждый шаг остановки — независимый: падение одного не должно оставлять
+    // человека с включённой камерой и в звонке, из которого не выйти.
+    for (const stop of this.#stopFns.splice(0)) {
+      try {
+        stop();
+      } catch {
+        // Узел уже отключён — не повод бросать остальное.
+      }
+    }
+    shut(this.#audioEncoder);
+    shut(this.#videoEncoder);
     this.#audioEncoder = null;
     this.#videoEncoder = null;
     this.#stream?.getTracks().forEach((track) => track.stop());
@@ -228,7 +251,7 @@ export class Capture {
     keepStop(() => {
       node.disconnect();
       source.disconnect();
-      encoder.close();
+      shut(encoder);
       void context.close();
     });
     return encoder;
@@ -273,11 +296,16 @@ export class Capture {
   }
 
   stopScreen(): void {
-    this.#screenStop?.();
-    this.#screenAudioStop?.();
+    for (const stop of [this.#screenStop, this.#screenAudioStop]) {
+      try {
+        stop?.();
+      } catch {
+        // см. stop(): шаги независимы
+      }
+    }
     this.#screenStop = null;
     this.#screenAudioStop = null;
-    this.#screenEncoder?.close();
+    shut(this.#screenEncoder);
     this.#screenEncoder = null;
     this.#screenStream?.getTracks().forEach((t) => t.stop());
     this.#screenStream = null;
@@ -427,14 +455,14 @@ export class Playback {
 
   /** Забыть участника: декодеры на ушедших иначе копятся всю встречу. */
   forget(author: string): void {
-    this.#audio.get(author)?.close();
+    shut(this.#audio.get(author));
     this.#audio.delete(author);
     this.#nextPlay.delete(author);
     this.#gains.get(author)?.disconnect();
     this.#gains.delete(author);
     for (const track of ['video', 'screen']) {
       const key = `${track}:${author}`;
-      this.#video.get(key)?.close();
+      shut(this.#video.get(key));
       this.#video.delete(key);
       this.#canvases.delete(key);
     }
@@ -468,8 +496,8 @@ export class Playback {
       this.#watch = null;
     }
     this.#lastFrame.clear();
-    for (const decoder of this.#audio.values()) decoder.close();
-    for (const decoder of this.#video.values()) decoder.close();
+    for (const decoder of this.#audio.values()) shut(decoder);
+    for (const decoder of this.#video.values()) shut(decoder);
     for (const node of this.#gains.values()) node.disconnect();
     this.#audio.clear();
     this.#video.clear();
@@ -597,7 +625,7 @@ export class Playback {
       canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
 
       if (key.startsWith('screen:')) {
-        this.#video.get(key)?.close();
+        shut(this.#video.get(key));
         this.#video.delete(key);
         this.#canvases.delete(key);
       }

@@ -44,7 +44,7 @@
   $effect(() => {
     for (const emoji of session.emojis) {
       if (!glyphs[emoji.name]) {
-        void previewUrl(emoji.hash).then((url) => {
+        void previewUrl(emoji.hash, session.spaceId).then((url) => {
           if (url) glyphs = { ...glyphs, [emoji.name]: url };
         });
       }
@@ -53,9 +53,11 @@
 
   $effect(() => {
     for (const file of message.attachments) {
-      if (file.local && isViewable(file) && !asked.has(file.hash)) {
+      // Не ждём флага «уже на диске»: previewUrl сам заберёт файл у того,
+      // у кого он есть. Раньше получатель не видел картинку вовсе.
+      if (isViewable(file) && !asked.has(file.hash)) {
         asked.add(file.hash);
-        void previewUrl(file.hash).then((url) => {
+        void previewUrl(file.hash, session.spaceId).then((url) => {
           if (url) previews = { ...previews, [file.hash]: url };
         });
       }

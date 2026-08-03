@@ -24,7 +24,7 @@
       if (member.avatar && !requested.has(member.avatar)) {
         const hash = member.avatar;
         requested.add(hash);
-        void previewUrl(hash).then((url) => {
+        void previewUrl(hash, session.spaceId).then((url) => {
           if (url) faces = { ...faces, [hash]: url };
         });
       }

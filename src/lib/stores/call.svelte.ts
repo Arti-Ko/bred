@@ -169,8 +169,17 @@ export class Call {
   }
 
   async leave(): Promise<void> {
-    this.#capture?.stop();
-    this.#playback?.stop();
+    // Ни одна поломка при остановке не должна запереть человека в звонке.
+    try {
+      this.#capture?.stop();
+    } catch {
+      // всё равно выходим
+    }
+    try {
+      this.#playback?.stop();
+    } catch {
+      // всё равно выходим
+    }
     this.#capture = null;
     this.#playback = null;
     if (this.#poll !== null) {
@@ -206,7 +215,11 @@ export class Call {
     const channel = this.channel;
     const next = !this.camOn;
 
-    this.#capture?.stop();
+    try {
+      this.#capture?.stop();
+    } catch {
+      // Старый захват мог уже развалиться — это не повод не включать камеру.
+    }
     this.#capture = new Capture();
     try {
       await this.#capture.start({

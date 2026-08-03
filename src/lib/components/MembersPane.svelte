@@ -10,7 +10,7 @@
     for (const member of session.members) {
       if (member.avatar && !faces[member.avatar]) {
         const hash = member.avatar;
-        void previewUrl(hash).then((url) => {
+        void previewUrl(hash, session.spaceId).then((url) => {
           if (url) faces = { ...faces, [hash]: url };
         });
       }

@@ -125,6 +125,8 @@ export const api = {
     invoke<MessageRow[]>('list_messages', { channel, before }),
   listThread: (root: Id) => invoke<MessageRow[]>('list_thread', { root }),
   attachmentUrl: (hash: Id) => invoke<string>('attachment_url', { hash }),
+  ensureAttachment: (space: Id, hash: Id) =>
+    invoke<string>('ensure_attachment', { space, hash }),
   collectGarbage: () => invoke<number>('collect_garbage'),
   saveAttachment: (hash: Id, target: string) =>
     invoke<void>('save_attachment', { hash, target }),

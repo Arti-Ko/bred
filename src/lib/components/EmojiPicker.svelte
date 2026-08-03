@@ -17,7 +17,7 @@
   $effect(() => {
     for (const emoji of session.emojis) {
       if (!glyphs[emoji.name]) {
-        void previewUrl(emoji.hash).then((url) => {
+        void previewUrl(emoji.hash, session.spaceId).then((url) => {
           if (url) glyphs = { ...glyphs, [emoji.name]: url };
         });
       }

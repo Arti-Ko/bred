@@ -12,7 +12,7 @@
     const hash = session.members.find((m) => m.id === session.me)?.avatar;
     if (hash && hash !== shown) {
       shown = hash;
-      void previewUrl(hash).then((url) => (face = url));
+      void previewUrl(hash, session.spaceId).then((url) => (face = url));
     }
     if (!hash) face = null;
   });

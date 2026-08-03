@@ -111,6 +111,9 @@ impl Net {
             .unwrap_or_else(|_| self.ctx.identity.id().short());
         Presence {
             author: self.ctx.identity.id(),
+            // Адрес едет вместе с присутствием: без него до человека нельзя
+            // дозвониться напрямую за файлом или за видео.
+            addr: self.addr_now(),
             nick,
             // Голосовой канал показываем только соседям по тому же пространству.
             voice: self
@@ -279,7 +282,18 @@ impl Net {
                     tracing::warn!(%err, "не удалось применить событие");
                 }
             }
-            Broadcast::Presence(presence) => self.ctx.note_presence(space, presence),
+            Broadcast::Presence(presence) => {
+                // Запоминаем адрес — именно он позволяет дозвониться до человека,
+                // не полагаясь на внешние службы имён.
+                if !presence.addr.is_empty() {
+                    if let Ok(addr) = postcard::from_bytes::<EndpointAddr>(&presence.addr) {
+                        if addr.id != self.endpoint.id() {
+                            self.lookup.add_endpoint_info(addr);
+                        }
+                    }
+                }
+                self.ctx.note_presence(space, presence);
+            }
             Broadcast::Typing { channel, author } => {
                 let nick = self.ctx.nick_of(space, author);
                 let _ = self.ctx.notices.send(Notice::Typing {
