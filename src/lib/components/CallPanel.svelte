@@ -41,10 +41,17 @@
   }
 
   const others = $derived(call.participants.filter((p) => p.id !== session.me));
+  const hasScreen = $derived(call.screens.length > 0);
 </script>
 
+<svelte:window
+  onkeydown={(event) => {
+    if (event.key === 'Escape' && call.expanded) call.toggleExpanded();
+  }}
+/>
+
 {#if call.active}
-  <section class="call" aria-label="Звонок">
+  <section class="call" class:expanded={call.expanded} aria-label="Звонок">
     <header>
       <span class="dot blink">◉</span>
       <b>{session.channels.find((c) => c.id === call.channel)?.name ?? 'звонок'}</b>
@@ -59,10 +66,28 @@
       <button class:off={!call.screenOn} onclick={() => call.toggleScreen()}>
         {call.screenOn ? 'экран вкл' : 'экран выкл'}
       </button>
+      {#if call.screenOn && call.screenAudioAvailable}
+        <button class:off={!call.screenAudio} onclick={() => call.toggleScreenAudio()}>
+          {call.screenAudio ? 'звук экрана вкл' : 'звук экрана выкл'}
+        </button>
+      {/if}
+      {#if hasScreen}
+        <button class:off={!call.screenOnly} onclick={() => call.toggleScreenOnly()}>
+          только экран
+        </button>
+      {/if}
+      <button onclick={() => call.toggleExpanded()}>
+        {call.expanded ? 'свернуть' : 'развернуть'}
+      </button>
       <button class="leave" onclick={() => call.leave()}>выйти [^E]</button>
     </header>
 
-    <div class="grid" class:color={prefs.colorVideo}>
+    <div
+      class="grid"
+      class:color={prefs.colorVideo}
+      class:with-screen={hasScreen}
+      class:only-screen={call.screenOnly && hasScreen}
+    >
       <figure class="tile self">
         <!-- svelte-ignore a11y_media_has_caption -->
         <video bind:this={selfVideo} muted playsinline autoplay class:hidden={!call.camOn}></video>
@@ -160,6 +185,31 @@
   .call {
     border-bottom: 1px solid var(--line);
     background: var(--bg-raised);
+  }
+
+  /* Развёрнутый звонок закрывает окно целиком: когда смотрят демонстрацию,
+     лента только отнимает место. */
+  .call.expanded {
+    position: fixed;
+    inset: 0;
+    z-index: 70;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+  }
+  .call.expanded .grid {
+    flex: 1;
+    max-height: none;
+    align-content: start;
+  }
+  /* Демонстрация занимает основную часть, камеры уходят полосой вниз */
+  .call.expanded .grid.with-screen .tile.wide {
+    grid-column: 1 / -1;
+    height: 78vh;
+    aspect-ratio: auto;
+  }
+  .grid.only-screen .tile:not(.wide) {
+    display: none;
   }
 
   header {

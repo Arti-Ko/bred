@@ -15,6 +15,14 @@ use tauri::{Emitter, Manager};
 
 use crate::{app::App, domain::Id, net::Notice};
 
+/// Пустой ответ схемы вложений: файла нет или он ещё не скачан.
+fn not_found() -> tauri::http::Response<Vec<u8>> {
+    tauri::http::Response::builder()
+        .status(404)
+        .body(Vec::new())
+        .expect("пустой ответ собирается всегда")
+}
+
 /// Причина, по которой приложение не смогло подняться.
 ///
 /// Раньше ошибка запуска летела из `setup` наружу и превращалась в abort —
@@ -127,6 +135,31 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
+        // Вложения отдаём собственной схемой, а не через мост команд: сырой
+        // ответ на десятки мегабайт рвал IPC — в интерфейсе это выглядело как
+        // «connection lost», после чего переставало работать вообще всё.
+        .register_uri_scheme_protocol("bredfile", |ctx, request| {
+            use tauri::Manager;
+
+            let Some(app) = ctx.app_handle().try_state::<std::sync::Arc<App>>() else {
+                return not_found();
+            };
+            // Путь вида /<хеш>: имя файла в адресе не нужно, адресация по содержимому.
+            let hash = request.uri().path().trim_start_matches('/').to_string();
+            let Ok(hash) = Id::parse(&hash) else {
+                return not_found();
+            };
+
+            match app.attachment_file(hash) {
+                Some((bytes, mime)) => tauri::http::Response::builder()
+                    .status(200)
+                    .header("Content-Type", mime)
+                    .header("Cache-Control", "max-age=31536000, immutable")
+                    .body(bytes)
+                    .unwrap_or_else(|_| not_found()),
+                None => not_found(),
+            }
+        })
         .setup(|app| {
             let handle = app.handle().clone();
             if let Err(err) = start_core(&handle) {
@@ -142,7 +175,7 @@ pub fn run() {
             commands::list_channels,
             commands::list_messages,
             commands::list_thread,
-            commands::attachment_bytes,
+            commands::attachment_url,
             commands::save_attachment,
             commands::collect_garbage,
             commands::get_message,

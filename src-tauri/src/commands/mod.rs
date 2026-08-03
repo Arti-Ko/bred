@@ -84,12 +84,11 @@ pub fn list_thread(app: State<'_, Arc<App>>, root: Id) -> Answer<Vec<MessageRow>
     app.thread(root).map_err(fail)
 }
 
-/// Байты вложения для показа в ленте. Отдаём сырыми — картинка в JSON
-/// раздулась бы на треть и грузила бы разбор.
+/// Адрес вложения для показа в ленте. Файл отдаётся схемой `bredfile://`,
+/// а не через мост команд: сырой ответ на десятки мегабайт рвал IPC.
 #[tauri::command]
-pub async fn attachment_bytes(app: State<'_, Arc<App>>, hash: Id) -> Answer<tauri::ipc::Response> {
-    let bytes = app.attachment_bytes(hash).await.map_err(fail)?;
-    Ok(tauri::ipc::Response::new(bytes))
+pub fn attachment_url(app: State<'_, Arc<App>>, hash: Id) -> Answer<String> {
+    Ok(app.attachment_url(hash))
 }
 
 /// Сохранить вложение по указанному пути.

@@ -118,7 +118,7 @@ const HANDLERS: Record<string, (args: Args) => unknown> = {
   media_stream: () => null,
   send_media: () => null,
   collect_garbage: () => 0,
-  attachment_bytes: () => fakeScreenshot(),
+  attachment_url: () => fakeScreenshotUrl(),
   personal_link: () => 'bred://hello/nfxwc3tjnzxxg5dbmvsa…',
   space_invite: () => 'bred://join/nfxwc3tjnzxxg5dbmvsa…',
   'plugin:app|version': () => '0.1.5',
@@ -129,8 +129,15 @@ const HANDLERS: Record<string, (args: Args) => unknown> = {
 };
 
 
+let cachedShot: string | null = null;
+
 /** Рисуем правдоподобный «скрин профайлера», чтобы превью было настоящим. */
-function fakeScreenshot(): ArrayBuffer {
+function fakeScreenshotUrl(): string {
+  cachedShot ??= fakeScreenshot();
+  return cachedShot;
+}
+
+function fakeScreenshot(): string {
   const canvas = document.createElement('canvas');
   canvas.width = 720;
   canvas.height = 300;
@@ -156,10 +163,7 @@ function fakeScreenshot(): ArrayBuffer {
   ctx.font = '14px monospace';
   ctx.fillText('CPU · idle · 4K', 16, 26);
 
-  const data = atob(canvas.toDataURL('image/png').split(',')[1]);
-  const bytes = new Uint8Array(data.length);
-  for (let i = 0; i < data.length; i += 1) bytes[i] = data.charCodeAt(i);
-  return bytes.buffer;
+  return canvas.toDataURL('image/png');
 }
 
 // Мост в ядро: те же имена команд, что и в настоящем приложении.

@@ -18,6 +18,12 @@ export class Call {
   micMuted = $state(false);
   camOn = $state(false);
   screenOn = $state(false);
+  /** Идёт ли звук вместе с демонстрацией и доступен ли он вообще. */
+  screenAudio = $state(false);
+  screenAudioAvailable = $state(false);
+  /** Звонок во весь экран, и режим «только демонстрация». */
+  expanded = $state(false);
+  screenOnly = $state(false);
   /** Кто из собеседников показывает экран. */
   screens = $state<Id[]>([]);
   participants = $state<Participant[]>([]);
@@ -60,6 +66,25 @@ export class Call {
     this.#playback?.attachCanvas(author, canvas, track);
   }
 
+  /** Развернуть звонок на всё окно и обратно. */
+  toggleExpanded(): void {
+    this.expanded = !this.expanded;
+    if (!this.expanded) this.screenOnly = false;
+  }
+
+  /** Оставить на экране только демонстрацию, без плиток с камерами. */
+  toggleScreenOnly(): void {
+    this.screenOnly = !this.screenOnly;
+    if (this.screenOnly) this.expanded = true;
+  }
+
+  /** Звук вместе с демонстрацией: включается и выключается на лету. */
+  toggleScreenAudio(): void {
+    if (!this.screenAudioAvailable) return;
+    this.screenAudio = !this.screenAudio;
+    this.#capture?.setScreenAudio(this.screenAudio);
+  }
+
   /** Показать или убрать демонстрацию своего экрана. */
   async toggleScreen(): Promise<void> {
     if (!this.active || !this.#capture) return;
@@ -67,9 +92,19 @@ export class Call {
       if (this.screenOn) {
         this.#capture.stopScreen();
         this.screenOn = false;
+        this.screenAudio = false;
+        this.screenAudioAvailable = false;
+        this.screenOnly = false;
       } else {
         await this.#capture.startScreen((message) => (this.status = message));
         this.screenOn = this.#capture.sharingScreen;
+        // Системный звук отдаёт не каждая платформа: на macOS вебвью его не
+        // даёт вовсе, поэтому проверяем дорожку, а не полагаемся на запрос.
+        this.screenAudioAvailable = this.#capture.screenHasAudio;
+        this.screenAudio = this.screenAudioAvailable;
+        if (!this.screenAudioAvailable) {
+          this.status = 'система не отдала звук экрана — идёт только картинка';
+        }
       }
     } catch (error) {
       // Отказ в системном диалоге выбора окна — не ошибка, просто передумали.
@@ -135,6 +170,10 @@ export class Call {
     this.stream = null;
     this.screens = [];
     this.screenOn = false;
+    this.screenAudio = false;
+    this.screenAudioAvailable = false;
+    this.expanded = false;
+    this.screenOnly = false;
     this.active = false;
     this.channel = null;
     this.space = null;

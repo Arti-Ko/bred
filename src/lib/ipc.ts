@@ -123,7 +123,7 @@ export const api = {
   listMessages: (channel: Id, before: number | null = null) =>
     invoke<MessageRow[]>('list_messages', { channel, before }),
   listThread: (root: Id) => invoke<MessageRow[]>('list_thread', { root }),
-  attachmentBytes: (hash: Id) => invoke<ArrayBuffer>('attachment_bytes', { hash }),
+  attachmentUrl: (hash: Id) => invoke<string>('attachment_url', { hash }),
   collectGarbage: () => invoke<number>('collect_garbage'),
   saveAttachment: (hash: Id, target: string) =>
     invoke<void>('save_attachment', { hash, target }),

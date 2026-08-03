@@ -1,8 +1,9 @@
-// Показ картинок прямо в ленте.
+// Показ картинок в ленте.
 //
-// Байты берём у ядра и заворачиваем в object URL. Кеш по хешу обязателен:
-// без него каждая перерисовка ленты тянула бы файл заново, а перерисовок при
-// живой переписке десятки в минуту.
+// Файл отдаёт само приложение по адресу `bredfile://…`, и браузер грузит его
+// как обычную картинку. Раньше байты ехали ответом команды — на десятках
+// мегабайт это рвало мост в ядро, и интерфейс писал «connection lost», после
+// чего переставало работать вообще всё.
 
 import { api, type AttachmentRow, type Id } from './ipc';
 
@@ -12,8 +13,8 @@ const VIEWABLE = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/s
 /** Картинки меньше этого размера тянем сами, не дожидаясь клика. */
 const AUTO_FETCH_LIMIT = 2 * 1024 * 1024;
 
+/** Адреса не меняются — содержимое адресуется хешем, поэтому кешируем навсегда. */
 const cache = new Map<Id, string>();
-const inflight = new Map<Id, Promise<string | null>>();
 
 export function isViewable(file: { mime: string }): boolean {
   return VIEWABLE.includes(file.mime);
@@ -23,34 +24,20 @@ export function shouldAutoFetch(file: AttachmentRow): boolean {
   return isViewable(file) && !file.local && file.size <= AUTO_FETCH_LIMIT;
 }
 
-/** Ссылка на уже скачанную картинку. `null`, если показывать нечего. */
+/** Адрес картинки, которая уже лежит на диске. */
 export async function previewUrl(hash: Id): Promise<string | null> {
   const ready = cache.get(hash);
   if (ready) return ready;
 
-  const running = inflight.get(hash);
-  if (running) return running;
-
-  const task = (async () => {
-    try {
-      const bytes = await api.attachmentBytes(hash);
-      const url = URL.createObjectURL(new Blob([bytes]));
-      cache.set(hash, url);
-      return url;
-    } catch {
-      // Файла ещё нет на диске или он слишком большой — молча без превью.
-      return null;
-    } finally {
-      inflight.delete(hash);
-    }
-  })();
-
-  inflight.set(hash, task);
-  return task;
+  try {
+    const url = await api.attachmentUrl(hash);
+    cache.set(hash, url);
+    return url;
+  } catch {
+    return null;
+  }
 }
 
-/** Сбросить кеш: вызывается при выходе из пространства, иначе URL текут. */
 export function forgetPreviews(): void {
-  for (const url of cache.values()) URL.revokeObjectURL(url);
   cache.clear();
 }

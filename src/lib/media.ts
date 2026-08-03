@@ -17,7 +17,10 @@ const VERSION = 1;
 const TRACK_AUDIO = 0;
 const TRACK_VIDEO = 1;
 const TRACK_SCREEN = 2;
+const TRACK_SCREEN_AUDIO = 3;
 
+/** Через сколько молчания дорожка считается погасшей. */
+const STALE_AFTER = 1500;
 /** Запас буфера звука. Меньше — рвётся на джиттере, больше — слышна задержка. */
 const AUDIO_LEAD = 0.06;
 /** Предел отставания. Больше — выгоднее пропустить накопившееся, чем тянуть его. */
@@ -25,7 +28,7 @@ const AUDIO_MAX_LAG = 0.4;
 /** Как часто просить кодировщик выдать ключевой кадр. */
 const KEYFRAME_EVERY = 60;
 
-export type TrackKind = 'audio' | 'video' | 'screen';
+export type TrackKind = 'audio' | 'video' | 'screen' | 'screen-audio';
 
 export interface IncomingFrame {
   author: string;
@@ -79,7 +82,14 @@ function unpack(raw: Uint8Array): IncomingFrame | null {
   const view = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
   return {
     author: idToHex(raw.subarray(3, 35)),
-    track: raw[1] === TRACK_SCREEN ? 'screen' : raw[1] === TRACK_VIDEO ? 'video' : 'audio',
+    track:
+      raw[1] === TRACK_SCREEN
+        ? 'screen'
+        : raw[1] === TRACK_SCREEN_AUDIO
+          ? 'screen-audio'
+          : raw[1] === TRACK_VIDEO
+            ? 'video'
+            : 'audio',
     keyframe: raw[2] !== 0,
     ts: Number(view.getBigInt64(35, true)),
     data: raw.subarray(HEADER),
@@ -110,6 +120,7 @@ export class Capture {
   #screenStream: MediaStream | null = null;
   #screenEncoder: VideoEncoder | null = null;
   #screenStop: (() => void) | null = null;
+  #screenAudioStop: (() => void) | null = null;
 
   get stream(): MediaStream | null {
     return this.#stream;
@@ -147,12 +158,23 @@ export class Capture {
   async #startAudio(onError: (message: string) => void): Promise<void> {
     const track = this.#stream?.getAudioTracks()[0];
     if (!track) return;
+    this.#audioEncoder = await this.#startAudioTrack(track, TRACK_AUDIO, onError, (stop) =>
+      this.#stopFns.push(stop),
+    );
+  }
 
+  /** Кодирование произвольной звуковой дорожки: микрофона или звука экрана. */
+  async #startAudioTrack(
+    track: MediaStreamTrack,
+    kind: number,
+    onError: (message: string) => void,
+    keepStop: (stop: () => void) => void,
+  ): Promise<AudioEncoder> {
     const encoder = new AudioEncoder({
       output: (chunk) => {
         const data = new Uint8Array(chunk.byteLength);
         chunk.copyTo(data);
-        void send(pack(TRACK_AUDIO, true, chunk.timestamp, data));
+        void send(pack(kind, true, chunk.timestamp, data));
       },
       error: (error) => onError(`кодировщик звука: ${error.message}`),
     });
@@ -162,8 +184,6 @@ export class Capture {
       numberOfChannels: 1,
       bitrate: 32000,
     });
-    this.#audioEncoder = encoder;
-
     // Путь через WebAudio, а не MediaStreamTrackProcessor: последний есть
     // только в Chromium, а окно на macOS — WKWebView.
     const context = new AudioContext({ sampleRate: 48000 });
@@ -205,18 +225,31 @@ export class Capture {
     node.connect(silence);
     silence.connect(context.destination);
 
-    this.#stopFns.push(() => {
+    keepStop(() => {
       node.disconnect();
       source.disconnect();
+      encoder.close();
       void context.close();
     });
+    return encoder;
+  }
+
+  /** Есть ли в текущей демонстрации звук. */
+  get screenHasAudio(): boolean {
+    return (this.#screenStream?.getAudioTracks().length ?? 0) > 0;
+  }
+
+  setScreenAudio(enabled: boolean): void {
+    this.#screenStream?.getAudioTracks().forEach((track) => (track.enabled = enabled));
   }
 
   /** Демонстрация экрана — отдельная дорожка, чтобы шла вместе с камерой. */
   async startScreen(onError: (message: string) => void): Promise<void> {
+    // Звук просим сразу: система сама решит, отдавать его или нет. На macOS
+    // вебвью его не отдаёт, поэтому наличие дорожки проверяем, а не полагаемся.
     const stream = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: 15 },
-      audio: false,
+      video: { frameRate: 12 },
+      audio: true,
     });
     this.#screenStream = stream;
     const track = stream.getVideoTracks()[0];
@@ -226,15 +259,24 @@ export class Capture {
     this.#screenEncoder = await this.#videoTrackPump(
       track,
       TRACK_SCREEN,
-      { width: 1280, height: 720, bitrate: 1_200_000, framerate: 15 },
+      // Битрейт выше, чем у камеры: на экране читают текст, и его портит
+      // не шум, а нехватка бит.
+      { width: 1280, height: 720, bitrate: 2_500_000, framerate: 12 },
       onError,
       (stop) => (this.#screenStop = stop),
+    );
+
+    const sound = stream.getAudioTracks()[0];
+    if (sound) await this.#startAudioTrack(sound, TRACK_SCREEN_AUDIO, onError, (stop) =>
+      this.#screenAudioStop = stop,
     );
   }
 
   stopScreen(): void {
     this.#screenStop?.();
+    this.#screenAudioStop?.();
     this.#screenStop = null;
+    this.#screenAudioStop = null;
     this.#screenEncoder?.close();
     this.#screenEncoder = null;
     this.#screenStream?.getTracks().forEach((t) => t.stop());
@@ -358,6 +400,9 @@ export class Playback {
   /** По регулятору громкости на каждого: в звонке люди звучат по-разному. */
   #gains = new Map<string, GainNode>();
   #volumes = new Map<string, number>();
+  /** Когда последний раз приходил кадр по каждой дорожке. */
+  #lastFrame = new Map<string, number>();
+  #watch: number | null = null;
   #onSpeaker: (author: string) => void;
 
   constructor(onSpeaker: (author: string) => void) {
@@ -410,9 +455,19 @@ export class Playback {
       if (frame) this.#handle(frame, onError);
     };
     await invoke('media_stream', { channel });
+
+    // Дорожку никто не «закрывает» отдельным сообщением: человек просто
+    // перестаёт слать кадры. Без этого сторожа последний кадр висел бы на
+    // экране навсегда — и выключенная камера, и снятая демонстрация.
+    this.#watch = window.setInterval(() => this.#dropStale(), 700);
   }
 
   stop(): void {
+    if (this.#watch !== null) {
+      window.clearInterval(this.#watch);
+      this.#watch = null;
+    }
+    this.#lastFrame.clear();
     for (const decoder of this.#audio.values()) decoder.close();
     for (const decoder of this.#video.values()) decoder.close();
     for (const node of this.#gains.values()) node.disconnect();
@@ -437,6 +492,7 @@ export class Playback {
   }
 
   #handleAudio(frame: IncomingFrame, onError: (message: string) => void): void {
+    // Звук экрана микшируется с голосом того же человека — это его звук.
     let decoder = this.#audio.get(frame.author);
     if (!decoder) {
       decoder = new AudioDecoder({
@@ -459,6 +515,7 @@ export class Playback {
   #handleVideo(frame: IncomingFrame, onError: (message: string) => void): void {
     // Ключ с дорожкой: у одного участника камера и экран идут одновременно.
     const key = `${frame.track}:${frame.author}`;
+    this.#lastFrame.set(key, Date.now());
     let decoder = this.#video.get(key);
     if (!decoder) {
       // До первого ключевого кадра декодер запускать бессмысленно.
@@ -521,6 +578,30 @@ export class Playback {
 
     // Грубый индикатор «говорит»: по факту прихода звука, без анализа громкости.
     this.#onSpeaker(author);
+  }
+
+  /**
+   * Гасит дорожки, по которым давно ничего не приходило.
+   *
+   * Камера — просто очищаем холст, под ним проступает аватар. Демонстрация —
+   * убираем декодер целиком, чтобы плитка с экраном исчезла, а не висела
+   * последним кадром.
+   */
+  #dropStale(): void {
+    const now = Date.now();
+    for (const [key, at] of this.#lastFrame) {
+      if (now - at < STALE_AFTER) continue;
+      this.#lastFrame.delete(key);
+
+      const canvas = this.#canvases.get(key);
+      canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height);
+
+      if (key.startsWith('screen:')) {
+        this.#video.get(key)?.close();
+        this.#video.delete(key);
+        this.#canvases.delete(key);
+      }
+    }
   }
 
   /** Регулятор громкости участника, создаётся при первом же кадре звука. */

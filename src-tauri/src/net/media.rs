@@ -41,6 +41,11 @@ const REASSEMBLY_WINDOW: usize = 24;
 const OVERHEAD: usize = 192;
 /// Консервативный потолок датаграммы, если транспорт не сообщил свой.
 const SAFE_DATAGRAM: usize = 1200;
+/// Сколько кадров картинки ждут отправки каждому собеседнику. Очередь короткая:
+/// если не успеваем, честнее выбросить кадр, чем копить задержку.
+const VIDEO_QUEUE: usize = 6;
+/// Потолок на кадр, пришедший потоком: защита от пира, который пришлёт гигабайт.
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Сколько кадров ждут интерфейс. Очередь намеренно короткая: в реальном
 /// времени опоздавший кадр не нужен никому, а неограниченная очередь при
 /// медленном получателе съедает память гигабайтами.
@@ -52,6 +57,17 @@ pub enum Track {
     Video,
     /// Демонстрация экрана. Отдельно от камеры, чтобы показывать обе разом.
     Screen,
+    /// Звук вместе с демонстрацией экрана.
+    ScreenAudio,
+}
+
+impl Track {
+    /// Картинку нельзя терять: пропавший кусок кадра рассыпает весь кадр и
+    /// тянется артефактами до следующего ключевого. Поэтому видео едет
+    /// надёжными потоками, а звук — датаграммами, где потеря дешевле задержки.
+    fn reliable(self) -> bool {
+        matches!(self, Track::Video | Track::Screen)
+    }
 }
 
 impl Track {
@@ -60,6 +76,7 @@ impl Track {
             Track::Audio => 0,
             Track::Video => 1,
             Track::Screen => 2,
+            Track::ScreenAudio => 3,
         }
     }
 
@@ -68,6 +85,7 @@ impl Track {
             0 => Some(Track::Audio),
             1 => Some(Track::Video),
             2 => Some(Track::Screen),
+            3 => Some(Track::ScreenAudio),
             _ => None,
         }
     }
@@ -122,6 +140,14 @@ pub fn decode_from_ui(raw: &[u8]) -> Result<(Track, bool, i64, &[u8])> {
     Ok((track, keyframe, ts, &raw[UI_HEADER..]))
 }
 
+/// Связь с одним собеседником.
+struct Peer {
+    connection: Connection,
+    /// Очередь кадров картинки. Отправкой занимается отдельная задача:
+    /// открыть поток — операция с ожиданием, а путь кадра должен быть коротким.
+    video: tokio::sync::mpsc::Sender<Bytes>,
+}
+
 /// Активный звонок.
 #[derive(Debug, Clone, Copy)]
 struct Call {
@@ -133,7 +159,7 @@ pub struct Media {
     ctx: Arc<Ctx>,
     endpoint: Endpoint,
     call: RwLock<Option<Call>>,
-    peers: RwLock<HashMap<EndpointId, Connection>>,
+    peers: RwLock<HashMap<EndpointId, Peer>>,
     outgoing: Mutex<HashMap<Track, u32>>,
     reassembly: Mutex<Reassembly>,
     /// Куда отдавать собранные кадры — интерфейсу.
@@ -176,8 +202,8 @@ impl Media {
         *self.call.write() = None;
         // Соединения рвём явно: иначе камера у собеседника ещё секунды будет
         // считать, что мы на связи.
-        for (_, connection) in self.peers.write().drain() {
-            connection.close(0u32.into(), "вышел".as_bytes());
+        for (_, peer) in self.peers.write().drain() {
+            peer.connection.close(0u32.into(), "вышел".as_bytes());
         }
         self.reassembly.lock().clear();
         tracing::info!("вышли из звонка");
@@ -215,7 +241,37 @@ impl Media {
             *counter
         };
 
-        let connections: Vec<Connection> = self.peers.read().values().cloned().collect();
+        let packet = |part: u16, parts: u16, chunk: &[u8]| MediaPacket {
+            space: call.space,
+            channel: call.channel,
+            author: self.ctx.identity.id(),
+            track,
+            seq,
+            part,
+            parts,
+            keyframe,
+            ts,
+            data: chunk.to_vec(),
+        };
+
+        // Картинка целиком в один надёжный поток: резать её незачем, а терять
+        // куски нельзя. Звук — датаграммами, кусками по размеру пути.
+        if track.reliable() {
+            let sealed = Bytes::from(seal(&key, &packet(0, 1, data))?);
+            for peer in self.peers.read().values() {
+                // Очередь переполнена — кадр выбрасываем: показать его с
+                // опозданием всё равно нельзя, а копить — значит тонуть.
+                let _ = peer.video.try_send(sealed.clone());
+            }
+            return Ok(());
+        }
+
+        let connections: Vec<Connection> = self
+            .peers
+            .read()
+            .values()
+            .map(|p| p.connection.clone())
+            .collect();
         if connections.is_empty() {
             return Ok(());
         }
@@ -237,19 +293,7 @@ impl Media {
             u16::try_from(chunks.len()).map_err(|_| anyhow!("кадр слишком фрагментирован"))?;
 
         for (index, chunk) in chunks.iter().enumerate() {
-            let packet = MediaPacket {
-                space: call.space,
-                channel: call.channel,
-                author: self.ctx.identity.id(),
-                track,
-                seq,
-                part: index as u16,
-                parts,
-                keyframe,
-                ts,
-                data: chunk.to_vec(),
-            };
-            let sealed = Bytes::from(seal(&key, &packet)?);
+            let sealed = Bytes::from(seal(&key, &packet(index as u16, parts, chunk))?);
             for connection in &connections {
                 // Потеря кадра здесь — норма и лучше, чем ожидание ретрансмита.
                 if let Err(err) = connection.send_datagram(sealed.clone()) {
@@ -260,24 +304,37 @@ impl Media {
         Ok(())
     }
 
-    /// Приём датаграмм от одного собеседника.
+    /// Приём от одного собеседника: датаграммы со звуком и потоки с картинкой.
     async fn pump(self: Arc<Self>, connection: Connection) {
         let remote = connection.remote_id();
-        self.peers.write().insert(remote, connection.clone());
+        let (video, frames) = tokio::sync::mpsc::channel(VIDEO_QUEUE);
+        self.peers.write().insert(
+            remote,
+            Peer {
+                connection: connection.clone(),
+                video,
+            },
+        );
+
+        let writer = tokio::spawn(write_frames(connection.clone(), frames));
+        let reader = tokio::spawn(read_frames(self.clone(), connection.clone()));
 
         loop {
             match connection.read_datagram().await {
-                Ok(raw) => self.on_datagram(&raw),
+                Ok(raw) => self.on_packet(&raw),
                 Err(err) => {
                     tracing::debug!(peer = %remote.fmt_short(), %err, "медиа-соединение закрыто");
                     break;
                 }
             }
         }
+
+        writer.abort();
+        reader.abort();
         self.peers.write().remove(&remote);
     }
 
-    fn on_datagram(&self, raw: &[u8]) {
+    fn on_packet(&self, raw: &[u8]) {
         let Some(call) = *self.call.read() else {
             return; // мы не в звонке — принимать нечего
         };
@@ -352,6 +409,37 @@ impl Media {
                         }
                     });
                 }
+            }
+        });
+    }
+}
+
+/// Отправка кадров картинки: каждый — своим однонаправленным потоком.
+///
+/// Поток на кадр, а не один общий: внутри потока QUIC гарантирует порядок и
+/// доставку, а между потоками нет блокировки — застрявший кадр не задерживает
+/// следующие.
+async fn write_frames(connection: Connection, mut frames: tokio::sync::mpsc::Receiver<Bytes>) {
+    while let Some(frame) = frames.recv().await {
+        let Ok(mut stream) = connection.open_uni().await else {
+            break;
+        };
+        if stream.write_all(&frame).await.is_err() || stream.finish().is_err() {
+            break;
+        }
+    }
+}
+
+/// Приём кадров картинки.
+async fn read_frames(media: Arc<Media>, connection: Connection) {
+    loop {
+        let Ok(mut stream) = connection.accept_uni().await else {
+            break;
+        };
+        let media = media.clone();
+        tokio::spawn(async move {
+            if let Ok(raw) = stream.read_to_end(MAX_FRAME_BYTES).await {
+                media.on_packet(&raw);
             }
         });
     }

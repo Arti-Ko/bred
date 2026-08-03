@@ -343,18 +343,31 @@ impl App {
         self.store.thread(root)
     }
 
-    /// Байты вложения для показа прямо в ленте. Только то, что уже скачано.
-    pub async fn attachment_bytes(&self, hash: Id) -> Result<Vec<u8>> {
-        let path = self
-            .store
-            .blob_path(hash)?
-            .filter(|p| p.exists())
-            .ok_or_else(|| anyhow!("файл ещё не скачан"))?;
-        let meta = tokio::fs::metadata(&path).await?;
-        if meta.len() > PREVIEW_LIMIT {
-            return Err(anyhow!("файл слишком большой для показа"));
+    /// Байты и тип вложения для схемы `bredfile://`. Синхронно: обработчик
+    /// схемы вызывается вне асинхронного контекста.
+    pub fn attachment_file(&self, hash: Id) -> Option<(Vec<u8>, String)> {
+        let path = self.store.blob_path(hash).ok()??;
+        if !path.exists() || std::fs::metadata(&path).ok()?.len() > PREVIEW_LIMIT {
+            return None;
         }
-        Ok(tokio::fs::read(&path).await?)
+        let mime = self
+            .store
+            .attachment(hash)
+            .ok()
+            .flatten()
+            .map(|a| a.mime)
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        Some((std::fs::read(&path).ok()?, mime))
+    }
+
+    /// Адрес вложения для интерфейса. Схема на Windows и на остальных системах
+    /// выглядит по-разному, поэтому собираем её здесь, а не в интерфейсе.
+    pub fn attachment_url(&self, hash: Id) -> String {
+        if cfg!(windows) {
+            format!("http://bredfile.localhost/{hash}")
+        } else {
+            format!("bredfile://localhost/{hash}")
+        }
     }
 
     /// Скопировать вложение туда, куда указал пользователь.
