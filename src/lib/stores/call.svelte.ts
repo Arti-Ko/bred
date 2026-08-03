@@ -3,6 +3,7 @@
 
 import { api, errorText, type Id } from '../ipc';
 import { Capture, missingCapabilities, Playback } from '../media';
+import { prefs } from './prefs.svelte';
 
 export interface Participant {
   id: Id;
@@ -20,6 +21,12 @@ export class Call {
   /** Кто из собеседников показывает экран. */
   screens = $state<Id[]>([]);
   participants = $state<Participant[]>([]);
+  /**
+   * Свой поток. Именно реактивное состояние, а не геттер к приватному полю:
+   * геттер не будил эффект, который присваивает поток элементу video, и
+   * человек видел чёрный квадрат вместо себя.
+   */
+  stream = $state<MediaStream | null>(null);
   status = $state('');
   /** Чего не хватает платформе. Непусто — звонки недоступны, и надо сказать честно. */
   gaps = $state<string[]>([]);
@@ -30,13 +37,23 @@ export class Call {
   #speakers = new Map<Id, number>();
 
   get localStream(): MediaStream | null {
-    return this.#capture?.stream ?? null;
+    return this.stream;
   }
 
   /** Говорит ли участник прямо сейчас (звук приходил меньше 400 мс назад). */
   speaking(id: Id): boolean {
     const at = this.#speakers.get(id);
     return at !== undefined && Date.now() - at < 400;
+  }
+
+  /** Громкость собеседника: 0 — не слышно, 1 — как есть, до 4 — усиление. */
+  volume(author: Id): number {
+    return prefs.volumes[author] ?? 1;
+  }
+
+  setVolume(author: Id, value: number): void {
+    prefs.setVolume(author, value);
+    this.#playback?.setVolume(author, value);
   }
 
   attachCanvas(author: Id, canvas: HTMLCanvasElement | null, track: 'video' | 'screen' = 'video'): void {
@@ -75,6 +92,10 @@ export class Call {
         this.#speakers.set(author, Date.now());
       });
       await this.#playback.listen((message) => (this.status = message));
+      // Возвращаем ранее настроенную громкость, чтобы не крутить её заново.
+      for (const [author, value] of Object.entries(prefs.volumes)) {
+        this.#playback.setVolume(author, value);
+      }
 
       this.#capture = new Capture();
       await this.#capture.start({
@@ -84,6 +105,7 @@ export class Call {
 
       await api.joinCall(space, channel);
 
+      this.stream = this.#capture.stream;
       this.active = true;
       this.space = space;
       this.channel = channel;
@@ -110,6 +132,7 @@ export class Call {
     }
     this.#speakers.clear();
     this.participants = [];
+    this.stream = null;
     this.screens = [];
     this.screenOn = false;
     this.active = false;
@@ -140,6 +163,7 @@ export class Call {
         onError: (message) => (this.status = message),
       });
       this.#capture.setMuted(this.micMuted);
+      this.stream = this.#capture.stream;
       this.camOn = next;
       this.space = space;
       this.channel = channel;

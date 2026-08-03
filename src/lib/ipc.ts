@@ -125,6 +125,8 @@ export const api = {
   listThread: (root: Id) => invoke<MessageRow[]>('list_thread', { root }),
   attachmentBytes: (hash: Id) => invoke<ArrayBuffer>('attachment_bytes', { hash }),
   collectGarbage: () => invoke<number>('collect_garbage'),
+  saveAttachment: (hash: Id, target: string) =>
+    invoke<void>('save_attachment', { hash, target }),
   getMessage: (id: Id) => invoke<MessageRow | null>('get_message', { id }),
   listMembers: (space: Id) => invoke<MemberRow[]>('list_members', { space }),
 

@@ -13,12 +13,16 @@
     onreply: () => void;
     ondownload: (hash: string) => void;
     onthread: () => void;
+    onsave: (hash: string, name: string) => void;
   }
 
-  const { message, mine, selected, onreact, onreply, ondownload, onthread }: Props = $props();
+  const { message, mine, selected, onreact, onreply, ondownload, onthread, onsave }: Props =
+    $props();
 
   /** Ссылки на превью: подтягиваются по мере появления файлов на диске. */
   let previews = $state<Record<string, string>>({});
+  /** Что уже запрашивали. Вне реактивности: иначе эффект будит сам себя. */
+  const asked = new Set<string>();
   let reactionPicker = $state(false);
 
   const emojiMap = $derived(session.emojiMap);
@@ -39,7 +43,8 @@
 
   $effect(() => {
     for (const file of message.attachments) {
-      if (file.local && isViewable(file) && !previews[file.hash]) {
+      if (file.local && isViewable(file) && !asked.has(file.hash)) {
+        asked.add(file.hash);
         void previewUrl(file.hash).then((url) => {
           if (url) previews = { ...previews, [file.hash]: url };
         });
@@ -95,22 +100,36 @@
     {#if previews[file.hash]}
       <figure class="shot">
         <img src={previews[file.hash]} alt={file.name} loading="lazy" />
-        <figcaption>{file.name} · {size(file.size)}</figcaption>
+        <figcaption>
+          <span class="nm">{file.name} · {size(file.size)}</span>
+          <button
+            onclick={(event) => {
+              event.stopPropagation();
+              onsave(file.hash, file.name);
+            }}>сохранить</button
+          >
+        </figcaption>
       </figure>
     {:else}
-    <button
-      class="file"
-      class:ready={file.local}
-      onclick={(event) => {
-        event.stopPropagation();
-        if (!file.local) ondownload(file.hash);
-      }}
-      title={file.local ? 'файл уже на этом устройстве' : 'скачать у того, у кого он есть'}
-    >
+    <div class="file" class:ready={file.local}>
       <span class="glyph">{file.local ? '▣' : '▢'}</span>
       <span class="name">{file.name}</span>
-      <span class="meta">{size(file.size)}{file.local ? '' : ' · скачать'}</span>
-    </button>
+      <span class="meta">{size(file.size)}</span>
+      {#if !file.local}
+        <button
+          onclick={(event) => {
+            event.stopPropagation();
+            ondownload(file.hash);
+          }}>скачать</button
+        >
+      {/if}
+      <button
+        onclick={(event) => {
+          event.stopPropagation();
+          onsave(file.hash, file.name);
+        }}>сохранить</button
+      >
+    </div>
     {/if}
   {/each}
 
@@ -333,10 +352,30 @@
     filter: none;
   }
   .shot figcaption {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--gap-3);
     padding: 3px 8px;
     border-top: 1px solid var(--line);
     color: var(--fg-dimmer);
     font-size: var(--text-xs);
+  }
+  .shot figcaption .nm {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .shot figcaption button {
+    color: var(--fg-dim);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    white-space: nowrap;
+    flex: none;
+  }
+  .shot figcaption button:hover {
+    color: var(--fg-hi);
   }
 
   .file {
@@ -350,11 +389,18 @@
     background: var(--bg-raised);
     color: var(--fg-dim);
     font-size: var(--text-sm);
-    text-align: left;
-    transition: border-color var(--fast) var(--ease), color var(--fast) var(--ease);
   }
   .file:hover {
     border-color: var(--fg-dim);
+  }
+  .file button {
+    color: var(--fg-dim);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    white-space: nowrap;
+    flex: none;
+  }
+  .file button:hover {
     color: var(--fg-hi);
   }
   /* Уже скачанный файл помечен заливкой глифа, а не цветом */

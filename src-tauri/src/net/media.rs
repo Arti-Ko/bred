@@ -23,7 +23,7 @@ use iroh::{
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc, time::Duration};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 use super::{
     ctx::Ctx,
@@ -41,6 +41,10 @@ const REASSEMBLY_WINDOW: usize = 24;
 const OVERHEAD: usize = 192;
 /// Консервативный потолок датаграммы, если транспорт не сообщил свой.
 const SAFE_DATAGRAM: usize = 1200;
+/// Сколько кадров ждут интерфейс. Очередь намеренно короткая: в реальном
+/// времени опоздавший кадр не нужен никому, а неограниченная очередь при
+/// медленном получателе съедает память гигабайтами.
+pub const SINK_QUEUE: usize = 96;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Track {
@@ -133,7 +137,9 @@ pub struct Media {
     outgoing: Mutex<HashMap<Track, u32>>,
     reassembly: Mutex<Reassembly>,
     /// Куда отдавать собранные кадры — интерфейсу.
-    sink: RwLock<Option<UnboundedSender<Vec<u8>>>>,
+    sink: RwLock<Option<Sender<Vec<u8>>>>,
+    /// Сколько кадров выброшено из-за переполнения — видно в логах.
+    dropped: Mutex<u64>,
 }
 
 impl Media {
@@ -146,12 +152,13 @@ impl Media {
             outgoing: Mutex::new(HashMap::new()),
             reassembly: Mutex::new(Reassembly::default()),
             sink: RwLock::new(None),
+            dropped: Mutex::new(0),
         });
         media.clone().reconcile_loop();
         media
     }
 
-    pub fn set_sink(&self, sink: UnboundedSender<Vec<u8>>) {
+    pub fn set_sink(&self, sink: Sender<Vec<u8>>) {
         *self.sink.write() = Some(sink);
     }
 
@@ -190,13 +197,10 @@ impl Media {
     }
 
     /// Разослать свой кадр всем в комнате.
-    pub async fn broadcast(
-        &self,
-        track: Track,
-        keyframe: bool,
-        ts: i64,
-        data: &[u8],
-    ) -> Result<()> {
+    ///
+    /// Синхронно и намеренно: внутри нет ни одной точки ожидания, а обёртка в
+    /// задачу порождала бы под сотню задач в секунду, каждую с копией кадра.
+    pub fn broadcast(&self, track: Track, keyframe: bool, ts: i64, data: &[u8]) -> Result<()> {
         let Some(call) = *self.call.read() else {
             return Ok(()); // не в звонке — кадр просто выбрасываем
         };
@@ -291,7 +295,18 @@ impl Media {
 
         if let Some(frame) = self.reassembly.lock().push(packet) {
             if let Some(sink) = self.sink.read().as_ref() {
-                let _ = sink.send(frame);
+                // Очередь переполнена — значит интерфейс не успевает. Кадр
+                // выбрасываем: показать его с опозданием всё равно нельзя.
+                if sink.try_send(frame).is_err() {
+                    let mut dropped = self.dropped.lock();
+                    *dropped += 1;
+                    if *dropped % 300 == 1 {
+                        tracing::debug!(
+                            dropped = *dropped,
+                            "интерфейс не успевает, кадры теряются"
+                        );
+                    }
+                }
             }
         }
     }

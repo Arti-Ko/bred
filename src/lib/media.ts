@@ -179,16 +179,21 @@ export class Capture {
       const channel = event.inputBuffer.getChannelData(0);
       const copy = new Float32Array(channel.length);
       copy.set(channel);
-      encoder.encode(
-        new AudioData({
-          format: 'f32-planar',
-          sampleRate: 48000,
-          numberOfFrames: copy.length,
-          numberOfChannels: 1,
-          timestamp,
-          data: copy,
-        }),
-      );
+
+      // AudioData держит память вне кучи JavaScript, и сборщик мусора её не
+      // освобождает — только явный close(). Без него звук в звонке утекает
+      // непрерывно, десятками мегабайт в минуту.
+      const frame = new AudioData({
+        format: 'f32-planar',
+        sampleRate: 48000,
+        numberOfFrames: copy.length,
+        numberOfChannels: 1,
+        timestamp,
+        data: copy,
+      });
+      encoder.encode(frame);
+      frame.close();
+
       timestamp += Math.round((copy.length / 48000) * 1_000_000);
     };
 
@@ -272,6 +277,8 @@ export class Capture {
       if (!running || encoder.state !== 'configured') return;
       // Очередь длиннее двух кадров означает, что мы не успеваем: пропускаем
       // кадр вместо того, чтобы копить задержку.
+      // Очередь длиннее двух кадров означает, что кодировщик не успевает.
+      // Пропускаем кадр вместо того, чтобы копить и задержку, и память.
       if (encoder.encodeQueueSize < 2) {
         const frame = new VideoFrame(video, { timestamp: performance.now() * 1000 });
         this.#videoFrames += 1;
@@ -348,10 +355,29 @@ export class Playback {
   #canvases = new Map<string, HTMLCanvasElement>();
   #context: AudioContext | null = null;
   #nextPlay = new Map<string, number>();
+  /** По регулятору громкости на каждого: в звонке люди звучат по-разному. */
+  #gains = new Map<string, GainNode>();
+  #volumes = new Map<string, number>();
   #onSpeaker: (author: string) => void;
 
   constructor(onSpeaker: (author: string) => void) {
     this.#onSpeaker = onSpeaker;
+  }
+
+  /**
+   * Громкость конкретного собеседника, где 1 — как есть.
+   *
+   * Ограничиваем сверху: усиление выше четырёх превращает тихого человека не в
+   * громкого, а в хрип пополам с шумом микрофона.
+   */
+  setVolume(author: string, value: number): void {
+    const gain = Math.max(0, Math.min(4, value));
+    this.#volumes.set(author, gain);
+    const node = this.#gains.get(author);
+    if (node && this.#context) {
+      // Плавно, а не рывком: скачок усиления слышен щелчком.
+      node.gain.setTargetAtTime(gain, this.#context.currentTime, 0.02);
+    }
   }
 
   /** Забыть участника: декодеры на ушедших иначе копятся всю встречу. */
@@ -359,6 +385,8 @@ export class Playback {
     this.#audio.get(author)?.close();
     this.#audio.delete(author);
     this.#nextPlay.delete(author);
+    this.#gains.get(author)?.disconnect();
+    this.#gains.delete(author);
     for (const track of ['video', 'screen']) {
       const key = `${track}:${author}`;
       this.#video.get(key)?.close();
@@ -387,8 +415,10 @@ export class Playback {
   stop(): void {
     for (const decoder of this.#audio.values()) decoder.close();
     for (const decoder of this.#video.values()) decoder.close();
+    for (const node of this.#gains.values()) node.disconnect();
     this.#audio.clear();
     this.#video.clear();
+    this.#gains.clear();
     this.#nextPlay.clear();
     void this.#context?.close();
     this.#context = null;
@@ -465,7 +495,11 @@ export class Playback {
 
     const source = context.createBufferSource();
     source.buffer = buffer;
-    source.connect(context.destination);
+    source.connect(this.#gainFor(author, context));
+    // Отыгравший источник обязан отцепиться от графа. Иначе за десятиминутный
+    // разговор их накапливается под тридцать тысяч на человека, и каждый
+    // держит свой буфер.
+    source.onended = () => source.disconnect();
 
     const earliest = context.currentTime + AUDIO_LEAD;
     let at = Math.max(earliest, this.#nextPlay.get(author) ?? 0);
@@ -476,12 +510,29 @@ export class Playback {
     if (at - context.currentTime > AUDIO_MAX_LAG) {
       at = earliest;
     }
+    // Кадр, чьё время уже прошло, играть незачем — только память занимать.
+    if (at + buffer.duration < context.currentTime) {
+      source.disconnect();
+      return;
+    }
 
     source.start(at);
     this.#nextPlay.set(author, at + buffer.duration);
 
     // Грубый индикатор «говорит»: по факту прихода звука, без анализа громкости.
     this.#onSpeaker(author);
+  }
+
+  /** Регулятор громкости участника, создаётся при первом же кадре звука. */
+  #gainFor(author: string, context: AudioContext): GainNode {
+    let node = this.#gains.get(author);
+    if (!node) {
+      node = context.createGain();
+      node.gain.value = this.#volumes.get(author) ?? 1;
+      node.connect(context.destination);
+      this.#gains.set(author, node);
+    }
+    return node;
   }
 
   #draw(key: string, image: VideoFrame): void {

@@ -1,7 +1,7 @@
 // Состояние сессии. Один объект на приложение: панелей мало, а связей между
 // ними много, и таскать пропсы через четыре уровня было бы дороже.
 
-import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
+import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 import {
   isPermissionGranted,
   requestPermission,
@@ -358,6 +358,29 @@ export class Session {
       await this.#loadMessages();
     } catch (error) {
       this.status = errorText(error);
+    }
+  }
+
+  /**
+   * Сохранить вложение к себе.
+   *
+   * Скачивание кладёт файл в служебное хранилище — человеку он нужен там, где
+   * он сам укажет, иначе «скачал» превращается в путь внутри Library.
+   */
+  async saveAttachment(hash: Id, name: string): Promise<void> {
+    if (!this.spaceId) return;
+    try {
+      // Если байтов ещё нет — сперва тянем их у того, у кого они есть.
+      await api.downloadAttachment(this.spaceId, hash);
+
+      const target = await saveFileDialog({ defaultPath: name, title: 'Куда сохранить' });
+      if (!target) return;
+
+      await api.saveAttachment(hash, target);
+      await this.#loadMessages();
+      this.#note(`сохранено: ${target}`);
+    } catch (error) {
+      this.#note(errorText(error));
     }
   }
 

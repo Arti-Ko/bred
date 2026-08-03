@@ -1,7 +1,7 @@
 //! Прикладной слой: собирает хранилище, личность и сеть в одно целое
 //! и предоставляет операции, которыми пользуется UI.
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::{path::Path, sync::Arc};
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -357,6 +357,22 @@ impl App {
         Ok(tokio::fs::read(&path).await?)
     }
 
+    /// Скопировать вложение туда, куда указал пользователь.
+    ///
+    /// Хранилище вложений — служебный каталог внутри данных приложения; человеку
+    /// нужен файл у себя, а не путь в недрах Library.
+    pub async fn save_attachment(&self, hash: Id, target: &Path) -> Result<()> {
+        let source = self
+            .store
+            .blob_path(hash)?
+            .filter(|p| p.exists())
+            .ok_or_else(|| anyhow!("файл ещё не скачан"))?;
+        tokio::fs::copy(&source, target)
+            .await
+            .with_context(|| format!("не удалось сохранить в {}", target.display()))?;
+        Ok(())
+    }
+
     /// Убрать с диска файлы, на которые больше нет ни одной ссылки.
     /// Возвращает, сколько байт освободилось.
     pub async fn collect_garbage(&self) -> Result<u64> {
@@ -481,10 +497,10 @@ impl App {
         self.net.media().participants()
     }
 
-    /// Кадр из интерфейса — в сеть.
-    pub async fn send_media(&self, raw: &[u8]) -> Result<()> {
+    /// Кадр из интерфейса — в сеть. Синхронно: путь кадра должен быть коротким.
+    pub fn send_media(&self, raw: &[u8]) -> Result<()> {
         let (track, keyframe, ts, data) = crate::net::media::decode_from_ui(raw)?;
-        self.net.media().broadcast(track, keyframe, ts, data).await
+        self.net.media().broadcast(track, keyframe, ts, data)
     }
 
     /// Кто из участников в каком голосовом канале — для списка справа.

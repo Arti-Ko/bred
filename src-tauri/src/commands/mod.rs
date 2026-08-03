@@ -92,6 +92,14 @@ pub async fn attachment_bytes(app: State<'_, Arc<App>>, hash: Id) -> Answer<taur
     Ok(tauri::ipc::Response::new(bytes))
 }
 
+/// Сохранить вложение по указанному пути.
+#[tauri::command]
+pub async fn save_attachment(app: State<'_, Arc<App>>, hash: Id, target: String) -> Answer<()> {
+    app.save_attachment(hash, std::path::Path::new(&target))
+        .await
+        .map_err(fail)
+}
+
 #[tauri::command]
 pub async fn collect_garbage(app: State<'_, Arc<App>>) -> Answer<u64> {
     app.collect_garbage().await.map_err(fail)
@@ -270,13 +278,11 @@ pub fn send_media(app: State<'_, Arc<App>>, request: tauri::ipc::Request<'_>) ->
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
         return Err("ожидались сырые байты кадра".to_string());
     };
-    let frame = bytes.clone();
-    let app = (*app).clone();
-    tauri::async_runtime::spawn(async move {
-        if let Err(err) = app.send_media(&frame).await {
-            tracing::debug!(%err, "кадр не ушёл");
-        }
-    });
+    // Прямо здесь, без задачи: отправка синхронная и быстрая, а задача на
+    // каждый кадр — это под сотню задач в секунду с копией кадра в каждой.
+    if let Err(err) = app.send_media(bytes) {
+        tracing::debug!(%err, "кадр не ушёл");
+    }
     Ok(())
 }
 
@@ -287,7 +293,7 @@ pub fn media_stream(
     app: State<'_, Arc<App>>,
     channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Answer<()> {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::net::media::SINK_QUEUE);
     app.net.media().set_sink(tx);
 
     tauri::async_runtime::spawn(async move {

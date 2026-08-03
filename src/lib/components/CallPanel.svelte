@@ -1,18 +1,43 @@
 <script lang="ts">
   import { call } from '../stores/call.svelte';
+  import { prefs } from '../stores/prefs.svelte';
   import { session } from '../stores/session.svelte';
+  import { previewUrl } from '../previews';
 
   let selfVideo: HTMLVideoElement | undefined = $state();
+  /** Чья громкость настраивается: открывается правым кликом по плитке. */
+  let tuning = $state<string | null>(null);
+  /** Картинки профилей — их показываем вместо инициалов. */
+  let faces = $state<Record<string, string>>({});
+  const requested = new Set<string>();
 
   $effect(() => {
-    if (selfVideo && call.localStream) {
-      selfVideo.srcObject = call.localStream;
+    if (selfVideo && call.stream) {
+      selfVideo.srcObject = call.stream;
       void selfVideo.play().catch(() => undefined);
+    }
+  });
+
+  $effect(() => {
+    for (const member of session.members) {
+      // Множество вне реактивности: иначе эффект будил бы сам себя.
+      if (member.avatar && !requested.has(member.avatar)) {
+        const hash = member.avatar;
+        requested.add(hash);
+        void previewUrl(hash).then((url) => {
+          if (url) faces = { ...faces, [hash]: url };
+        });
+      }
     }
   });
 
   function nick(id: string): string {
     return session.members.find((m) => m.id === id)?.nick ?? id.slice(0, 8);
+  }
+
+  function face(id: string): string | null {
+    const hash = session.members.find((m) => m.id === id)?.avatar;
+    return hash ? (faces[hash] ?? null) : null;
   }
 
   const others = $derived(call.participants.filter((p) => p.id !== session.me));
@@ -37,24 +62,69 @@
       <button class="leave" onclick={() => call.leave()}>выйти [^E]</button>
     </header>
 
-    <div class="grid">
+    <div class="grid" class:color={prefs.colorVideo}>
       <figure class="tile self">
         <!-- svelte-ignore a11y_media_has_caption -->
-        <video bind:this={selfVideo} muted playsinline class:hidden={!call.camOn}></video>
-        {#if !call.camOn}<div class="placeholder">{session.nick.slice(0, 2)}</div>{/if}
+        <video bind:this={selfVideo} muted playsinline autoplay class:hidden={!call.camOn}></video>
+        {#if !call.camOn}
+          {#if face(session.me)}
+            <img class="face" src={face(session.me)} alt="" />
+          {:else}
+            <div class="placeholder">{session.nick.slice(0, 2)}</div>
+          {/if}
+        {/if}
         <figcaption>{session.nick} · вы{call.micMuted ? ' · без звука' : ''}</figcaption>
       </figure>
 
       {#each others as participant (participant.id)}
-        <figure class="tile" class:speaking={call.speaking(participant.id)}>
-          <div class="placeholder">{nick(participant.id).slice(0, 2)}</div>
+        <figure
+          class="tile"
+          class:speaking={call.speaking(participant.id)}
+          oncontextmenu={(event) => {
+            // Правый клик по человеку — его громкость. Общего регулятора мало:
+            // в одном звонке один шепчет, другой перекрикивает.
+            event.preventDefault();
+            tuning = tuning === participant.id ? null : participant.id;
+          }}
+        >
+          {#if face(participant.id)}
+            <img class="face" src={face(participant.id)} alt="" />
+          {:else}
+            <div class="placeholder">{nick(participant.id).slice(0, 2)}</div>
+          {/if}
           <canvas
             {@attach (node) => {
               call.attachCanvas(participant.id, node as HTMLCanvasElement, 'video');
               return () => call.attachCanvas(participant.id, null, 'video');
             }}
           ></canvas>
-          <figcaption>{nick(participant.id)}</figcaption>
+          {#if tuning === participant.id}
+            <div class="volume">
+              <label>
+                громкость
+                <input
+                  type="range"
+                  min="0"
+                  max="4"
+                  step="0.05"
+                  value={call.volume(participant.id)}
+                  oninput={(event) =>
+                    call.setVolume(participant.id, Number(event.currentTarget.value))}
+                />
+              </label>
+              <div class="volume-row">
+                <span>{Math.round(call.volume(participant.id) * 100)}%</span>
+                <button onclick={() => call.setVolume(participant.id, 1)}>сбросить</button>
+                <button onclick={() => (tuning = null)}>закрыть</button>
+              </div>
+            </div>
+          {/if}
+
+          <figcaption>
+            {nick(participant.id)}{call.volume(participant.id) !== 1
+              ? ` · ${Math.round(call.volume(participant.id) * 100)}%`
+              : ''}
+          </figcaption>
         </figure>
       {/each}
 
@@ -73,7 +143,10 @@
       {/each}
 
       {#if others.length === 0}
-        <p class="empty">никого больше нет. позовите: <b>^I</b> копирует ссылку</p>
+        <p class="empty">
+          никого больше нет. позовите: <b>^I</b> — ссылка в пространство,
+          <b>/визитка</b> — ссылка для связи один на один
+        </p>
       {/if}
     </div>
 
@@ -168,8 +241,59 @@
     height: 100%;
     object-fit: cover;
     z-index: 1;
-    /* Монохром распространяется и на видео: иначе картинка выпадает из системы */
+    /* Монохром по умолчанию — но переключаемо в настройках */
     filter: grayscale(1) contrast(1.05);
+  }
+  .grid.color .tile video,
+  .grid.color .tile canvas,
+  .grid.color .face {
+    filter: none;
+  }
+
+  /* Аватар вместо инициалов, когда камера выключена */
+  .face {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    filter: grayscale(1) contrast(1.05);
+  }
+
+  .volume {
+    position: absolute;
+    inset: auto 0 0 0;
+    z-index: 3;
+    padding: var(--gap-3);
+    background: var(--bg-raised);
+    border-top: 1px solid var(--fg-faint);
+    font-size: var(--text-xs);
+    color: var(--fg-dim);
+  }
+  .volume label {
+    display: block;
+  }
+  .volume input {
+    width: 100%;
+    margin-top: 4px;
+    accent-color: var(--fg);
+  }
+  .volume-row {
+    display: flex;
+    align-items: center;
+    gap: var(--gap-3);
+    margin-top: 4px;
+  }
+  .volume-row span {
+    color: var(--fg-hi);
+  }
+  .volume-row button {
+    color: var(--fg-dimmer);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .volume-row button:hover {
+    color: var(--fg-hi);
   }
   .tile.self video {
     transform: scaleX(-1);

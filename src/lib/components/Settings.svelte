@@ -1,5 +1,6 @@
 <script lang="ts">
   import { session } from '../stores/session.svelte';
+  import { prefs } from '../stores/prefs.svelte';
   import { updates } from '../stores/updates.svelte';
 
   interface Props {
@@ -58,6 +59,23 @@
     <div class="row">
       <span class="k">ключ</span>
       <span class="v selectable">{session.me}</span>
+    </div>
+
+    <div class="group">звонки</div>
+    <div class="row">
+      <span class="k">видео</span>
+      <button class="act" onclick={() => prefs.toggleColorVideo()}>
+        {prefs.colorVideo ? 'в цвете' : 'чёрно-белое'}
+      </button>
+      <span class="hint">
+        по умолчанию монохром — под остальной интерфейс; демонстрация экрана всегда цветная
+      </span>
+    </div>
+    <div class="row">
+      <span class="k">громкость</span>
+      <span class="hint">
+        настраивается по каждому отдельно: правый клик по человеку в звонке
+      </span>
     </div>
 
     <div class="group">сеть</div>

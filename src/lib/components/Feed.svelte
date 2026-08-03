@@ -104,6 +104,7 @@
           onreact={(emoji) => session.toggleReaction(message, emoji)}
           onreply={() => (session.replyTo = message)}
           ondownload={(hash) => session.download(hash)}
+          onsave={(hash, name) => session.saveAttachment(hash, name)}
           onthread={() => session.openThread(message.id)}
         />
       </div>
