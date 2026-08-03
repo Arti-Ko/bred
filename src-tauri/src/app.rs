@@ -7,7 +7,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
     domain::{
-        now_ms, Attachment, Clock, Event, EventKind, Id, Invite, SignedEvent, Space, SpaceId,
+        now_ms, Attachment, Clock, Event, EventKind, Hello, Id, Invite, SignedEvent, Space, SpaceId,
     },
     identity::{load_avatar, load_nick, save_avatar, save_nick, Identity},
     net::{ctx::Notice, Ctx, Net},
@@ -75,6 +75,53 @@ impl App {
     /// Публичная половина ключа согласования — её видят собеседники.
     pub fn dh_public(&self) -> Id {
         crate::identity::dh_public(&self.dh)
+    }
+
+    /// Личная визитка: ссылка, по которой с тобой можно связаться напрямую,
+    /// не имея ни одного общего пространства.
+    pub fn personal_link(&self) -> String {
+        Hello {
+            id: self.me(),
+            nick: self.nick(),
+            dh: self.dh_public(),
+            addr: self.net.addr_now(),
+        }
+        .encode()
+    }
+
+    /// Открыть личную переписку по чужой визитке.
+    pub async fn open_direct_link(&self, link: &str) -> Result<SpaceId> {
+        let hello = Hello::decode(link)?;
+        if hello.id == self.me() {
+            return Err(anyhow!("это ваша собственная ссылка"));
+        }
+
+        let shared = crate::identity::shared_secret(&self.dh, hello.dh);
+        let mut space = crate::domain::direct_space(self.me(), hello.id, shared);
+        space.name = hello.nick.clone();
+
+        if self.ctx.space(space.id).is_none() {
+            self.store.save_space(&space)?;
+            self.ctx.add_space(space.clone());
+        }
+        // Запоминаем собеседника, иначе после перезапуска мы не сможем
+        // ни назвать его, ни завести переписку заново.
+        self.store
+            .remember_peer(space.id, hello.id, &hello.nick, hello.dh)?;
+
+        let bootstrap = if hello.addr.is_empty() {
+            Vec::new()
+        } else {
+            vec![hello.addr]
+        };
+        self.net.join_via(space.clone(), &bootstrap).await?;
+
+        if self.store.channels(space.id)?.is_empty() {
+            self.create_channel(space.id, "личное", "личное", false)
+                .await?;
+        }
+        self.announce_profile(space.id).await?;
+        Ok(space.id)
     }
 
     /// Завести или открыть личную переписку. Приглашение не нужно: адрес и ключ

@@ -65,6 +65,9 @@ export class Session {
   hasOlder = $state(false);
   loadingOlder = $state(false);
 
+  /** Локальные системные строки: результаты команд прямо в ленте. */
+  notes = $state<Array<{ id: number; channel: Id | null; text: string; ts: number }>>([]);
+  #noteSeq = 0;
   #canNotify = false;
   #typingSeen = new Map<Id, { nick: string; at: number }>();
   #refreshTimer: number | null = null;
@@ -123,7 +126,7 @@ export class Session {
       if (!picked) return;
       await api.addEmoji(this.spaceId, name, Array.isArray(picked) ? picked[0] : picked, sticker);
       await this.#loadEmojis();
-      this.status = `добавлено :${name}:`;
+      this.#note(`добавлено :${name}: — вставляйте прямо в текст`);
     } catch (error) {
       this.status = errorText(error);
     }
@@ -192,6 +195,28 @@ export class Session {
     }
   }
 
+  /**
+   * Показать результат действия серой строкой в ленте.
+   *
+   * Статус-строку внизу человек не читает — она узкая и меняется молча.
+   * Ответ на команду должен появляться там же, где он её набрал.
+   */
+  #note(text: string): void {
+    this.notes = [
+      ...this.notes,
+      { id: ++this.#noteSeq, channel: this.channelId, text, ts: Date.now() },
+    ].slice(-30);
+    this.status = text;
+  }
+
+  /** Системные строки текущего канала. */
+  get visibleNotes(): Array<{ id: number; text: string; ts: number }> {
+    return this.notes.filter((n) => n.channel === null || n.channel === this.channelId);
+  }
+
+  /** Подставить команду в поле ввода — по клику на подсказку. */
+  suggest = $state('');
+
   async init(): Promise<void> {
     try {
       const boot = await api.bootstrap();
@@ -236,14 +261,20 @@ export class Session {
 
   async send(body: string): Promise<void> {
     const text = body.trim();
-    if (!this.spaceId || !this.channelId) return;
-    if (!text && this.pending.length === 0) return;
 
-    // Команды набираются в том же поле — отдельного режима нет.
+    // Команды разбираются до всех проверок. Иначе на свежей установке, где
+    // пространств ещё нет, не работает даже `/простор` — то есть единственный
+    // способ завести первое. Ровно в эту дыру всё и упиралось.
     if (text.startsWith('/')) {
       await this.#runCommand(text);
       return;
     }
+
+    if (!this.spaceId || !this.channelId) {
+      this.#note('сначала создайте пространство: /простор Название');
+      return;
+    }
+    if (!text && this.pending.length === 0) return;
 
     try {
       await api.sendMessage(
@@ -275,7 +306,7 @@ export class Session {
       if (!picked) return;
       await api.setAvatar(Array.isArray(picked) ? picked[0] : picked);
       await this.#loadMembers();
-      this.status = 'аватар обновлён';
+      this.#note('аватар обновлён');
     } catch (error) {
       this.status = errorText(error);
     }
@@ -307,7 +338,7 @@ export class Session {
         prepared.push(await api.attachFile(path));
       }
       this.pending = [...this.pending, ...prepared];
-      this.status = `прикреплено: ${prepared.map((a) => a.name).join(', ')}`;
+      this.#note(`прикреплено: ${prepared.map((a) => a.name).join(', ')}`);
     } catch (error) {
       this.status = errorText(error);
     }
@@ -323,7 +354,7 @@ export class Session {
     this.status = 'качаем…';
     try {
       const path = await api.downloadAttachment(this.spaceId, hash);
-      this.status = `сохранено: ${path}`;
+      this.#note(`сохранено: ${path}`);
       await this.#loadMessages();
     } catch (error) {
       this.status = errorText(error);
@@ -354,9 +385,9 @@ export class Session {
     try {
       const ticket = await api.spaceInvite(this.spaceId);
       await navigator.clipboard.writeText(ticket);
-      this.status = 'ссылка-приглашение скопирована в буфер';
+      this.#note('ссылка-приглашение скопирована в буфер');
     } catch (error) {
-      this.status = errorText(error);
+      this.#note(errorText(error));
     }
   }
 
@@ -374,16 +405,19 @@ export class Session {
     try {
       switch (command) {
         case 'простор':
-        case 'space':
+        case 'space': {
           if (!argument) throw new Error('нужно название: /простор Орбита');
           await this.#refreshSpaces(await api.createSpace(argument));
+          this.#note(`пространство «${argument}» создано`);
           break;
+        }
         case 'канал':
         case 'channel': {
           if (!this.spaceId) throw new Error('сначала выберите пространство');
           if (!argument) throw new Error('нужно название: /канал баги');
           await api.createChannel(this.spaceId, argument, 'общее', false);
           await this.#loadChannels();
+          this.#note(`канал #${argument} создан`);
           break;
         }
         case 'голос':
@@ -392,6 +426,7 @@ export class Session {
           if (!argument) throw new Error('нужно название: /голос стендап');
           await api.createChannel(this.spaceId, argument, 'голос', true);
           await this.#loadChannels();
+          this.#note(`голосовой канал «${argument}» создан`);
           break;
         }
         case 'звонок':
@@ -399,8 +434,71 @@ export class Session {
           const room = this.channels.find((c) => c.voice && c.name === argument);
           if (!room) throw new Error(`голосового канала «${argument}» нет`);
           await this.joinVoice(room.id, false);
+          this.#note(`вы в звонке «${argument}»`);
           break;
         }
+        case 'войти':
+        case 'join': {
+          if (!argument) throw new Error('нужна ссылка: /войти bred://…');
+          // Одна команда на обе ссылки: человеку незачем помнить, какая из них
+          // на пространство, а какая на личную переписку.
+          const space = argument.includes('bred://hello/')
+            ? await api.openDirectLink(argument)
+            : await api.joinSpace(argument);
+          await this.#refreshSpaces(space);
+          this.#note('подключено');
+          break;
+        }
+        case 'имя':
+        case 'nick': {
+          if (!argument) throw new Error('нужно имя: /имя тимур');
+          const was = this.nick;
+          await api.setNick(argument);
+          this.nick = argument;
+          await this.#loadMembers();
+          this.#note(`имя изменено: ${was} → ${argument}`);
+          break;
+        }
+        case 'позвать':
+        case 'invite':
+          await this.invite();
+          break;
+        case 'визитка':
+        case 'me':
+          await this.copyPersonalLink();
+          break;
+        case 'лс':
+        case 'dm': {
+          const who = this.members.find(
+            (m) => m.nick === argument || m.id.startsWith(argument),
+          );
+          if (!who) throw new Error(`не нашёл участника «${argument}»`);
+          await this.openDirect(who.id);
+          this.#note(`открыта переписка с ${who.nick}`);
+          break;
+        }
+        case 'покинуть':
+        case 'leave': {
+          if (!this.spaceId) throw new Error('пространство не выбрано');
+          const name = this.space?.name ?? '';
+          await api.leaveSpace(this.spaceId);
+          this.spaces = await api.listSpaces();
+          this.spaceId = null;
+          this.channelId = null;
+          this.messages = [];
+          this.channels = [];
+          this.members = [];
+          forgetPreviews();
+          await api.collectGarbage().catch(() => undefined);
+          if (this.spaces.length > 0) await this.selectSpace(this.spaces[0].id);
+          this.#note(`вы вышли из «${name}», история стёрта`);
+          break;
+        }
+        case 'экран':
+        case 'screen':
+          await call.toggleScreen();
+          this.#note(call.screenOn ? 'показываете экран' : 'показ экрана выключен');
+          break;
         case 'файл':
         case 'file':
           await this.attach();
@@ -417,66 +515,41 @@ export class Session {
         case 'sticker':
           await this.addEmoji(argument, true);
           break;
-        case 'лс':
-        case 'dm': {
-          const who = this.members.find(
-            (m) => m.nick === argument || m.id.startsWith(argument),
-          );
-          if (!who) throw new Error(`не нашёл участника «${argument}»`);
-          await this.openDirect(who.id);
-          break;
-        }
-        case 'войти':
-        case 'join':
-          await this.#refreshSpaces(await api.joinSpace(argument));
-          break;
-        case 'имя':
-        case 'nick':
-          await api.setNick(argument);
-          this.nick = argument;
-          await this.#loadMembers();
-          break;
         case 'обновление':
-        case 'update':
+        case 'update': {
           await updates.check();
-          this.status =
+          this.#note(
             updates.stage === 'available'
-              ? `доступна версия ${updates.next} — открой настройки (^,)`
+              ? `доступна версия ${updates.next} — установить в настройках (^,)`
               : updates.stage === 'current'
                 ? 'установлена последняя версия'
-                : (updates.error || 'проверяем…');
-          break;
-        case 'позвать':
-        case 'invite':
-          await this.invite();
-          break;
-        case 'покинуть':
-        case 'leave': {
-          if (!this.spaceId) throw new Error('пространство не выбрано');
-          const leaving = this.spaceId;
-          await api.leaveSpace(leaving);
-          this.spaces = await api.listSpaces();
-          this.spaceId = null;
-          this.channelId = null;
-          this.messages = [];
-          this.channels = [];
-          this.members = [];
-          if (this.spaces.length > 0) await this.selectSpace(this.spaces[0].id);
-          forgetPreviews();
-          await api.collectGarbage().catch(() => undefined);
-          this.status = 'вы вышли, история этого пространства стёрта';
+                : (updates.error || 'проверяем…'),
+          );
           break;
         }
-        case 'экран':
-        case 'screen':
-          await call.toggleScreen();
+        case 'помощь':
+        case 'help':
+          this.#note(
+            'команды: /простор /канал /голос /звонок /войти /позвать /визитка ' +
+              '/лс /имя /аватар /файл /эмодзи /стикер /экран /покинуть /обновление',
+          );
           break;
         default:
-          throw new Error(`неизвестная команда /${command}`);
+          throw new Error(`неизвестная команда /${command} — наберите /помощь`);
       }
-      if (!this.status) this.status = '';
     } catch (error) {
-      this.status = errorText(error);
+      this.#note(errorText(error));
+    }
+  }
+
+  /** Скопировать свою визитку: по ней с вами свяжутся напрямую. */
+  async copyPersonalLink(): Promise<void> {
+    try {
+      const link = await api.personalLink();
+      await navigator.clipboard.writeText(link);
+      this.#note('ваша ссылка для связи скопирована — отправьте её собеседнику');
+    } catch (error) {
+      this.#note(errorText(error));
     }
   }
 

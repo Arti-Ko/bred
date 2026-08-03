@@ -128,6 +128,17 @@ pub async fn open_direct(app: State<'_, Arc<App>>, peer: Id) -> Answer<SpaceId> 
     app.open_direct(peer).await.map_err(fail)
 }
 
+/// Ссылка-визитка для связи один на один.
+#[tauri::command]
+pub fn personal_link(app: State<'_, Arc<App>>) -> Answer<String> {
+    Ok(app.personal_link())
+}
+
+#[tauri::command]
+pub async fn open_direct_link(app: State<'_, Arc<App>>, link: String) -> Answer<SpaceId> {
+    app.open_direct_link(&link).await.map_err(fail)
+}
+
 #[tauri::command]
 pub fn list_emojis(app: State<'_, Arc<App>>, space: SpaceId) -> Answer<Vec<EmojiRow>> {
     app.emojis(space).map_err(fail)

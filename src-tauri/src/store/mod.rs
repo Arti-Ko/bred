@@ -531,6 +531,24 @@ impl Store {
         Ok(())
     }
 
+    /// Запомнить собеседника: имя и ключ согласования из визитки.
+    /// Без этого личная переписка забудется при перезапуске.
+    pub fn remember_peer(&self, space: SpaceId, peer: Id, nick: &str, dh: Id) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO peers(id, space, nick, dh, last_seen) VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id, space) DO UPDATE SET nick = excluded.nick, dh = excluded.dh",
+            params![
+                &peer.0[..],
+                &space.0[..],
+                nick,
+                &dh.0[..],
+                crate::domain::now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
     /// Ключ согласования участника — из любого общего пространства.
     pub fn peer_dh(&self, peer: Id) -> Result<Option<Id>> {
         let conn = self.conn.lock();

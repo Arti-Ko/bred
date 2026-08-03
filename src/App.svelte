@@ -3,6 +3,7 @@
   import ChannelPane from './lib/components/ChannelPane.svelte';
   import Feed from './lib/components/Feed.svelte';
   import MembersPane from './lib/components/MembersPane.svelte';
+  import CommandBar from './lib/components/CommandBar.svelte';
   import EmojiPicker from './lib/components/EmojiPicker.svelte';
   import Settings from './lib/components/Settings.svelte';
   import ThreadPanel from './lib/components/ThreadPanel.svelte';
@@ -141,6 +142,18 @@
     </div>
     <MembersPane />
   </div>
+
+  <CommandBar
+    onpick={(command) => {
+      // Готовую команду отправляем сразу, командам с аргументом даём дописать.
+      if (command.endsWith(' ')) {
+        draft = command;
+        input?.focus();
+      } else {
+        void session.send(command);
+      }
+    }}
+  />
 
   {#if session.pending.length > 0}
     <div class="pending">

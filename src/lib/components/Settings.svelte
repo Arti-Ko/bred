@@ -34,6 +34,16 @@
   </header>
 
   <div class="body">
+    <div class="group">связь один на один</div>
+    <div class="row">
+      <span class="k">моя ссылка</span>
+      <button class="act primary" onclick={() => session.copyPersonalLink()}>скопировать</button>
+      <span class="hint">
+        отправьте её кому угодно — он вставит её командой <b>/войти</b> и напишет вам лично,
+        без общих пространств
+      </span>
+    </div>
+
     <div class="group">профиль</div>
     <div class="row">
       <span class="k">имя</span>
@@ -107,6 +117,7 @@
       <button class="act" onclick={() => session.invite()} disabled={!session.spaceId}>
         скопировать ссылку
       </button>
+      <span class="hint">зовёт в текущее пространство</span>
     </div>
     <div class="row">
       <span class="k">эмодзи</span>

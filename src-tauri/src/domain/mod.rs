@@ -71,6 +71,44 @@ impl Invite {
     }
 }
 
+/// Личная визитка: по ней можно написать напрямую, не имея общих пространств.
+///
+/// Без неё личная переписка возможна только с тем, с кем уже состоишь в одном
+/// пространстве — ключ согласования приезжает в профиле. Визитка закрывает эту
+/// дыру: в ней есть всё, что нужно, чтобы вывести общий ключ и дозвониться.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Hello {
+    pub id: Id,
+    pub nick: String,
+    /// Публичная половина ключа согласования.
+    pub dh: Id,
+    /// Сериализованный адрес узла как точка входа.
+    pub addr: Vec<u8>,
+}
+
+impl Hello {
+    pub fn encode(&self) -> String {
+        let raw = postcard::to_stdvec(self).expect("визитка сериализуема");
+        format!(
+            "bred://hello/{}",
+            data_encoding::BASE32_NOPAD
+                .encode(&raw)
+                .to_ascii_lowercase()
+        )
+    }
+
+    pub fn decode(text: &str) -> anyhow::Result<Self> {
+        let body = text
+            .trim()
+            .strip_prefix("bred://hello/")
+            .ok_or_else(|| anyhow::anyhow!("ссылка должна начинаться с bred://hello/"))?;
+        let raw = data_encoding::BASE32_NOPAD
+            .decode(body.to_ascii_uppercase().as_bytes())
+            .map_err(|_| anyhow::anyhow!("повреждённая ссылка-визитка"))?;
+        Ok(postcard::from_bytes(&raw)?)
+    }
+}
+
 /// Адрес и ключ личной переписки.
 ///
 /// Идентификатор считается из двух публичных ключей в отсортированном порядке —

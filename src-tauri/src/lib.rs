@@ -150,6 +150,8 @@ pub fn run() {
             commands::join_space,
             commands::space_invite,
             commands::open_direct,
+            commands::personal_link,
+            commands::open_direct_link,
             commands::list_emojis,
             commands::add_emoji,
             commands::remove_emoji,

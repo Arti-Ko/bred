@@ -133,6 +133,8 @@ export const api = {
   spaceInvite: (space: Id) => invoke<string>('space_invite', { space }),
   leaveSpace: (space: Id) => invoke<void>('leave_space', { space }),
   openDirect: (peer: Id) => invoke<Id>('open_direct', { peer }),
+  personalLink: () => invoke<string>('personal_link'),
+  openDirectLink: (link: string) => invoke<Id>('open_direct_link', { link }),
 
   listEmojis: (space: Id) => invoke<EmojiRow[]>('list_emojis', { space }),
   addEmoji: (space: Id, name: string, path: string, sticker: boolean) =>

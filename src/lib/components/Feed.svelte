@@ -80,8 +80,7 @@
         {#if session.channel}
           пусто. напишите первое сообщение — оно уйдёт соседям, как только они появятся
         {:else}
-          создайте пространство командой <code>/простор Название</code> или войдите
-          по ссылке: <code>/войти bred://join/…</code>
+          создайте пространство или подключитесь по ссылке — команды внизу кликабельны
         {/if}
       </p>
     {/if}
@@ -108,6 +107,11 @@
           onthread={() => session.openThread(message.id)}
         />
       </div>
+    {/each}
+
+    <!-- Результаты команд: серым, там же, где человек их набрал -->
+    {#each session.visibleNotes as note (note.id)}
+      <div class="note">· {note.text}</div>
     {/each}
 
     {#if session.typing.length > 0}
@@ -158,10 +162,13 @@
     max-width: 70ch;
     line-height: 1.7;
   }
-  .empty code {
-    color: var(--fg);
-    border: 1px solid var(--line);
-    padding: 0 4px;
+
+  .note {
+    padding: 3px 14px;
+    color: var(--fg-dimmer);
+    font-size: var(--text-sm);
+    max-width: 82ch;
+    word-break: break-word;
   }
 
   .typing {
