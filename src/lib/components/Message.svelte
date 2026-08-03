@@ -14,10 +14,20 @@
     ondownload: (hash: string) => void;
     onthread: () => void;
     onsave: (hash: string, name: string) => void;
+    ondelete: () => void;
   }
 
-  const { message, mine, selected, onreact, onreply, ondownload, onthread, onsave }: Props =
-    $props();
+  const {
+    message,
+    mine,
+    selected,
+    onreact,
+    onreply,
+    ondownload,
+    onthread,
+    onsave,
+    ondelete,
+  }: Props = $props();
 
   /** Ссылки на превью: подтягиваются по мере появления файлов на диске. */
   let previews = $state<Record<string, string>>({});
@@ -174,6 +184,15 @@
           onreply();
         }}>ответить</button
       >
+      {#if mine && !message.deleted}
+        <button
+          class="rx"
+          onclick={(event) => {
+            event.stopPropagation();
+            ondelete();
+          }}>удалить</button
+        >
+      {/if}
     {/if}
 
     {#if message.thread_replies > 0 || selected}

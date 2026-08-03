@@ -350,14 +350,23 @@ impl App {
         if !path.exists() || std::fs::metadata(&path).ok()?.len() > PREVIEW_LIMIT {
             return None;
         }
-        let mime = self
+        let bytes = std::fs::read(&path).ok()?;
+        let stored = self
             .store
             .attachment(hash)
             .ok()
             .flatten()
             .map(|a| a.mime)
-            .unwrap_or_else(|| "application/octet-stream".to_string());
-        Some((std::fs::read(&path).ok()?, mime))
+            .unwrap_or_default();
+
+        // У эмодзи и аватаров в логе записано `image/*` — это не настоящий тип,
+        // и браузер такую картинку не рисует. Определяем по содержимому.
+        let mime = if stored.contains('*') || stored.is_empty() {
+            sniff_mime(&bytes).to_string()
+        } else {
+            stored
+        };
+        Some((bytes, mime))
     }
 
     /// Адрес вложения для интерфейса. Схема на Windows и на остальных системах
@@ -557,6 +566,13 @@ impl App {
         Ok(path.to_string_lossy().to_string())
     }
 
+    /// Удалить канал у всех участников вместе с его перепиской.
+    pub async fn delete_channel(&self, space: SpaceId, channel: Id) -> Result<()> {
+        self.commit_and_publish(space, EventKind::ChannelDelete { channel })
+            .await?;
+        Ok(())
+    }
+
     pub fn mark_read(&self, channel: Id) -> Result<()> {
         self.store.mark_read(channel)
     }
@@ -691,6 +707,20 @@ impl App {
     }
 }
 
+/// Тип картинки по её первым байтам.
+///
+/// Расширение и запись в логе могут врать или отсутствовать, а сигнатура — нет.
+fn sniff_mime(bytes: &[u8]) -> &'static str {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => "image/png",
+        [0xFF, 0xD8, 0xFF, ..] => "image/jpeg",
+        [b'G', b'I', b'F', b'8', ..] => "image/gif",
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
+        [b'<', b's', b'v', b'g', ..] | [b'<', b'?', b'x', b'm', b'l', ..] => "image/svg+xml",
+        _ => "application/octet-stream",
+    }
+}
+
 fn validate_name(value: &str, what: &str) -> Result<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -705,6 +735,17 @@ fn validate_name(value: &str, what: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mime_is_recognised_by_signature() {
+        // Расширение и запись в логе могут врать, сигнатура — нет.
+        assert_eq!(sniff_mime(b"\x89PNG\r\n\x1a\n"), "image/png");
+        assert_eq!(sniff_mime(b"GIF89a..."), "image/gif");
+        assert_eq!(sniff_mime(&[0xFF, 0xD8, 0xFF, 0xE0]), "image/jpeg");
+        assert_eq!(sniff_mime(b"RIFF\x00\x00\x00\x00WEBPVP8 "), "image/webp");
+        assert_eq!(sniff_mime(b"\x00\x01\x02"), "application/octet-stream");
+        assert_eq!(sniff_mime(b""), "application/octet-stream");
+    }
 
     #[test]
     fn name_validation_trims_and_rejects_empty() {

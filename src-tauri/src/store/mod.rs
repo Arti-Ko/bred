@@ -707,6 +707,32 @@ fn materialize(tx: &rusqlite::Transaction<'_>, id: &Id, ev: &Event) -> Result<()
                 params![&id.0[..], &hash.0[..], name],
             )?;
         }
+        EventKind::ChannelDelete { channel } => {
+            // Прав в пространстве нет: кто внутри, тот и может убрать канал.
+            // Событие остаётся в логе, поэтому решение видно и воспроизводимо.
+            tx.execute(
+                "DELETE FROM attachments WHERE message IN
+                   (SELECT id FROM messages WHERE channel = ?1)",
+                params![&channel.0[..]],
+            )?;
+            tx.execute(
+                "DELETE FROM reactions WHERE target IN
+                   (SELECT id FROM messages WHERE channel = ?1)",
+                params![&channel.0[..]],
+            )?;
+            tx.execute(
+                "DELETE FROM messages WHERE channel = ?1",
+                params![&channel.0[..]],
+            )?;
+            tx.execute(
+                "DELETE FROM reads WHERE channel = ?1",
+                params![&channel.0[..]],
+            )?;
+            tx.execute(
+                "DELETE FROM channels WHERE id = ?1",
+                params![&channel.0[..]],
+            )?;
+        }
         EventKind::EmojiRemove { name } => {
             tx.execute(
                 "DELETE FROM emojis WHERE space = ?1 AND name = ?2",

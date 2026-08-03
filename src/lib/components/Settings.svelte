@@ -2,6 +2,20 @@
   import { session } from '../stores/session.svelte';
   import { prefs } from '../stores/prefs.svelte';
   import { updates } from '../stores/updates.svelte';
+  import { previewUrl } from '../previews';
+
+  /** Своя картинка профиля: человек должен видеть, как его увидят другие. */
+  let face = $state<string | null>(null);
+  let shown: string | null = null;
+
+  $effect(() => {
+    const hash = session.members.find((m) => m.id === session.me)?.avatar;
+    if (hash && hash !== shown) {
+      shown = hash;
+      void previewUrl(hash).then((url) => (face = url));
+    }
+    if (!hash) face = null;
+  });
 
   interface Props {
     onclose: () => void;
@@ -53,8 +67,15 @@
     </div>
     <div class="row">
       <span class="k">картинка</span>
-      <button class="act" onclick={() => session.setAvatar()}>выбрать…</button>
-      <span class="hint">png, gif, webp</span>
+      <div class="avatar">
+        {#if face}
+          <img src={face} alt="ваша картинка профиля" />
+        {:else}
+          <span class="none">{session.nick.slice(0, 2)}</span>
+        {/if}
+        <button class="act" onclick={() => session.setAvatar()}>выбрать…</button>
+      </div>
+      <span class="hint">png, gif, webp — так вас увидят остальные</span>
     </div>
     <div class="row">
       <span class="k">ключ</span>
@@ -239,6 +260,26 @@
     border-color: var(--inv-bg);
     color: var(--inv-fg);
     font-weight: 700;
+  }
+
+  .avatar {
+    display: flex;
+    align-items: center;
+    gap: var(--gap-4);
+  }
+  .avatar img,
+  .avatar .none {
+    width: 3rem;
+    height: 3rem;
+    flex: none;
+    border: 1px solid var(--line);
+    object-fit: cover;
+  }
+  .avatar .none {
+    display: grid;
+    place-items: center;
+    color: var(--fg-faint);
+    text-transform: uppercase;
   }
 
   .notice {

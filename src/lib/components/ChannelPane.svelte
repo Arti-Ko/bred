@@ -48,6 +48,12 @@
           aria-current={channel.id === session.channelId ? 'true' : undefined}
           onclick={() =>
             channel.voice ? session.joinVoice(channel.id) : session.selectChannel(channel.id)}
+          oncontextmenu={(event) => {
+            // Правый клик по каналу — удалить его. Отдельной кнопки нет
+            // намеренно: в списке она мозолила бы глаза и звала промахнуться.
+            event.preventDefault();
+            void session.deleteChannel(channel.id, channel.name);
+          }}
         >
           <span class="k">{channel.voice ? '>' : '#'}</span>
           <span class="nm">{channel.name}</span>
@@ -64,6 +70,10 @@
         {/if}
       {/each}
     {/each}
+
+    {#if session.channels.length > 0}
+      <p class="hint muted">правый клик по каналу — удалить его</p>
+    {/if}
 
     {#if session.spaces.length === 0}
       <p class="hint">
@@ -139,6 +149,12 @@
     padding: 1px var(--gap-4) 1px 30px;
     color: var(--fg-dimmer);
     font-size: var(--text-xs);
+  }
+
+  .hint.muted {
+    color: var(--fg-faint);
+    font-size: var(--text-xs);
+    line-height: 1.4;
   }
 
   .hint {

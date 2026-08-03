@@ -134,6 +134,7 @@ export const api = {
   joinSpace: (ticket: string) => invoke<Id>('join_space', { ticket }),
   spaceInvite: (space: Id) => invoke<string>('space_invite', { space }),
   leaveSpace: (space: Id) => invoke<void>('leave_space', { space }),
+  deleteChannel: (space: Id, channel: Id) => invoke<void>('delete_channel', { space, channel }),
   openDirect: (peer: Id) => invoke<Id>('open_direct', { peer }),
   personalLink: () => invoke<string>('personal_link'),
   openDirectLink: (link: string) => invoke<Id>('open_direct_link', { link }),

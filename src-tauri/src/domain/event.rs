@@ -65,6 +65,8 @@ pub enum EventKind {
     },
     /// Убрать свой эмодзи из набора пространства.
     EmojiRemove { name: String },
+    /// Удалить канал вместе со всем, что в нём написано.
+    ChannelDelete { channel: ChannelId },
 }
 
 /// Описание прикреплённого файла.

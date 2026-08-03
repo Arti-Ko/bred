@@ -1,7 +1,11 @@
 // Состояние сессии. Один объект на приложение: панелей мало, а связей между
 // ними много, и таскать пропсы через четыре уровня было бы дороже.
 
-import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
+import {
+  ask as askDialog,
+  open as openFileDialog,
+  save as saveFileDialog,
+} from '@tauri-apps/plugin-dialog';
 import {
   isPermissionGranted,
   requestPermission,
@@ -379,6 +383,45 @@ export class Session {
       await api.saveAttachment(hash, target);
       await this.#loadMessages();
       this.#note(`сохранено: ${target}`);
+    } catch (error) {
+      this.#note(errorText(error));
+    }
+  }
+
+  /** Удалить своё сообщение. Чужие удалить нельзя — подпись не сойдётся. */
+  async deleteMessage(target: Id): Promise<void> {
+    if (!this.spaceId) return;
+    try {
+      await api.deleteMessage(this.spaceId, target);
+      await this.#loadMessages();
+      this.#note('сообщение удалено');
+    } catch (error) {
+      this.#note(errorText(error));
+    }
+  }
+
+  /**
+   * Удалить канал вместе со всей перепиской в нём — у всех участников.
+   * Спрашиваем подтверждение: отменить это нельзя.
+   */
+  async deleteChannel(channel: Id, name: string): Promise<void> {
+    if (!this.spaceId) return;
+    try {
+      const yes = await askDialog(
+        `Удалить канал «${name}» и всё, что в нём написано? У всех участников.`,
+        { title: 'Удаление канала', kind: 'warning' },
+      );
+      if (!yes) return;
+
+      await api.deleteChannel(this.spaceId, channel);
+      if (this.channelId === channel) {
+        this.channelId = null;
+        this.messages = [];
+      }
+      await this.#loadChannels();
+      const first = this.channels.find((c) => !c.voice);
+      if (first && !this.channelId) await this.selectChannel(first.id);
+      this.#note(`канал «${name}» удалён`);
     } catch (error) {
       this.#note(errorText(error));
     }

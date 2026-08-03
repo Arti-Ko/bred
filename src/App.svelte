@@ -25,9 +25,14 @@
 
   function submit() {
     const text = draft.trim();
-    if (!text) return;
-    history = [text, ...history].slice(0, 50);
-    cursor = -1;
+    // Пустая строка при прикреплённом файле — это «отправить только файл»,
+    // а не «ничего не делать». Раньше здесь стоял ранний выход, и одно
+    // вложение без подписи отправить было нельзя.
+    if (!text && session.pending.length === 0) return;
+    if (text) {
+      history = [text, ...history].slice(0, 50);
+      cursor = -1;
+    }
     draft = '';
     void session.send(text);
   }

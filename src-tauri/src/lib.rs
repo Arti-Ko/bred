@@ -191,6 +191,7 @@ pub fn run() {
             commands::remove_emoji,
             commands::leave_space,
             commands::create_channel,
+            commands::delete_channel,
             commands::send_message,
             commands::react,
             commands::edit_message,

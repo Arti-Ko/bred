@@ -335,6 +335,11 @@ pub async fn delete_message(app: State<'_, Arc<App>>, space: SpaceId, target: Id
 }
 
 #[tauri::command]
+pub async fn delete_channel(app: State<'_, Arc<App>>, space: SpaceId, channel: Id) -> Answer<()> {
+    app.delete_channel(space, channel).await.map_err(fail)
+}
+
+#[tauri::command]
 pub async fn set_nick(app: State<'_, Arc<App>>, nick: String) -> Answer<()> {
     app.set_nick(&nick).await.map_err(fail)
 }
