@@ -21,6 +21,21 @@ pub const MAX_FRAME: usize = 8 * 1024 * 1024;
 /// Сколько событий отдаём за один заход досинхронизации.
 pub const SYNC_BATCH: usize = 512;
 
+/// Версия формата провода.
+///
+/// Формат событий не самоописывающий: пропущенное или новое поле не
+/// «подставляется по умолчанию», а сдвигает весь поток. Поэтому узлы разных
+/// версий не могут читать события друг друга в принципе — и об этом надо
+/// говорить вслух, а не молча отбрасывать чужие сообщения.
+pub const PROTOCOL: u16 = 1;
+
+/// Конверт: версия снаружи, чтобы её можно было прочитать всегда.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Envelope {
+    pub version: u16,
+    pub body: Vec<u8>,
+}
+
 /// Сообщение, разлетающееся по gossip-рою пространства.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Broadcast {
@@ -71,6 +86,27 @@ pub struct Beacon {
 }
 
 // ── шифрование ──────────────────────────────────────────────────────────────
+
+/// Упаковать сообщение роя вместе с версией формата.
+pub fn wrap(key: &[u8; 32], message: &Broadcast) -> Result<Vec<u8>> {
+    let body = postcard::to_stdvec(message)?;
+    seal(
+        key,
+        &Envelope {
+            version: PROTOCOL,
+            body,
+        },
+    )
+}
+
+/// Распаковать сообщение роя. `Err` с версией — собеседник на другой версии.
+pub fn unwrap(key: &[u8; 32], raw: &[u8]) -> Result<Broadcast, Option<u16>> {
+    let envelope: Envelope = open(key, raw).map_err(|_| None)?;
+    if envelope.version != PROTOCOL {
+        return Err(Some(envelope.version));
+    }
+    postcard::from_bytes(&envelope.body).map_err(|_| Some(envelope.version))
+}
 
 /// Зашифровать сообщение ключом пространства.
 pub fn seal<T: Serialize>(key: &[u8; 32], value: &T) -> Result<Vec<u8>> {
@@ -192,6 +228,47 @@ mod tests {
         buf.extend_from_slice(b"...");
         let mut cursor = std::io::Cursor::new(buf);
         assert!(read_frame(&mut cursor).await.is_err());
+    }
+
+    #[test]
+    fn envelope_round_trips_within_one_version() {
+        let key = [5u8; 32];
+        let message = Broadcast::Typing {
+            channel: Id([2u8; 32]),
+            author: Id([3u8; 32]),
+        };
+        let raw = wrap(&key, &message).unwrap();
+        assert!(matches!(unwrap(&key, &raw), Ok(Broadcast::Typing { .. })));
+    }
+
+    #[test]
+    fn other_version_is_reported_not_swallowed() {
+        // Узел с другой версией формата обязан быть заметен: иначе со стороны
+        // это выглядит как «человек в сети, но его сообщения не приходят».
+        let key = [5u8; 32];
+        let alien = seal(
+            &key,
+            &Envelope {
+                version: PROTOCOL + 7,
+                body: vec![1, 2, 3],
+            },
+        )
+        .unwrap();
+        assert_eq!(unwrap(&key, &alien).err(), Some(Some(PROTOCOL + 7)));
+    }
+
+    #[test]
+    fn foreign_key_stays_silent() {
+        // А вот чужой ключ — обычное дело в открытом рое, шуметь не о чем.
+        let raw = wrap(
+            &[1u8; 32],
+            &Broadcast::Typing {
+                channel: Id([2u8; 32]),
+                author: Id([3u8; 32]),
+            },
+        )
+        .unwrap();
+        assert_eq!(unwrap(&[9u8; 32], &raw).err(), Some(None));
     }
 
     #[test]

@@ -453,7 +453,9 @@ impl App {
 
     pub async fn react(&self, space: SpaceId, target: Id, emoji: &str, remove: bool) -> Result<()> {
         let emoji = emoji.trim();
-        if emoji.is_empty() || emoji.chars().count() > 8 {
+        // Ограничение в восемь символов отсекало собственные эмодзи вида
+        // `:паррот:` — реакцией своей картинкой пользоваться было нельзя.
+        if emoji.is_empty() || emoji.chars().count() > 40 {
             return Err(anyhow!("некорректная реакция"));
         }
         self.commit_and_publish(

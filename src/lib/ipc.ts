@@ -111,6 +111,7 @@ export type Notice =
   | { kind: 'applied'; space: Id; event: Id }
   | { kind: 'presence'; space: Id }
   | { kind: 'fork'; space: Id; author: Id }
+  | { kind: 'version'; space: Id; theirs: number; ours: number }
   | { kind: 'typing'; space: Id; channel: Id; author: Id; nick: string }
   | { kind: 'net' };
 

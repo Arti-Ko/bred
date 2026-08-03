@@ -129,12 +129,14 @@ impl Store {
             "SELECT s.id, s.name, s.direct,
                     (SELECT COUNT(*) FROM messages m
                       JOIN channels c ON c.id = m.channel
-                     WHERE c.space = s.id AND m.lamport > COALESCE(
+                     WHERE c.space = s.id AND m.author != ?1 AND m.deleted = 0
+                       AND m.lamport > COALESCE(
                            (SELECT read_lamport FROM reads WHERE channel = c.id), 0))
              FROM spaces s ORDER BY s.rowid",
         )?;
+        let me = *self.me.lock();
         let rows = stmt
-            .query_map([], |r| {
+            .query_map(params![&me.0[..]], |r| {
                 Ok(SpaceRow {
                     id: id_from_row(r.get::<_, Vec<u8>>(0)?),
                     name: r.get(1)?,
@@ -371,14 +373,18 @@ impl Store {
     pub fn channels(&self, space: SpaceId) -> Result<Vec<ChannelRow>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
+            // Своё и удалённое непрочитанным не считается: значок над каналом,
+            // куда ты сам только что написал, — это просто вранье.
             "SELECT c.id, c.space, c.name, c.category, c.voice,
                     (SELECT COUNT(*) FROM messages m
-                      WHERE m.channel = c.id AND m.lamport > COALESCE(
+                      WHERE m.channel = c.id AND m.author != ?2 AND m.deleted = 0
+                        AND m.lamport > COALESCE(
                             (SELECT read_lamport FROM reads WHERE channel = c.id), 0))
              FROM channels c WHERE c.space = ?1 ORDER BY c.voice, c.created_ts",
         )?;
+        let me = *self.me.lock();
         let rows = stmt
-            .query_map(params![&space.0[..]], |r| {
+            .query_map(params![&space.0[..], &me.0[..]], |r| {
                 Ok(ChannelRow {
                     id: id_from_row(r.get::<_, Vec<u8>>(0)?),
                     space: id_from_row(r.get::<_, Vec<u8>>(1)?),
@@ -389,6 +395,34 @@ impl Store {
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+
+        // Личную переписку открывают обе стороны, и каждая заводит свой канал
+        // «личное» — сойтись они не могут, идентификатор канала это хеш события.
+        // Схлопываем одноимённые, оставляя наименьший: правило одинаково у всех.
+        let direct = conn
+            .query_row(
+                "SELECT direct IS NOT NULL FROM spaces WHERE id = ?1",
+                params![&space.0[..]],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            != 0;
+        if direct {
+            let mut seen: std::collections::HashMap<String, ChannelRow> = HashMap::new();
+            for row in rows {
+                seen.entry(row.name.clone())
+                    .and_modify(|kept| {
+                        if row.id.0 < kept.id.0 {
+                            *kept = row.clone();
+                        }
+                    })
+                    .or_insert(row);
+            }
+            let mut merged: Vec<ChannelRow> = seen.into_values().collect();
+            merged.sort_by_key(|c| (c.voice, c.id.0));
+            return Ok(merged);
+        }
         Ok(rows)
     }
 

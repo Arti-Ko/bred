@@ -52,6 +52,11 @@ enum UiNotice {
         space: Id,
         author: Id,
     },
+    Version {
+        space: Id,
+        theirs: u16,
+        ours: u16,
+    },
     Typing {
         space: Id,
         channel: Id,
@@ -67,6 +72,15 @@ impl From<Notice> for UiNotice {
             Notice::Applied { space, event } => UiNotice::Applied { space, event },
             Notice::Presence { space } => UiNotice::Presence { space },
             Notice::Fork { space, author } => UiNotice::Fork { space, author },
+            Notice::Version {
+                space,
+                theirs,
+                ours,
+            } => UiNotice::Version {
+                space,
+                theirs,
+                ours,
+            },
             Notice::Typing {
                 space,
                 channel,

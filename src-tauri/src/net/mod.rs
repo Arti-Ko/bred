@@ -35,7 +35,7 @@ use parking_lot::RwLock;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::domain::{now_ms, SignedEvent, Space, SpaceId};
-use wire::{open, seal, Broadcast, Presence};
+use wire::{Broadcast, Presence};
 
 /// Как часто напоминаем о себе соседям по пространству.
 const PRESENCE_INTERVAL: Duration = Duration::from_secs(10);
@@ -252,16 +252,26 @@ impl Net {
         let Some(sender) = self.senders.read().get(&space).cloned() else {
             return Ok(());
         };
-        let sealed = seal(&key, message)?;
+        let sealed = wire::wrap(&key, message)?;
         sender.broadcast(sealed.into()).await?;
         Ok(())
     }
 
     /// Разбор входящего сообщения роя.
     fn on_message(&self, space: SpaceId, key: &[u8; 32], raw: &[u8]) {
-        let Ok(message) = open::<Broadcast>(key, raw) else {
-            // Чужой ключ или мусор — молча игнорируем: в открытом рое это норма.
-            return;
+        let message = match wire::unwrap(key, raw) {
+            Ok(message) => message,
+            Err(None) => return, // чужой ключ или мусор — в открытом рое это норма
+            Err(Some(their)) => {
+                // Версии разошлись. Молчать нельзя: со стороны это выглядит как
+                // «человек онлайн, но его сообщения не приходят».
+                let _ = self.ctx.notices.send(Notice::Version {
+                    space,
+                    theirs: their,
+                    ours: wire::PROTOCOL,
+                });
+                return;
+            }
         };
         match message {
             Broadcast::Event(signed) => {

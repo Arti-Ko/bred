@@ -105,9 +105,11 @@
       return;
     }
     // Ctrl+1..9 — переключение каналов по номеру, как вкладки в терминале.
+    // Только текстовые: попасть по номеру в голосовой значило открыть пустую
+    // ленту, потому что сообщений там не бывает.
     if (mod && /^[1-9]$/.test(event.key)) {
       const index = Number(event.key) - 1;
-      const channel = session.channels[index];
+      const channel = session.channels.filter((c) => !c.voice)[index];
       if (channel) {
         event.preventDefault();
         void session.selectChannel(channel.id);

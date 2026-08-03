@@ -40,7 +40,14 @@ export class Call {
   #capture: Capture | null = null;
   #playback: Playback | null = null;
   #poll: number | null = null;
-  #speakers = new Map<Id, number>();
+  /**
+   * Когда от кого последний раз приходил звук.
+   *
+   * Реактивное состояние, а не обычная Map: подсветка говорящего — самое
+   * быстрое, что есть в звонке, а из Map она обновлялась только когда
+   * перерисовку вызывало что-то другое, то есть раз в полторы секунды.
+   */
+  #speakers = $state<Record<Id, number>>({});
 
   get localStream(): MediaStream | null {
     return this.stream;
@@ -48,7 +55,7 @@ export class Call {
 
   /** Говорит ли участник прямо сейчас (звук приходил меньше 400 мс назад). */
   speaking(id: Id): boolean {
-    const at = this.#speakers.get(id);
+    const at = this.#speakers[id];
     return at !== undefined && Date.now() - at < 400;
   }
 
@@ -124,7 +131,12 @@ export class Call {
 
     try {
       this.#playback = new Playback((author) => {
-        this.#speakers.set(author, Date.now());
+        const now = Date.now();
+        // Обновляем не чаще, чем нужно глазу: звук идёт полсотни кадров
+        // в секунду, и дёргать перерисовку на каждый — расточительство.
+        if (now - (this.#speakers[author] ?? 0) > 200) {
+          this.#speakers = { ...this.#speakers, [author]: now };
+        }
       });
       await this.#playback.listen((message) => (this.status = message));
       // Возвращаем ранее настроенную громкость, чтобы не крутить её заново.
@@ -165,7 +177,7 @@ export class Call {
       window.clearInterval(this.#poll);
       this.#poll = null;
     }
-    this.#speakers.clear();
+    this.#speakers = {};
     this.participants = [];
     this.stream = null;
     this.screens = [];
@@ -224,13 +236,13 @@ export class Call {
         for (const previous of this.participants) {
           if (!present.has(previous.id)) {
             this.#playback?.forget(previous.id);
-            this.#speakers.delete(previous.id);
+            delete this.#speakers[previous.id];
           }
         }
 
         this.participants = state.participants.map((id) => ({
           id,
-          spokeAt: this.#speakers.get(id) ?? 0,
+          spokeAt: this.#speakers[id] ?? 0,
         }));
         this.screens = this.#playback?.sharingScreen() ?? [];
       } catch {
