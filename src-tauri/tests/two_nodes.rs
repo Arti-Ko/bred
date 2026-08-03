@@ -60,7 +60,7 @@ async fn attachment_reaches_the_other_side() {
     )
     .await;
 
-    let invite = alice.invite(space).expect("приглашение");
+    let invite = alice.invite(space).await.expect("приглашение");
     boris.join_space(&invite).await.expect("вход по ссылке");
 
     // Файл, который поедет по сети.
@@ -148,7 +148,7 @@ async fn avatar_and_sticker_reach_the_other_side() {
         .await
         .expect("стикер");
 
-    let invite = alice.invite(space).expect("приглашение");
+    let invite = alice.invite(space).await.expect("приглашение");
     boris.join_space(&invite).await.expect("вход по ссылке");
 
     // Борис должен увидеть и профиль Алисы, и её стикер.

@@ -34,6 +34,12 @@ pub fn spawn(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     tokio::spawn(async move {
+        // Отключаемый маячок: в тестах интернет-пути он бы подменял собой всё,
+        // что мы там проверяем, и дыра в этом пути осталась бы незамеченной.
+        if std::env::var("BRED_NO_LAN").is_ok() {
+            tracing::info!("локальный маячок выключен переменной окружения");
+            return;
+        }
         let socket = match bind() {
             Ok(socket) => Arc::new(socket),
             Err(err) => {

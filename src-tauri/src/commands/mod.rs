@@ -55,7 +55,7 @@ pub fn bootstrap(handle: tauri::AppHandle) -> Answer<Bootstrap> {
 pub fn net_status(app: State<'_, Arc<App>>) -> Answer<NetStatus> {
     Ok(NetStatus {
         endpoint: app.net.endpoint_id().to_string(),
-        online: !app.net.addr_bytes().is_empty(),
+        online: app.net.reachable(),
         spaces: app.ctx.space_list().len(),
     })
 }
@@ -152,8 +152,8 @@ pub async fn open_direct(app: State<'_, Arc<App>>, peer: Id) -> Answer<SpaceId> 
 
 /// Ссылка-визитка для связи один на один.
 #[tauri::command]
-pub fn personal_link(app: State<'_, Arc<App>>) -> Answer<String> {
-    Ok(app.personal_link())
+pub async fn personal_link(app: State<'_, Arc<App>>) -> Answer<String> {
+    Ok(app.personal_link().await)
 }
 
 #[tauri::command]
@@ -185,8 +185,8 @@ pub async fn remove_emoji(app: State<'_, Arc<App>>, space: SpaceId, name: String
 }
 
 #[tauri::command]
-pub fn space_invite(app: State<'_, Arc<App>>, space: SpaceId) -> Answer<String> {
-    app.invite(space).map_err(fail)
+pub async fn space_invite(app: State<'_, Arc<App>>, space: SpaceId) -> Answer<String> {
+    app.invite(space).await.map_err(fail)
 }
 
 #[tauri::command]

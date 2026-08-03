@@ -146,10 +146,60 @@ impl Net {
         postcard::to_stdvec(&self.endpoint.addr()).unwrap_or_else(|_| self.addr_bytes())
     }
 
-    /// Подписка на пространство без точек входа: так входят в уже известные
-    /// пространства при старте — соседи найдутся сами через локалку или рой.
+    /// Видно ли нас из интернета: есть ретранслятор или неместный IP.
+    ///
+    /// Раньше признак «в сети» считался по непустоте адреса — а он непуст
+    /// всегда, там как минимум наш идентификатор. Индикатор горел зелёным даже
+    /// когда до нас было не дозвониться ниоткуда, кроме своей же квартиры.
+    pub fn reachable(&self) -> bool {
+        self.endpoint.addr().addrs.iter().any(|addr| match addr {
+            iroh::TransportAddr::Relay(_) => true,
+            iroh::TransportAddr::Ip(socket) => !is_local(&socket.ip()),
+            _ => false,
+        })
+    }
+
+    /// Подождать, пока станем доступны извне.
+    ///
+    /// Сразу после запуска у узла есть только адреса домашней сети: выбор
+    /// ретранслятора занимает пару секунд. Ссылка, снятая в этот промежуток,
+    /// уводит собеседника в его собственную локалку.
+    pub async fn wait_reachable(&self, limit: Duration) -> bool {
+        if self.reachable() {
+            return true;
+        }
+        tokio::time::timeout(limit, self.endpoint.online())
+            .await
+            .is_ok()
+    }
+
+    /// Вход в уже известное пространство при запуске.
+    ///
+    /// Точками входа берём тех, с кем уже общались. Рой gossip сам никого не
+    /// набирает: с пустым списком узел молча ждёт, пока наберут его. В локальной
+    /// сети эту роль берёт на себя UDP-маячок, а через интернет — никто, и
+    /// после перезапуска каждый оставался один в пространстве и в звонке, хотя
+    /// приложение бодро показывало «в сети». Ссылка-приглашение при этом не
+    /// спасала: она срабатывает ровно один раз, пока приложение не закрыли.
     pub async fn join(self: &Arc<Self>, space: Space) -> Result<()> {
-        self.join_via(space, &[]).await
+        let known = self.ctx.store.known_peers(space.id).unwrap_or_default();
+        let mut ids = Vec::new();
+        let mut addrs = Vec::new();
+        for (peer, addr) in known {
+            // Идентификатор годится и сам по себе: адрес по нему ищется в
+            // публичном справочнике. Сохранённый адрес — запасной путь на
+            // случай, если этот справочник в сети недоступен.
+            if let Some(id) = EndpointId::from_bytes(&peer.0)
+                .ok()
+                .filter(|id| *id != self.endpoint.id())
+            {
+                ids.push(id);
+            }
+            if let Some(raw) = addr {
+                addrs.push(raw);
+            }
+        }
+        self.join_with(space, &addrs, ids).await
     }
 
     /// Вход по приглашению: `bootstrap` — сериализованные адреса пригласившего.
@@ -159,7 +209,16 @@ impl Net {
     /// В локалке эту роль берёт на себя UDP-маячок, а через интернет — вот эти
     /// адреса из ссылки.
     pub async fn join_via(self: &Arc<Self>, space: Space, bootstrap: &[Vec<u8>]) -> Result<()> {
-        let mut entry_points = Vec::new();
+        self.join_with(space, bootstrap, Vec::new()).await
+    }
+
+    async fn join_with(
+        self: &Arc<Self>,
+        space: Space,
+        bootstrap: &[Vec<u8>],
+        extra: Vec<EndpointId>,
+    ) -> Result<()> {
+        let mut entry_points = extra;
         for raw in bootstrap {
             let Ok(addr) = postcard::from_bytes::<EndpointAddr>(raw) else {
                 continue;
@@ -172,6 +231,8 @@ impl Net {
             self.lookup.add_endpoint_info(addr.clone());
             entry_points.push(addr.id);
         }
+        entry_points.sort();
+        entry_points.dedup();
 
         let topic = TopicId::from_bytes(space.topic());
         let subscription = self.gossip.subscribe(topic, entry_points.clone()).await?;
@@ -292,6 +353,13 @@ impl Net {
                     if let Ok(addr) = postcard::from_bytes::<EndpointAddr>(&presence.addr) {
                         if addr.id != self.endpoint.id() {
                             self.lookup.add_endpoint_info(addr);
+                            // И на диск: при следующем запуске справочник в
+                            // памяти будет пуст, а набирать кого-то надо.
+                            let _ = self.ctx.store.remember_peer_addr(
+                                presence.author,
+                                space,
+                                &presence.addr,
+                            );
                         }
                     }
                 }
@@ -438,5 +506,17 @@ impl Net {
                 }
             }
         });
+    }
+}
+
+/// Адрес из домашней сети, по которому нас не найти из другого города.
+fn is_local(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
     }
 }

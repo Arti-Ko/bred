@@ -447,6 +447,34 @@ impl Store {
         schema::read_message(&conn, id, *self.me.lock())
     }
 
+    /// Запомнить, как в последний раз выглядел адрес соседа.
+    ///
+    /// Пригодится при следующем запуске: справочник в памяти к тому моменту
+    /// пуст, а публичный поиск по идентификатору доступен не в каждой сети.
+    pub fn remember_peer_addr(&self, peer: Id, space: SpaceId, addr: &[u8]) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE peers SET addr = ?3 WHERE id = ?1 AND space = ?2",
+            params![&peer.0[..], &space.0[..], addr],
+        )?;
+        Ok(())
+    }
+
+    /// Соседи по пространству и их последние адреса — точки входа в рой.
+    pub fn known_peers(&self, space: SpaceId) -> Result<Vec<(Id, Option<Vec<u8>>)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, addr FROM peers WHERE space = ?1 ORDER BY last_seen DESC LIMIT 32",
+        )?;
+        let rows = stmt
+            .query_map(params![&space.0[..]], |r| {
+                Ok((id_from_row(r.get::<_, Vec<u8>>(0)?), r.get(1)?))
+            })?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows)
+    }
+
     pub fn members(&self, space: SpaceId) -> Result<Vec<MemberRow>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(

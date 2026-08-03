@@ -139,6 +139,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     add_column(conn, "spaces", "direct", "BLOB")?;
     add_column(conn, "peers", "avatar", "BLOB")?;
     add_column(conn, "peers", "dh", "BLOB")?;
+    // Последний известный адрес соседа. Без него после перезапуска не к кому
+    // обратиться: рой gossip сам никого не набирает, а ссылка-приглашение
+    // одноразовая — она живёт только до закрытия приложения.
+    add_column(conn, "peers", "addr", "BLOB")?;
 
     Ok(())
 }

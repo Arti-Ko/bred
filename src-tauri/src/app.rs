@@ -2,7 +2,7 @@
 //! и предоставляет операции, которыми пользуется UI.
 
 use anyhow::{anyhow, Context, Result};
-use std::{path::Path, sync::Arc};
+use std::{path::Path, sync::Arc, time::Duration};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
@@ -18,6 +18,9 @@ use crate::{
 pub const PAGE: usize = 200;
 /// Потолок на файл, который можно показать прямо в ленте: всё, что больше,
 /// не картинка для превью, а вложение, и гнать его через IPC незачем.
+/// Сколько ждём пригодного для интернета адреса, прежде чем отдать ссылку.
+const LINK_WAIT: Duration = Duration::from_secs(10);
+
 const PREVIEW_LIMIT: u64 = 16 * 1024 * 1024;
 
 pub struct App {
@@ -79,7 +82,10 @@ impl App {
 
     /// Личная визитка: ссылка, по которой с тобой можно связаться напрямую,
     /// не имея ни одного общего пространства.
-    pub fn personal_link(&self) -> String {
+    pub async fn personal_link(&self) -> String {
+        // Пара секунд ожидания против ссылки, по которой невозможно прийти:
+        // сразу после запуска у нас только адреса домашней сети.
+        self.net.wait_reachable(LINK_WAIT).await;
         Hello {
             id: self.me(),
             nick: self.nick(),
@@ -273,7 +279,8 @@ impl App {
     }
 
     /// Ссылка-приглашение: несёт ключ пространства и наш адрес как точку входа.
-    pub fn invite(&self, space: SpaceId) -> Result<String> {
+    pub async fn invite(&self, space: SpaceId) -> Result<String> {
+        self.net.wait_reachable(LINK_WAIT).await;
         let space = self
             .ctx
             .space(space)
