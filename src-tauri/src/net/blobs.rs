@@ -72,7 +72,7 @@ impl std::fmt::Debug for BlobProtocol {
 impl ProtocolHandler for BlobProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         if let Err(err) = serve(self.ctx.clone(), connection).await {
-            tracing::debug!(%err, "раздача файла прервана");
+            tracing::warn!(%err, "раздача файла прервана");
         }
         Ok(())
     }
@@ -80,7 +80,17 @@ impl ProtocolHandler for BlobProtocol {
 
 async fn serve(ctx: Arc<Ctx>, connection: Connection) -> Result<()> {
     let (send, recv) = connection.accept_bi().await?;
-    serve_stream(&ctx, send, recv).await
+    serve_stream(&ctx, send, recv).await?;
+
+    // Ждём, пока получатель закроет соединение сам.
+    //
+    // Если вернуть управление сразу, соединение закроется здесь — вместе с
+    // байтами, которые собеседник ещё не успел дочитать. У него это выглядит
+    // как «connection lost», хотя файл был отдан целиком. Синхронизация
+    // сообщений живёт в цикле и потому уцелела, а раздача файлов — разовая,
+    // и обрывалась тем чаще, чем крупнее файл.
+    connection.closed().await;
+    Ok(())
 }
 
 /// Раздача поверх пары потоков. Отделена от QUIC-соединения, чтобы протокол

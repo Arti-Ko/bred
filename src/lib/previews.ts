@@ -24,6 +24,9 @@ export function shouldAutoFetch(file: AttachmentRow): boolean {
   return isViewable(file) && !file.local && file.size <= AUTO_FETCH_LIMIT;
 }
 
+/** Паузы между попытками забрать файл, миллисекунды. */
+const RETRIES = [1500, 4000, 10_000];
+
 /**
  * Идущие сейчас загрузки: иначе один и тот же файл тянулся бы по разу на
  * каждый компонент, который его показывает.
@@ -40,18 +43,31 @@ const inflight = new Map<Id, Promise<string | null>>();
 export async function previewUrl(hash: Id, space: Id | null): Promise<string | null> {
   const ready = cache.get(hash);
   if (ready) return ready;
-  if (!space) return null;
+
+  // Своя картинка (аватар в настройках) лежит на диске, и качать её не у кого.
+  // Пространства при этом может ещё не быть вовсе — в этом случае интерфейс
+  // раньше молча показывал пустоту вместо только что выбранного лица.
+  if (!space) return api.attachmentUrl(hash);
 
   const running = inflight.get(hash);
   if (running) return running;
 
   const task = (async () => {
     try {
-      const url = await api.ensureAttachment(space, hash);
-      cache.set(hash, url);
-      return url;
+      // Тот, у кого файл, может быть не в сети именно в эту секунду. Одной
+      // попытки мало: без повторов картинка оставалась битой до перезапуска.
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          const url = await api.ensureAttachment(space, hash);
+          cache.set(hash, url);
+          return url;
+        } catch (err) {
+          if (attempt >= RETRIES.length) throw err;
+          await new Promise((wake) => setTimeout(wake, RETRIES[attempt]));
+        }
+      }
     } catch {
-      // Ещё не у кого забрать — попробуем снова, когда человек появится.
+      // Забрать не у кого. Ничего не запоминаем — следующий показ попробует снова.
       return null;
     } finally {
       inflight.delete(hash);
