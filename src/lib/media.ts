@@ -345,8 +345,6 @@ export class Capture {
     let running = true;
     const pump = () => {
       if (!running || encoder.state !== 'configured') return;
-      // Очередь длиннее двух кадров означает, что мы не успеваем: пропускаем
-      // кадр вместо того, чтобы копить задержку.
       // Очередь длиннее двух кадров означает, что кодировщик не успевает.
       // Пропускаем кадр вместо того, чтобы копить и задержку, и память.
       if (encoder.encodeQueueSize < 2) {
@@ -355,9 +353,17 @@ export class Capture {
         encoder.encode(frame, { keyFrame: this.#videoFrames % KEYFRAME_EVERY === 1 });
         frame.close();
       }
-      requestAnimationFrame(pump);
+      schedule();
     };
-    requestAnimationFrame(pump);
+    // Пока окно на виду — по кадрам отрисовки. Когда свёрнуто — по таймеру:
+    // requestAnimationFrame в скрытом окне не вызывается вовсе, и собеседник
+    // видел, будто камеру выключили.
+    const schedule = () => {
+      if (!running) return;
+      if (document.hidden) window.setTimeout(pump, 1000 / 12);
+      else requestAnimationFrame(pump);
+    };
+    schedule();
 
     this.#stopFns.push(() => {
       running = false;
@@ -401,9 +407,17 @@ export class Capture {
         encoder.encode(frame, { keyFrame: frames % KEYFRAME_EVERY === 1 });
         frame.close();
       }
-      requestAnimationFrame(pump);
+      schedule();
     };
-    requestAnimationFrame(pump);
+    // Пока окно на виду — по кадрам отрисовки. Когда свёрнуто — по таймеру:
+    // requestAnimationFrame в скрытом окне не вызывается вовсе, и собеседник
+    // видел, будто камеру выключили.
+    const schedule = () => {
+      if (!running) return;
+      if (document.hidden) window.setTimeout(pump, 1000 / 12);
+      else requestAnimationFrame(pump);
+    };
+    schedule();
 
     keepStop(() => {
       running = false;

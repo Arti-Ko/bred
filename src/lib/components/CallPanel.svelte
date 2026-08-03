@@ -79,6 +79,7 @@
       <button onclick={() => call.toggleExpanded()}>
         {call.expanded ? 'свернуть' : 'развернуть'}
       </button>
+      {#if call.expanded}<span class="tip">Esc — свернуть</span>{/if}
       <button class="leave" onclick={() => call.leave()}>выйти [^E]</button>
     </header>
 
@@ -202,10 +203,21 @@
     max-height: none;
     align-content: start;
   }
-  /* Демонстрация занимает основную часть, камеры уходят полосой вниз */
-  .call.expanded .grid.with-screen .tile.wide {
+  /* Развёрнутый звонок — это лица во весь экран. Демонстрация показывается
+     отдельным режимом: вместе они делят место так, что не видно ни того,
+     ни другого. */
+  .call.expanded .grid {
+    grid-template-columns: repeat(auto-fit, minmax(min(28rem, 46%), 1fr));
+    align-content: center;
+    gap: var(--gap-4);
+    padding: var(--gap-4);
+  }
+  .call.expanded .grid:not(.only-screen) .tile.wide {
+    display: none;
+  }
+  .call.expanded .grid.only-screen .tile.wide {
     grid-column: 1 / -1;
-    height: 78vh;
+    height: 88vh;
     aspect-ratio: auto;
   }
   .grid.only-screen .tile:not(.wide) {
@@ -226,8 +238,10 @@
   .dot {
     color: var(--fg-hi);
   }
-  .count {
+  .count,
+  .tip {
     color: var(--fg-dimmer);
+    font-size: var(--text-xs);
   }
   .sp {
     flex: 1;

@@ -37,6 +37,9 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use crate::domain::{now_ms, SignedEvent, Space, SpaceId};
 use wire::{Broadcast, Presence};
 
+/// Сколько ждём файл от одного узла, прежде чем спросить следующего.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Как часто напоминаем о себе соседям по пространству.
 const PRESENCE_INTERVAL: Duration = Duration::from_secs(10);
 
@@ -323,16 +326,24 @@ impl Net {
             let Ok(peer) = iroh::PublicKey::from_bytes(&holder.0) else {
                 continue;
             };
-            match blobs::fetch(
-                self.ctx.clone(),
-                &self.endpoint,
-                EndpointAddr::from(peer),
-                space,
-                hash,
-                size,
+            // Со сроком: попытка достучаться до узла, которого нет в сети,
+            // иначе висит минутами. А пока она висит, забивается очередь
+            // запросов к ядру, и интерфейс сообщает «connection lost».
+            let attempt = tokio::time::timeout(
+                FETCH_TIMEOUT,
+                blobs::fetch(
+                    self.ctx.clone(),
+                    &self.endpoint,
+                    EndpointAddr::from(peer),
+                    space,
+                    hash,
+                    size,
+                ),
             )
             .await
-            {
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("собеседник не ответил вовремя")));
+
+            match attempt {
                 Ok(path) => return Ok(path),
                 Err(err) => {
                     tracing::debug!(holder = %holder.short(), %err, "не отдал файл, пробуем следующего");

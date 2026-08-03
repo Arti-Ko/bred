@@ -414,34 +414,47 @@ impl Media {
     }
 }
 
-/// Отправка кадров картинки: каждый — своим однонаправленным потоком.
+/// Отправка кадров картинки — одним долгоживущим потоком, кадр за кадром.
 ///
-/// Поток на кадр, а не один общий: внутри потока QUIC гарантирует порядок и
-/// доставку, а между потоками нет блокировки — застрявший кадр не задерживает
-/// следующие.
+/// Не поток на кадр: доставку это давало, а порядок — нет. Кодек не терпит
+/// перестановки, дельта-кадр раньше своего предшественника превращает картинку
+/// в кашу, которая не восстанавливается. Здесь порядок гарантирован самим QUIC.
+///
+/// Задержка одного кадра тормозит следующие, и это правильно: пропустить кадр
+/// в середине всё равно нельзя — распадётся всё до ближайшего ключевого.
 async fn write_frames(connection: Connection, mut frames: tokio::sync::mpsc::Receiver<Bytes>) {
+    let Ok(mut stream) = connection.open_uni().await else {
+        return;
+    };
     while let Some(frame) = frames.recv().await {
-        let Ok(mut stream) = connection.open_uni().await else {
-            break;
-        };
-        if stream.write_all(&frame).await.is_err() || stream.finish().is_err() {
+        let header = (frame.len() as u32).to_le_bytes();
+        if stream.write_all(&header).await.is_err() || stream.write_all(&frame).await.is_err() {
             break;
         }
     }
+    let _ = stream.finish();
 }
 
-/// Приём кадров картинки.
+/// Приём кадров картинки. Строго последовательно, без задачи на кадр:
+/// порядок обработки так же важен, как порядок доставки.
 async fn read_frames(media: Arc<Media>, connection: Connection) {
+    let Ok(mut stream) = connection.accept_uni().await else {
+        return;
+    };
+    let mut header = [0u8; 4];
     loop {
-        let Ok(mut stream) = connection.accept_uni().await else {
+        if stream.read_exact(&mut header).await.is_err() {
             break;
-        };
-        let media = media.clone();
-        tokio::spawn(async move {
-            if let Ok(raw) = stream.read_to_end(MAX_FRAME_BYTES).await {
-                media.on_packet(&raw);
-            }
-        });
+        }
+        let len = u32::from_le_bytes(header) as usize;
+        if len == 0 || len > MAX_FRAME_BYTES {
+            break; // мусор или попытка съесть память
+        }
+        let mut frame = vec![0u8; len];
+        if stream.read_exact(&mut frame).await.is_err() {
+            break;
+        }
+        media.on_packet(&frame);
     }
 }
 
