@@ -99,6 +99,18 @@
       </span>
     </div>
 
+    <div class="group">уведомления</div>
+    <div class="row">
+      <span class="k">звук</span>
+      <button class="act" onclick={() => prefs.toggleSoundOnMessage()}>
+        {prefs.soundOnMessage ? 'включён' : 'выключен'}
+      </button>
+      <span class="hint">
+        короткий сигнал на чужое сообщение: из фона всегда, а при открытом окне — только про
+        другие каналы
+      </span>
+    </div>
+
     <div class="group">сеть</div>
     <div class="row">
       <span class="k">узел</span>

@@ -145,6 +145,10 @@ where
     Ok(())
 }
 
+/// Сколько ждём, пока узел возьмёт трубку. Мёртвый адрес должен отваливаться
+/// быстро: за ним в очереди стоят живые.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
 /// Скачать вложение у конкретного пира. Возвращает путь к готовому файлу.
 pub async fn fetch(
     ctx: Arc<Ctx>,
@@ -170,7 +174,9 @@ pub async fn fetch(
         .map(|m| m.len())
         .unwrap_or(0);
 
-    let connection = endpoint.connect(peer, BLOB_ALPN).await?;
+    let connection = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(peer, BLOB_ALPN))
+        .await
+        .map_err(|_| anyhow!("узел не отвечает"))??;
     let (send, recv) = connection.open_bi().await?;
     fetch_stream(
         ctx.as_ref(),

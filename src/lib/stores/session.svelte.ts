@@ -27,6 +27,9 @@ import {
 } from '../ipc';
 import { call } from './call.svelte';
 import { forgetPreviews, shouldAutoFetch } from '../previews';
+import { forgetPrefetched, prefetchAll } from '../prefetch';
+import { chime } from '../chime';
+import { prefs } from './prefs.svelte';
 import { updates } from './updates.svelte';
 
 /** Сколько живёт отметка «печатает…» без подтверждения. */
@@ -144,9 +147,13 @@ export class Session {
     if (!this.spaceId) return;
     this.emojis = await api.listEmojis(this.spaceId).catch(() => []);
     // Картинки эмодзи нужны сразу: без них в тексте будут голые `:имена:`.
-    for (const emoji of this.emojis) {
-      await api.downloadAttachment(this.spaceId, emoji.hash).catch(() => undefined);
-    }
+    // Но ждать их здесь нельзя — список уже готов, и рисовать можно прямо
+    // сейчас. Раньше этот цикл ждал каждый файл по очереди и повторялся на
+    // каждой пачке событий, из-за чего лента замирала на ровном месте.
+    prefetchAll(
+      this.spaceId,
+      this.emojis.map((e) => e.hash),
+    );
   }
 
   /** Кто сидит в конкретном голосовом канале. */
@@ -187,12 +194,31 @@ export class Session {
     }
   }
 
-  /** Сообщение из фона — повод дёрнуть человека, но только чужое. */
+  /**
+   * Чужое сообщение — повод дёрнуть человека.
+   *
+   * Два разных сигнала с разными условиями. Звук нужен и тогда, когда окно на
+   * виду: человек читает один канал, а написали в другой — раньше он узнавал об
+   * этом, только случайно туда заглянув. Молчим лишь про тот канал, который
+   * прямо сейчас открыт и виден. Уведомление операционной системы, наоборот,
+   * только из фона: показывать его поверх открытого окна незачем.
+   *
+   * Разрешения тоже разные. Звук не спрашивает ничего, поэтому он больше не
+   * привязан к тому, дал ли человек доступ к уведомлениям системы — раньше
+   * отказ там означал полную тишину.
+   */
   async #notify(event: Id): Promise<void> {
-    if (!this.#canNotify || document.hasFocus()) return;
+    const background = !document.hasFocus();
+    if (!background && !prefs.soundOnMessage) return;
     try {
       const message = await api.getMessage(event);
       if (!message || message.author === this.me || message.deleted) return;
+
+      if (prefs.soundOnMessage && (background || message.channel !== this.channelId)) {
+        chime();
+      }
+
+      if (!this.#canNotify || !background) return;
       const channel = this.channels.find((c) => c.id === message.channel);
       sendNotification({
         title: channel ? `#${channel.name} · ${message.nick}` : message.nick,
@@ -321,13 +347,12 @@ export class Session {
   }
 
   /** Скачиваем чужие аватары сами: иначе в списке будут пустые квадраты. */
-  async #prefetchAvatars(): Promise<void> {
+  #prefetchAvatars(): void {
     if (!this.spaceId) return;
-    for (const member of this.members) {
-      if (member.avatar) {
-        await api.downloadAttachment(this.spaceId, member.avatar).catch(() => undefined);
-      }
-    }
+    prefetchAll(
+      this.spaceId,
+      this.members.flatMap((m) => (m.avatar ? [m.avatar] : [])),
+    );
   }
 
   /** Выбрать файлы и подготовить их к отправке. */
@@ -559,6 +584,7 @@ export class Session {
           this.channels = [];
           this.members = [];
           forgetPreviews();
+          forgetPrefetched();
           await api.collectGarbage().catch(() => undefined);
           if (this.spaces.length > 0) await this.selectSpace(this.spaces[0].id);
           this.#note(`вы вышли из «${name}», история стёрта`);
@@ -721,7 +747,7 @@ export class Session {
     this.messages = page;
     // Полная страница означает, что выше почти наверняка есть ещё.
     this.hasOlder = page.length >= PAGE;
-    void this.#prefetchImages(page);
+    this.#prefetchImages(page);
   }
 
   /** Подгрузка вверх по курсору. Возвращает, сколько добавилось. */
@@ -736,7 +762,7 @@ export class Session {
       this.hasOlder = page.length >= PAGE;
       if (page.length > 0) {
         this.messages = [...page, ...this.messages];
-        void this.#prefetchImages(page);
+        this.#prefetchImages(page);
       }
       return page.length;
     } catch (error) {
@@ -748,15 +774,12 @@ export class Session {
   }
 
   /** Небольшие картинки тянем заранее — иначе лента дырявая до клика. */
-  async #prefetchImages(page: MessageRow[]): Promise<void> {
+  #prefetchImages(page: MessageRow[]): void {
     if (!this.spaceId) return;
-    for (const message of page) {
-      for (const file of message.attachments) {
-        if (shouldAutoFetch(file)) {
-          await api.downloadAttachment(this.spaceId, file.hash).catch(() => undefined);
-        }
-      }
-    }
+    prefetchAll(
+      this.spaceId,
+      page.flatMap((m) => m.attachments.filter(shouldAutoFetch).map((f) => f.hash)),
+    );
   }
 
   // ── ветки ─────────────────────────────────────────────────────────────────
@@ -778,7 +801,7 @@ export class Session {
   async #loadMembers(): Promise<void> {
     if (!this.spaceId) return;
     this.members = await api.listMembers(this.spaceId);
-    void this.#prefetchAvatars();
+    this.#prefetchAvatars();
   }
 
   async #loadVoice(): Promise<void> {

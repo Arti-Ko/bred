@@ -7,18 +7,22 @@ const STORAGE_KEY = 'bred.prefs';
 
 interface Stored {
   colorVideo: boolean;
+  /** Звук при входящем сообщении. */
+  soundOnMessage: boolean;
   /** Громкость по каждому собеседнику, 1 — как есть. */
   volumes: Record<string, number>;
 }
 
+const DEFAULTS: Stored = { colorVideo: false, soundOnMessage: true, volumes: {} };
+
 function load(): Stored {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (raw) return { colorVideo: false, volumes: {}, ...JSON.parse(raw) };
+    if (raw) return { ...DEFAULTS, ...JSON.parse(raw) };
   } catch {
     // Повреждённые настройки — не повод не запускаться.
   }
-  return { colorVideo: false, volumes: {} };
+  return DEFAULTS;
 }
 
 export class Prefs {
@@ -36,6 +40,19 @@ export class Prefs {
    */
   volumes = $state<Record<string, number>>(load().volumes);
 
+  /**
+   * Короткий звук при чужом сообщении.
+   *
+   * По умолчанию включён: уведомление операционной системы человек пропускает,
+   * если окно просто ушло на второй план, а звук слышно всегда.
+   */
+  soundOnMessage = $state(load().soundOnMessage);
+
+  toggleSoundOnMessage(): void {
+    this.soundOnMessage = !this.soundOnMessage;
+    this.#save();
+  }
+
   toggleColorVideo(): void {
     this.colorVideo = !this.colorVideo;
     this.#save();
@@ -50,7 +67,11 @@ export class Prefs {
     try {
       localStorage.setItem(
         STORAGE_KEY,
-        JSON.stringify({ colorVideo: this.colorVideo, volumes: this.volumes }),
+        JSON.stringify({
+          colorVideo: this.colorVideo,
+          soundOnMessage: this.soundOnMessage,
+          volumes: this.volumes,
+        }),
       );
     } catch {
       // Нет доступа к хранилищу — настройка просто не переживёт перезапуск.

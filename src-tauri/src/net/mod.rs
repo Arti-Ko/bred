@@ -37,8 +37,19 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 use crate::domain::{now_ms, SignedEvent, Space, SpaceId};
 use wire::{Broadcast, Presence};
 
-/// Сколько ждём файл от одного узла, прежде чем спросить следующего.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
+/// Сколько ждём, пока узел вообще возьмёт трубку.
+///
+/// Отдельно от срока на сам файл: узла может не быть в сети, и тогда попытка
+/// должна отваливаться быстро — иначе очередь из пяти мёртвых адресов съедает
+/// минуту, а человек всё это время смотрит на пустое место вместо картинки.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// Сколько ждём сам файл после того, как соединение установлено.
+///
+/// Раньше на всё про всё было пятнадцать секунд, и крупный файл через
+/// ретранслятор просто не успевал приехать: обрыв выглядел как «не работает
+/// отправка файлов», хотя байты шли и шли.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Сколько ждём ретранслятора при запуске, прежде чем входить в рой.
 const STARTUP_WAIT: Duration = Duration::from_secs(20);
@@ -130,6 +141,16 @@ impl Net {
 
     pub fn media(&self) -> &Arc<Media> {
         &self.media
+    }
+
+    /// Закрыть узел по-человечески: попрощаться с соседями и отпустить сокет.
+    ///
+    /// Просто уронить `Net` мало — соединения продолжают жить в фоновых задачах
+    /// iroh, и снаружи узел ещё какое-то время выглядит доступным. Для тестов
+    /// это разница между «проверили обрыв» и «ничего не проверили».
+    pub async fn shutdown(&self) {
+        self.senders.write().clear();
+        self.endpoint.close().await;
     }
 
     /// Немедленно сообщить о себе. Вызывается при входе и выходе из звонка:
@@ -416,8 +437,50 @@ impl Net {
         }
     }
 
-    /// Скачать вложение. Перебираем тех, кто его упоминал, пока кто-то не отдаст:
-    /// автор может быть офлайн, но файл уже есть у любого, кто его получил.
+    /// Кого спрашивать про файл и в каком порядке.
+    ///
+    /// Автор — только первый кандидат, а не единственный. Байты есть у каждого,
+    /// кто их однажды получил, и когда автор ушёл спать, файл всё равно лежит у
+    /// соседей. Раньше список состоял из одного автора, и «отправка файлов не
+    /// работает» означало ровно это: спросить было решительно некого.
+    ///
+    /// Сначала те, кто прямо сейчас на связи: у них ответ придёт за секунды,
+    /// а не по таймауту.
+    fn candidates(&self, space: SpaceId, holders: &[crate::domain::Id]) -> Vec<crate::domain::Id> {
+        let me = self.ctx.identity.id();
+        let online: std::collections::HashSet<_> = self
+            .ctx
+            .presence_of(space)
+            .into_iter()
+            .map(|p| p.author)
+            .collect();
+
+        let mut ordered = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        // Три круга: живой держатель, живой сосед, всё остальное из истории.
+        let rest = self
+            .ctx
+            .store
+            .members(space)
+            .map(|rows| rows.into_iter().map(|r| r.id).collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        for who in holders
+            .iter()
+            .filter(|id| online.contains(id))
+            .chain(online.iter().filter(|id| !holders.contains(id)))
+            .chain(holders.iter())
+            .chain(rest.iter())
+        {
+            if *who != me && seen.insert(*who) {
+                ordered.push(*who);
+            }
+        }
+        ordered
+    }
+
+    /// Скачать вложение. Перебираем тех, у кого он может быть, пока кто-то не
+    /// отдаст: автор может быть офлайн, но файл уже есть у любого, кто его получил.
     pub async fn fetch_blob(
         &self,
         space: SpaceId,
@@ -426,18 +489,18 @@ impl Net {
         holders: &[crate::domain::Id],
     ) -> Result<std::path::PathBuf> {
         let mut last: Option<anyhow::Error> = None;
-        for holder in holders {
-            if *holder == self.ctx.identity.id() {
-                continue;
-            }
+        for holder in self.candidates(space, holders) {
+            let holder = &holder;
             let Ok(peer) = iroh::PublicKey::from_bytes(&holder.0) else {
                 continue;
             };
-            // Со сроком: попытка достучаться до узла, которого нет в сети,
-            // иначе висит минутами. А пока она висит, забивается очередь
-            // запросов к ядру, и интерфейс сообщает «connection lost».
+            // Два разных срока. Дозвон короткий: узла может не быть в сети, и
+            // висеть на нём минутами нельзя — очередь запросов к ядру забивается,
+            // и интерфейс сообщает «connection lost». А вот сама передача
+            // длинная: большой файл через ретранслятор едет долго, и обрывать
+            // его на пятнадцатой секунде — это и есть «файлы не отправляются».
             let attempt = tokio::time::timeout(
-                FETCH_TIMEOUT,
+                CONNECT_TIMEOUT + FETCH_TIMEOUT,
                 blobs::fetch(
                     self.ctx.clone(),
                     &self.endpoint,
