@@ -208,6 +208,22 @@ export class Call {
     this.#capture?.setMuted(this.micMuted);
   }
 
+  /**
+   * Выдать ключевой кадр по просьбе ядра — в звонке появился новый собеседник.
+   *
+   * Без этого он смотрел на чёрный прямоугольник до ближайшего кадра по
+   * расписанию, то есть несколько секунд.
+   */
+  requestKeyframe(): void {
+    this.#capture?.forceKeyframe();
+  }
+
+  /** Битрейт, подобранный ядром под реальный исходящий канал. */
+  applyBitrate(track: string, bps: number): void {
+    if (track !== 'video' && track !== 'screen') return;
+    this.#capture?.setBitrate(track, bps);
+  }
+
   /** Камеру включаем пересбором захвата: кодировщик настраивается один раз. */
   async toggleCamera(): Promise<void> {
     if (!this.active || !this.space || !this.channel) return;
