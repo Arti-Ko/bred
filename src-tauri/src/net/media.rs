@@ -301,11 +301,6 @@ pub fn decode_from_ui(raw: &[u8]) -> Result<(Track, bool, i64, &[u8])> {
 
 // ── очередь картинки ────────────────────────────────────────────────────────
 
-struct Frame {
-    bytes: Bytes,
-    keyframe: bool,
-}
-
 /// Очередь кадров одной дорожки к одному собеседнику.
 ///
 /// Обычный `mpsc` с `try_send` ронял то, что прилетело последним, — в том числе
@@ -314,7 +309,7 @@ struct Frame {
 /// **вытесняет всю очередь**, потому что всё, что стояло перед ним, декодеру уже
 /// не понадобится, а обычный кадр в переполненную очередь просто не встаёт.
 struct FrameQueue {
-    inner: Mutex<VecDeque<Frame>>,
+    inner: Mutex<VecDeque<Bytes>>,
     ready: tokio::sync::Notify,
     closed: AtomicBool,
     /// Сколько кадров пришлось выбросить — это и есть сигнал governor'у, что
@@ -344,12 +339,12 @@ impl FrameQueue {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 return;
             }
-            queue.push_back(Frame { bytes, keyframe });
+            queue.push_back(bytes);
         }
         self.ready.notify_one();
     }
 
-    fn pop(&self) -> Option<Frame> {
+    fn pop(&self) -> Option<Bytes> {
         self.inner.lock().pop_front()
     }
 
@@ -876,9 +871,8 @@ async fn write_track(connection: Connection, queue: Arc<FrameQueue>) {
             queue.ready.notified().await;
             continue;
         };
-        let header = (frame.bytes.len() as u32).to_le_bytes();
-        if stream.write_all(&header).await.is_err() || stream.write_all(&frame.bytes).await.is_err()
-        {
+        let header = (frame.len() as u32).to_le_bytes();
+        if stream.write_all(&header).await.is_err() || stream.write_all(&frame).await.is_err() {
             break;
         }
     }
@@ -1150,9 +1144,9 @@ mod tests {
         }
         queue.push(Bytes::from_static(b"key"), true);
 
-        let frame = queue.pop().expect("что-то в очереди есть");
-        assert!(
-            frame.keyframe,
+        assert_eq!(
+            queue.pop().as_deref(),
+            Some(&b"key"[..]),
             "ключевой кадр обязан вытеснить накопившееся, а не встать за ним"
         );
         assert!(queue.pop().is_none(), "после вытеснения очередь пуста");
