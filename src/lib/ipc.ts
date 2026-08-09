@@ -119,7 +119,11 @@ export type Notice =
   | { kind: 'fork'; space: Id; author: Id }
   | { kind: 'version'; space: Id; theirs: number; ours: number }
   | { kind: 'typing'; space: Id; channel: Id; author: Id; nick: string }
-  | { kind: 'net' };
+  | { kind: 'net' }
+  /** В звонке появился новый собеседник — кодировщику пора выдать ключевой кадр. */
+  | { kind: 'keyframe' }
+  /** Ядро подобрало битрейт дорожки под реальный исходящий канал. */
+  | { kind: 'bitrate'; track: string; bps: number };
 
 export const api = {
   bootstrap: () => invoke<Bootstrap>('bootstrap'),

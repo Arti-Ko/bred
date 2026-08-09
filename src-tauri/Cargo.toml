@@ -1,6 +1,6 @@
 [package]
 name = "bred"
-version = "0.1.16"
+version = "0.2.0"
 description = "БРЕД — Быстрая Ретрансляция Электронных Данных"
 edition = "2021"
 rust-version = "1.82"
@@ -42,7 +42,10 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 
 [profile.release]
-opt-level = "s"
+# Скорость, а не размер. На горячем пути — шифрование каждого пакета звонка,
+# blake3 по вложениям и postcard по событиям; `opt-level = "s"` экономил
+# мегабайты бинаря за счёт ровно тех циклов, которых не хватает в звонке.
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"

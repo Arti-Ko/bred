@@ -64,6 +64,11 @@ enum UiNotice {
         nick: String,
     },
     Net,
+    Keyframe,
+    Bitrate {
+        track: &'static str,
+        bps: u32,
+    },
 }
 
 impl From<Notice> for UiNotice {
@@ -93,6 +98,8 @@ impl From<Notice> for UiNotice {
                 nick,
             },
             Notice::Net => UiNotice::Net,
+            Notice::Keyframe => UiNotice::Keyframe,
+            Notice::Bitrate { track, bps } => UiNotice::Bitrate { track, bps },
         }
     }
 }

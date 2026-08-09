@@ -691,6 +691,15 @@ export class Session {
       case 'net':
         void this.#pollNet();
         break;
+      case 'keyframe':
+        // Декодер собеседника не начнёт работу, пока не увидит ключевой кадр.
+        call.requestKeyframe();
+        break;
+      case 'bitrate':
+        // Величину считает ядро: только оно видит исходящий канал и то,
+        // на скольких собеседников он делится.
+        call.applyBitrate(notice.track, notice.bps);
+        break;
     }
   }
 
