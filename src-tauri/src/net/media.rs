@@ -170,7 +170,12 @@ fn nonce_of(counter: u64) -> Nonce {
 /// `postcard`-вектор, потом второй вектор под nonce, потом копировал в него
 /// результат шифрования — три аллокации и два прохода по памяти на каждый из
 /// полусотни пакетов в секунду.
-fn seal_media(cipher: &ChaCha20Poly1305, counter: u64, head: &Head, data: &[u8]) -> Result<Vec<u8>> {
+fn seal_media(
+    cipher: &ChaCha20Poly1305,
+    counter: u64,
+    head: &Head,
+    data: &[u8],
+) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(WIRE_OVERHEAD + data.len());
     out.extend_from_slice(&counter.to_le_bytes());
     head.write(&mut out);
@@ -709,7 +714,10 @@ impl Media {
                     let mut dropped = self.dropped.lock();
                     *dropped += 1;
                     if *dropped % 300 == 1 {
-                        tracing::debug!(dropped = *dropped, "интерфейс не успевает, кадры теряются");
+                        tracing::debug!(
+                            dropped = *dropped,
+                            "интерфейс не успевает, кадры теряются"
+                        );
                     }
                 }
             }
