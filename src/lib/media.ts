@@ -303,7 +303,10 @@ export class Capture {
     const source = context.createMediaStreamSource(new MediaStream([track]));
 
     let timestamp = 0;
-    const push = (samples: Float32Array) => {
+    // Именно `Float32Array<ArrayBuffer>`, а не просто `Float32Array`: с версии
+    // 5.7 TypeScript различает, чем подложен типизированный массив, и
+    // `AudioData` не принимает тот, за которым может стоять `SharedArrayBuffer`.
+    const push = (samples: Float32Array<ArrayBuffer>) => {
       if (encoder.state !== 'configured') return;
       // AudioData держит память вне кучи JavaScript, и сборщик мусора её не
       // освобождает — только явный close(). Без него звук в звонке утекает
@@ -343,7 +346,7 @@ export class Capture {
   async #pumpAudio(
     context: AudioContext,
     source: MediaStreamAudioSourceNode,
-    push: (samples: Float32Array) => void,
+    push: (samples: Float32Array<ArrayBuffer>) => void,
   ): Promise<() => void> {
     // Подключение к выходу обязательно, иначе граф не тянет звук через узел;
     // громкость нулевая, чтобы не слышать самого себя.
@@ -359,7 +362,10 @@ export class Capture {
         outputChannelCount: [1],
         processorOptions: { blockSize: AUDIO_BLOCK },
       });
-      node.port.onmessage = (event: MessageEvent<Float32Array>) => push(event.data);
+      // Воркер передаёт владение буфером, поэтому за массивом стоит обычный
+      // `ArrayBuffer`, а не разделяемый.
+      node.port.onmessage = (event: MessageEvent<Float32Array<ArrayBuffer>>) =>
+        push(event.data);
       source.connect(node);
       node.connect(silence);
       return () => {
