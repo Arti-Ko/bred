@@ -123,25 +123,39 @@ pub async fn sync_with(
     peer: EndpointAddr,
     space: SpaceId,
 ) -> Result<usize> {
+    let connection = endpoint.connect(peer, SYNC_ALPN).await?;
+    let total = sync_over(&ctx, &connection, space).await;
+    connection.close(0u32.into(), "готово".as_bytes());
+    total
+}
+
+/// Обмен историей поверх **уже поднятого** соединения.
+///
+/// Отделено от дозвона намеренно. Сверка идёт к каждому соседу каждые пять
+/// секунд, и раньше каждая заводила своё соединение: рукопожатие QUIC, обмен
+/// ключами TLS — и всё это выбрасывалось через мгновение. Дорого здесь не
+/// столько процессорное время, сколько то, что свежее соединение начинает
+/// подбор скорости с нуля и может заново дёрнуть пробивку NAT — ровно поперёк
+/// того звонка, который идёт по соседнему пути того же endpoint.
+///
+/// Соединение остаётся открытым, а каждый раунд просит у него новую пару
+/// потоков: принимающая сторона (`serve`) для этого и написана циклом.
+pub async fn sync_over(ctx: &Ctx, connection: &Connection, space: SpaceId) -> Result<usize> {
     let key = ctx
         .space(space)
         .ok_or_else(|| anyhow!("неизвестное пространство"))?
         .key;
 
-    let connection = endpoint.connect(peer, SYNC_ALPN).await?;
-
     let mut total = 0usize;
     for _ in 0..MAX_ROUNDS {
         let (send, recv) = connection.open_bi().await?;
-        let round = sync_round(&ctx, send, recv, space, &key).await?;
+        let round = sync_round(ctx, send, recv, space, &key).await?;
         total += round.received;
         // Обе стороны исчерпались — больше ходить не за чем.
         if round.received == 0 && round.sent == 0 {
             break;
         }
     }
-
-    connection.close(0u32.into(), "готово".as_bytes());
     Ok(total)
 }
 

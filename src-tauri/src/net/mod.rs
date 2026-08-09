@@ -51,11 +51,22 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 /// отправка файлов», хотя байты шли и шли.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(180);
 
-/// Сколько ждём ретранслятора при запуске, прежде чем входить в рой.
+/// Сколько готовы ждать ретранслятора, чтобы позвать соседей ещё раз.
+///
+/// Это не пауза перед подпиской — подписка идёт сразу. Ожидание нужно только
+/// затем, чтобы повторить зов, когда до интернет-соседей станет возможно
+/// дозвониться. В локальной сети без интернета оно просто истекает, никого не
+/// задерживая.
 const STARTUP_WAIT: Duration = Duration::from_secs(20);
 
-/// Как часто проверяем, не остались ли мы в пространстве совсем одни.
-const REJOIN_INTERVAL: Duration = Duration::from_secs(20);
+/// С чего начинаем звать соседей, оставшись одни, и чем заканчиваем.
+///
+/// Раньше здесь стояли фиксированные двадцать секунд — столько узел и молчал
+/// после неудачного входа, показывая пустое пространство. Первая попытка теперь
+/// через полсекунды, а редкими они становятся, только если стучаться и правда
+/// некуда.
+const REJOIN_MIN: Duration = Duration::from_millis(500);
+const REJOIN_MAX: Duration = Duration::from_secs(20);
 
 /// Как часто сверяем историю с соседями.
 ///
@@ -80,6 +91,19 @@ pub struct Net {
     /// надо звать заново: сам рой этого не сделает.
     neighbors: RwLock<HashMap<SpaceId, std::collections::HashSet<EndpointId>>>,
     addr_bytes: Arc<RwLock<Vec<u8>>>,
+    /// Живые соединения досинхронизации, по одному на соседа.
+    ///
+    /// Сверка ходит к каждому соседу каждые пять секунд. Пока соединение
+    /// поднималось заново на каждую, это была непрерывная фоновая долбёжка
+    /// рукопожатиями — и она приходилась на тот же endpoint, по которому идёт
+    /// звонок.
+    sync_pool: parking_lot::Mutex<HashMap<EndpointId, iroh::endpoint::Connection>>,
+    /// С кем сверка идёт прямо сейчас.
+    ///
+    /// Она заводится из трёх мест сразу: по появлению соседа, по часам и по
+    /// маячку локальной сети. Без этого замка все три шли параллельно и втроём
+    /// спрашивали у человека одно и то же.
+    syncing: parking_lot::Mutex<std::collections::HashSet<(SpaceId, EndpointId)>>,
     _router: Router,
 }
 
@@ -119,6 +143,8 @@ impl Net {
             senders: RwLock::new(HashMap::new()),
             neighbors: RwLock::new(HashMap::new()),
             addr_bytes: Arc::new(RwLock::new(Vec::new())),
+            sync_pool: parking_lot::Mutex::new(HashMap::new()),
+            syncing: parking_lot::Mutex::new(std::collections::HashSet::new()),
             _router: router,
         });
 
@@ -128,21 +154,31 @@ impl Net {
         net.clone().keep_swarm_alive();
         net.clone().keep_history_in_sync();
 
-        // Ждём ретранслятор, и только потом подписываемся на рой.
+        // Подписываемся на рой сразу, не дожидаясь ретранслятора.
         //
-        // Сразу после запуска у узла есть лишь адреса домашней сети: выбор
-        // ретранслятора занимает пару секунд. Дозвон, сделанный в этот
-        // промежуток, внутри одной сети проходит напрямую и всё работает, а
-        // между разными сетями — обречён. И это не «попробуем позже»: рой
-        // восстанавливается только из пассивного набора, который при свежем
-        // запуске пуст, поэтому одна неудачная попытка отрезает узел насовсем.
+        // Раньше здесь стояло ожидание до двадцати секунд. Объяснялось оно тем,
+        // что неудачный первый дозвон отрезает узел насовсем: рой восстанавливает
+        // связи из пассивного набора, а при свежем запуске тот пуст. Это перестало
+        // быть правдой, как только повторный зов пошёл с быстрым backoff, — а
+        // цена ожидания оставалась всегда.
+        //
+        // Хуже всего она была там, где ретранслятора нет по определению.
+        // `reachable()` требует ретранслятор или неместный адрес; в локальной
+        // сети без интернета он не станет истинным никогда, и двадцать секунд
+        // простоя случались на каждом запуске — включая тот, где все собеседники
+        // сидят за соседним столом.
         let opening = net.clone();
         tokio::spawn(async move {
-            opening.wait_reachable(STARTUP_WAIT).await;
             for space in opening.ctx.space_list() {
                 if let Err(err) = opening.join(space.clone()).await {
                     tracing::warn!(space = %space.id.short(), %err, "не удалось подключиться к пространству");
                 }
+            }
+            // Точки входа из интернета до появления ретранслятора недостижимы:
+            // как только он поднялся — зовём соседей ещё раз. Обычно это пара
+            // секунд, а не двадцать.
+            if opening.wait_reachable(STARTUP_WAIT).await {
+                opening.rejoin_lonely_spaces().await;
             }
         });
 
@@ -160,6 +196,9 @@ impl Net {
     /// это разница между «проверили обрыв» и «ничего не проверили».
     pub async fn shutdown(&self) {
         self.senders.write().clear();
+        for (_, connection) in self.sync_pool.lock().drain() {
+            connection.close(0u32.into(), "выключаемся".as_bytes());
+        }
         self.endpoint.close().await;
     }
 
@@ -535,16 +574,56 @@ impl Net {
             .unwrap_or_else(|| anyhow::anyhow!("некого спросить: нет ни одного держателя файла")))
     }
 
-    /// Догнать историю у только что появившегося соседа.
+    /// Догнать историю у соседа, переиспользуя уже поднятое соединение.
     fn catch_up(self: Arc<Self>, space: SpaceId, peer: EndpointId) {
+        // Сверка к одному соседу заводится из трёх мест сразу: по его появлению,
+        // по часам и по маячку локальной сети. Пускаем одну — остальные две
+        // спрашивали бы ровно то же самое и ровно у того же человека.
+        if !self.syncing.lock().insert((space, peer)) {
+            return;
+        }
         tokio::spawn(async move {
-            let addr = EndpointAddr::from(peer);
-            match sync::sync_with(self.ctx.clone(), &self.endpoint, addr, space).await {
+            match self.sync_once(space, peer).await {
                 Ok(0) => tracing::debug!(space = %space.short(), "история уже совпадала"),
                 Ok(n) => tracing::info!(space = %space.short(), events = n, "догнали историю"),
                 Err(err) => tracing::debug!(%err, "досинхронизация не удалась"),
             }
+            self.syncing.lock().remove(&(space, peer));
         });
+    }
+
+    /// Один обмен историей: сперва по живому соединению, и только если его нет
+    /// или оно отвалилось — новым.
+    ///
+    /// Спрашивать соединение о живости отдельно не пробуем: между ответом и
+    /// использованием оно всё равно может умереть, так что проверять пришлось бы
+    /// дважды. Дешевле сразу воспользоваться, а на ошибке выбросить из пула и
+    /// один раз перенабрать.
+    async fn sync_once(&self, space: SpaceId, peer: EndpointId) -> Result<usize> {
+        let pooled = self.sync_pool.lock().get(&peer).cloned();
+        if let Some(connection) = pooled {
+            match sync::sync_over(&self.ctx, &connection, space).await {
+                Ok(count) => return Ok(count),
+                Err(err) => {
+                    tracing::debug!(peer = %peer.fmt_short(), %err, "соединение сверки отвалилось");
+                    self.sync_pool.lock().remove(&peer);
+                }
+            }
+        }
+
+        let connection = self
+            .endpoint
+            .connect(EndpointAddr::from(peer), sync::SYNC_ALPN)
+            .await?;
+        self.sync_pool.lock().insert(peer, connection.clone());
+
+        match sync::sync_over(&self.ctx, &connection, space).await {
+            Ok(count) => Ok(count),
+            Err(err) => {
+                self.sync_pool.lock().remove(&peer);
+                Err(err)
+            }
+        }
     }
 
     /// Периодически сообщаем соседям, что мы здесь.
@@ -602,41 +681,65 @@ impl Net {
     /// звонок. Поэтому исходный дозвон повторяем мы сами.
     fn keep_swarm_alive(self: Arc<Self>) {
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(REJOIN_INTERVAL);
-            ticker.tick().await; // первый тик приходит сразу, он не нужен
+            // Небольшая фора подписке при запуске: она идёт параллельно и обычно
+            // успевает за миллисекунды. Если всё же не успеет, повторный вход
+            // просто заменит отправителя, а дубли событий отсеет `apply`.
+            tokio::time::sleep(REJOIN_MIN).await;
+
+            let mut retry = REJOIN_MIN;
             loop {
-                ticker.tick().await;
-                if !self.reachable() {
-                    continue; // звать некого, пока нас самих не видно
-                }
-                for space in self.ctx.space_list() {
-                    let alone = self
-                        .neighbors
-                        .read()
-                        .get(&space.id)
-                        .map(|set| set.is_empty())
-                        .unwrap_or(true);
-                    if !alone {
-                        continue;
-                    }
-                    let Some(sender) = self.senders.read().get(&space.id).cloned() else {
-                        // Подписки ещё нет — значит вход при запуске не удался.
-                        if let Err(err) = self.join(space.clone()).await {
-                            tracing::debug!(space = %space.id.short(), %err, "повторный вход не удался");
-                        }
-                        continue;
-                    };
-                    let peers = self.known_ids(space.id);
-                    if peers.is_empty() {
-                        continue;
-                    }
-                    tracing::debug!(space = %space.id.short(), count = peers.len(), "одни в пространстве, зовём соседей заново");
-                    if let Err(err) = sender.join_peers(peers).await {
-                        tracing::debug!(%err, "повторный зов не прошёл");
-                    }
-                }
+                let wait = if self.rejoin_lonely_spaces().await {
+                    let now = retry;
+                    retry = (retry * 2).min(REJOIN_MAX);
+                    now
+                } else {
+                    // Рой на месте: проверяем редко. Но счётчик сбрасываем, чтобы
+                    // следующая беда снова начиналась с быстрых попыток, а не с
+                    // двадцати секунд молчания.
+                    retry = REJOIN_MIN;
+                    REJOIN_MAX
+                };
+                tokio::time::sleep(wait).await;
             }
         });
+    }
+
+    /// Позвать соседей туда, где мы остались одни.
+    /// Возвращает `true`, если хоть в одном пространстве мы одни.
+    async fn rejoin_lonely_spaces(self: &Arc<Self>) -> bool {
+        if !self.reachable() {
+            return false; // звать некого, пока нас самих не видно
+        }
+        let mut lonely = false;
+        for space in self.ctx.space_list() {
+            let alone = self
+                .neighbors
+                .read()
+                .get(&space.id)
+                .map(|set| set.is_empty())
+                .unwrap_or(true);
+            if !alone {
+                continue;
+            }
+            lonely = true;
+
+            let Some(sender) = self.senders.read().get(&space.id).cloned() else {
+                // Подписки ещё нет — значит вход при запуске не удался.
+                if let Err(err) = self.join(space.clone()).await {
+                    tracing::debug!(space = %space.id.short(), %err, "повторный вход не удался");
+                }
+                continue;
+            };
+            let peers = self.known_ids(space.id);
+            if peers.is_empty() {
+                continue;
+            }
+            tracing::debug!(space = %space.id.short(), count = peers.len(), "одни в пространстве, зовём соседей заново");
+            if let Err(err) = sender.join_peers(peers).await {
+                tracing::debug!(%err, "повторный зов не прошёл");
+            }
+        }
+        lonely
     }
 
     /// Сверять историю с соседями по часам, а не по случаю.
