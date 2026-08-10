@@ -1,6 +1,9 @@
 // Состояние звонка. Отдельно от общей сессии: у звонка своя частота изменений
 // (кадры идут десятками в секунду) и своё время жизни.
 
+import { getCurrentWindow } from '@tauri-apps/api/window';
+import type { UnlistenFn } from '@tauri-apps/api/event';
+
 import { api, errorText, type Id } from '../ipc';
 import { Capture, missingCapabilities, Playback } from '../media';
 import { prefs } from './prefs.svelte';
@@ -21,9 +24,18 @@ export class Call {
   /** Идёт ли звук вместе с демонстрацией и доступен ли он вообще. */
   screenAudio = $state(false);
   screenAudioAvailable = $state(false);
-  /** Звонок во весь экран, и режим «только демонстрация». */
+  /** Звонок на всё окно, и режим «только демонстрация». */
   expanded = $state(false);
   screenOnly = $state(false);
+  /**
+   * Демонстрация во весь физический экран.
+   *
+   * Это не то же самое, что `expanded`: тот раскрывает звонок на всё окно, но
+   * окно остаётся окном — сверху строка системы, снизу док, вокруг рамка. Здесь
+   * в полноэкранный режим уходит само окно, и от чужого экрана человека не
+   * отделяет уже ничего.
+   */
+  fullscreen = $state(false);
   /** Кто из собеседников показывает экран. */
   screens = $state<Id[]>([]);
   participants = $state<Participant[]>([]);
@@ -48,6 +60,10 @@ export class Call {
    * перерисовку вызывало что-то другое, то есть раз в полторы секунды.
    */
   #speakers = $state<Record<Id, number>>({});
+  /** Что было развёрнуто до полного экрана — чтобы вернуть, а не сбросить. */
+  #beforeFullscreen: { expanded: boolean; screenOnly: boolean } | null = null;
+  /** Слежение за окном: из полного экрана можно выйти и мимо нашей кнопки. */
+  #unwatchWindow: UnlistenFn | null = null;
 
   get localStream(): MediaStream | null {
     return this.stream;
@@ -75,8 +91,87 @@ export class Call {
 
   /** Развернуть звонок на всё окно и обратно. */
   toggleExpanded(): void {
+    // Из полного экрана «свернуть» обязано выводить именно из него, иначе
+    // кнопка выглядит сломанной: нажал — ничего не изменилось.
+    if (this.fullscreen) {
+      void this.exitFullscreen();
+      return;
+    }
     this.expanded = !this.expanded;
     if (!this.expanded) this.screenOnly = false;
+  }
+
+  /** Полный экран для чужой демонстрации — туда и обратно. */
+  async toggleFullscreen(): Promise<void> {
+    if (this.fullscreen) await this.exitFullscreen();
+    else await this.enterFullscreen();
+  }
+
+  async enterFullscreen(): Promise<void> {
+    if (this.fullscreen || this.screens.length === 0) return;
+    if (!(await this.#setWindowFullscreen(true))) return;
+
+    this.#beforeFullscreen = { expanded: this.expanded, screenOnly: this.screenOnly };
+    this.fullscreen = true;
+    // Полный экран без «только экрана» показывал бы чужую демонстрацию рядом с
+    // плитками камер — то есть мелко, ровно там, где хотели крупно.
+    this.expanded = true;
+    this.screenOnly = true;
+    await this.#watchWindow();
+  }
+
+  async exitFullscreen(): Promise<void> {
+    if (!this.fullscreen) return;
+    await this.#setWindowFullscreen(false);
+    this.#forgetFullscreen();
+  }
+
+  /**
+   * Вернуть интерфейс из полного экрана, не трогая само окно.
+   *
+   * Отдельно от `exitFullscreen`, потому что окно могло выйти само: на macOS
+   * это зелёная кнопка и Ctrl+Cmd+F, и тогда просить систему выйти повторно
+   * незачем — надо лишь догнать состояние.
+   */
+  #forgetFullscreen(): void {
+    this.fullscreen = false;
+    const before = this.#beforeFullscreen;
+    this.#beforeFullscreen = null;
+    this.expanded = before?.expanded ?? false;
+    this.screenOnly = before?.screenOnly ?? false;
+    this.#unwatchWindow?.();
+    this.#unwatchWindow = null;
+  }
+
+  async #setWindowFullscreen(on: boolean): Promise<boolean> {
+    try {
+      await getCurrentWindow().setFullscreen(on);
+      return true;
+    } catch (error) {
+      // Платформа не дала полноэкранный режим. Сказать честно лучше, чем
+      // оставить человека с кнопкой, которая молча ничего не делает.
+      this.status = errorText(error);
+      return false;
+    }
+  }
+
+  /**
+   * Следить, не вышло ли окно из полного экрана помимо нас.
+   *
+   * Полный экран снимается и средствами системы, и тогда интерфейс остался бы
+   * в режиме «только экран» с кнопкой «из полного экрана» — при обычном окне.
+   */
+  async #watchWindow(): Promise<void> {
+    try {
+      const window = getCurrentWindow();
+      this.#unwatchWindow = await window.onResized(async () => {
+        if (!this.fullscreen) return;
+        if (!(await window.isFullscreen())) this.#forgetFullscreen();
+      });
+    } catch {
+      // Без слежения полный экран работает, просто выходить из него придётся
+      // нашей же кнопкой. Это не повод не пускать в него вовсе.
+    }
   }
 
   /** Оставить на экране только демонстрацию, без плиток с камерами. */
@@ -169,6 +264,9 @@ export class Call {
   }
 
   async leave(): Promise<void> {
+    // Первым делом отпускаем экран: выйти из звонка и остаться в полноэкранном
+    // окне без единой кнопки — это тупик, из которого не видно выхода.
+    await this.exitFullscreen().catch(() => undefined);
     // Ни одна поломка при остановке не должна запереть человека в звонке.
     try {
       this.#capture?.stop();
@@ -274,6 +372,9 @@ export class Call {
           spokeAt: this.#speakers[id] ?? 0,
         }));
         this.screens = this.#playback?.sharingScreen() ?? [];
+        // Демонстрацию сняли — держать полный экран больше не на чем, там
+        // остался бы чёрный прямоугольник во весь монитор.
+        if (this.fullscreen && this.screens.length === 0) void this.exitFullscreen();
       } catch {
         // Молча: звонок важнее, чем точность списка на одном тике.
       }

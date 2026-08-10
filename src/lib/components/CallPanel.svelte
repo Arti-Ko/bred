@@ -46,12 +46,21 @@
 
 <svelte:window
   onkeydown={(event) => {
-    if (event.key === 'Escape' && call.expanded) call.toggleExpanded();
+    if (event.key !== 'Escape') return;
+    // Полный экран снимается первым: он «глубже» развёрнутого, и один Escape
+    // должен возвращать на один шаг, а не сразу к ленте.
+    if (call.fullscreen) void call.exitFullscreen();
+    else if (call.expanded) call.toggleExpanded();
   }}
 />
 
 {#if call.active}
-  <section class="call" class:expanded={call.expanded} aria-label="Звонок">
+  <section
+    class="call"
+    class:expanded={call.expanded}
+    class:fullscreen={call.fullscreen}
+    aria-label="Звонок"
+  >
     <header>
       <span class="dot blink">◉</span>
       <b>{session.channels.find((c) => c.id === call.channel)?.name ?? 'звонок'}</b>
@@ -75,11 +84,14 @@
         <button class:off={!call.screenOnly} onclick={() => call.toggleScreenOnly()}>
           только экран
         </button>
+        <button onclick={() => call.toggleFullscreen()}>
+          {call.fullscreen ? 'из полного экрана' : 'во весь экран'}
+        </button>
       {/if}
       <button onclick={() => call.toggleExpanded()}>
         {call.expanded ? 'свернуть' : 'развернуть'}
       </button>
-      {#if call.expanded}<span class="tip">Esc — свернуть</span>{/if}
+      {#if call.expanded && !call.fullscreen}<span class="tip">Esc — свернуть</span>{/if}
       <button class="leave" onclick={() => call.leave()}>выйти [^E]</button>
     </header>
 
@@ -176,6 +188,12 @@
       {/if}
     </div>
 
+    {#if call.fullscreen}
+      <!-- Подсказка живёт пару секунд и уходит: постоянная надпись поверх
+           чужого экрана закрывает как раз ту строчку, ради которой смотрят. -->
+      <span class="fs-hint">Esc — выйти · панель вверху экрана</span>
+    {/if}
+
     {#if call.status}
       <div class="err">{call.status}</div>
     {/if}
@@ -222,6 +240,70 @@
   }
   .grid.only-screen .tile:not(.wide) {
     display: none;
+  }
+
+  /* Полный экран — это уже не «звонок на всё окно»: окно ушло в полноэкранный
+     режим средствами системы, и всё, что не чужой экран, обязано уйти с
+     дороги. Фон чёрный, а не по теме: вокруг картинки должно быть ничто, а не
+     «наш тёмный». */
+  .call.fullscreen {
+    position: fixed;
+    inset: 0;
+    z-index: 90;
+    background: #000;
+  }
+  .call.fullscreen .grid {
+    padding: 0;
+    gap: 0;
+    align-content: stretch;
+  }
+  .call.fullscreen .grid.only-screen .tile.wide {
+    height: 100vh;
+    border: none;
+    background: #000;
+  }
+  /* Панель не занимает место постоянно: всплывает, когда курсор подводят к
+     верхней кромке, и не мешает, пока не нужна. Прозрачная она остаётся
+     кликабельной, поэтому наведение работает и на невидимой. */
+  .call.fullscreen header {
+    position: absolute;
+    inset: 0 0 auto 0;
+    z-index: 3;
+    background: var(--bg);
+    border-bottom: 1px solid var(--line);
+    opacity: 0;
+    transition: opacity var(--fast) var(--ease);
+  }
+  .call.fullscreen header:hover,
+  .call.fullscreen header:focus-within {
+    opacity: 1;
+  }
+  /* Имя показывающего — тоже помеха поверх текста. Появляется по наведению. */
+  .call.fullscreen figcaption {
+    opacity: 0;
+    transition: opacity var(--fast) var(--ease);
+  }
+  .call.fullscreen .tile:hover figcaption {
+    opacity: 1;
+  }
+
+  .fs-hint {
+    position: absolute;
+    right: var(--gap-4);
+    bottom: var(--gap-4);
+    z-index: 4;
+    padding: 0.2rem 0.6rem;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    color: var(--fg-dimmer);
+    font-size: var(--text-xs);
+    animation: fs-hint-out var(--fast) var(--ease) 2.6s forwards;
+  }
+  @keyframes fs-hint-out {
+    to {
+      opacity: 0;
+      visibility: hidden;
+    }
   }
 
   header {
@@ -295,6 +377,12 @@
   .tile.wide {
     grid-column: span 2;
     aspect-ratio: 16 / 9;
+  }
+  /* Чужой экран нельзя обрезать под пропорции плитки: смысл демонстрации в
+     том, чтобы прочитать, что на ней, а `cover` срезает края — как раз там,
+     где панели и меню. */
+  .tile.wide canvas {
+    object-fit: contain;
   }
 
   .tile video,

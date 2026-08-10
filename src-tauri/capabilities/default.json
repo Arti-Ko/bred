@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Права окна БРЕД: выбор файлов для отправки и открытие полученных.",
+  "description": "Права окна БРЕД: выбор файлов, открытие полученных и полный экран для демонстрации.",
   "windows": [
     "main"
   ],
@@ -16,6 +16,8 @@
     "notification:allow-is-permission-granted",
     "updater:default",
     "process:allow-restart",
-    "dialog:allow-ask"
+    "dialog:allow-ask",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-is-fullscreen"
   ]
 }
