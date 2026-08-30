@@ -292,15 +292,30 @@ pub fn call_state(app: State<'_, Arc<App>>) -> Answer<CallState> {
 // ── общий плеер ─────────────────────────────────────────────────────────────
 
 /// Что можно подключить: приложения плюс весь звук системы.
+///
+/// Асинхронная и в отдельном потоке не для красоты: синхронная команда Tauri
+/// исполняется в главном потоке, а система на первый такой запрос показывает
+/// диалог разрешения и держит ответ до тех пор, пока человек не нажмёт. В
+/// главном потоке это выглядело бы как зависшее окно.
 #[tauri::command]
-pub fn music_sources(app: State<'_, Arc<App>>) -> Answer<Vec<crate::player::Source>> {
-    app.music_sources().map_err(fail)
+pub async fn music_sources(app: State<'_, Arc<App>>) -> Answer<Vec<crate::player::Source>> {
+    let app = app.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || app.music_sources())
+        .await
+        .map_err(|err| format!("опрос источников не завершился: {err}"))?
+        .map_err(fail)
 }
 
 /// Начать транслировать звук источника на комнату.
+///
+/// Тоже в отдельном потоке — см. `music_sources`: запуск захвата ждёт системы.
 #[tauri::command]
-pub fn music_start(app: State<'_, Arc<App>>, source: String) -> Answer<()> {
-    app.inner().music_start(&source).map_err(fail)
+pub async fn music_start(app: State<'_, Arc<App>>, source: String) -> Answer<()> {
+    let app = app.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || app.music_start(&source))
+        .await
+        .map_err(|err| format!("запуск захвата не завершился: {err}"))?
+        .map_err(fail)
 }
 
 #[tauri::command]
