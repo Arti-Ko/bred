@@ -11,9 +11,16 @@ interface Stored {
   soundOnMessage: boolean;
   /** Громкость по каждому собеседнику, 1 — как есть. */
   volumes: Record<string, number>;
+  /** Громкость общего плеера у себя, 1 — как есть. */
+  musicVolume: number;
 }
 
-const DEFAULTS: Stored = { colorVideo: false, soundOnMessage: true, volumes: {} };
+const DEFAULTS: Stored = {
+  colorVideo: false,
+  soundOnMessage: true,
+  volumes: {},
+  musicVolume: 0.7,
+};
 
 function load(): Stored {
   try {
@@ -41,6 +48,16 @@ export class Prefs {
   volumes = $state<Record<string, number>>(load().volumes);
 
   /**
+   * Громкость общего плеера.
+   *
+   * Своя у каждого слушателя и отдельно от голоса — иначе не выйдет главного:
+   * приглушить музыку, чтобы за ней было слышно разговор. По умолчанию тише
+   * единицы: музыка приходит с полной громкости приложения-источника и легко
+   * перекрикивает людей.
+   */
+  musicVolume = $state(load().musicVolume);
+
+  /**
    * Короткий звук при чужом сообщении.
    *
    * По умолчанию включён: уведомление операционной системы человек пропускает,
@@ -63,6 +80,11 @@ export class Prefs {
     this.#save();
   }
 
+  setMusicVolume(value: number): void {
+    this.musicVolume = value;
+    this.#save();
+  }
+
   #save(): void {
     try {
       localStorage.setItem(
@@ -71,6 +93,7 @@ export class Prefs {
           colorVideo: this.colorVideo,
           soundOnMessage: this.soundOnMessage,
           volumes: this.volumes,
+          musicVolume: this.musicVolume,
         }),
       );
     } catch {

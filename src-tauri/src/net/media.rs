@@ -48,7 +48,7 @@ use crate::domain::{ChannelId, Id, SpaceId};
 /// Старый и новый БРЕД не должны договориться о медиа: разойдись они по формату
 /// заголовка — и звонок выглядел бы установленным, но состоял бы из тишины и
 /// чёрных прямоугольников. Разные ALPN честнее: связь просто не поднимется.
-pub const MEDIA_ALPN: &[u8] = b"bred/media/2";
+pub const MEDIA_ALPN: &[u8] = b"bred/media/3";
 
 /// Как часто сверяем состав комнаты с присутствием.
 const RECONCILE: Duration = Duration::from_secs(2);
@@ -89,10 +89,17 @@ pub const SINK_QUEUE: usize = 96;
 /// подтвердил QUIC. Раньше автор брался из тела пакета, и любой участник
 /// пространства мог представиться кем угодно; теперь подделать его нельзя.
 ///
-/// `[0]` дорожка и признак ключевого кадра, `[1..5]` метка канала,
-/// `[5..9]` номер кадра, `[9..11]` номер части, `[11..13]` всего частей,
-/// `[13..21]` время в микросекундах.
+/// `[0]` дорожка (биты 0-2), кодек (биты 3-5) и признак ключевого кадра
+/// (бит 7), `[1..5]` метка канала, `[5..9]` номер кадра, `[9..11]` номер части,
+/// `[11..13]` всего частей, `[13..21]` время в микросекундах.
 const HEADER: usize = 21;
+/// Дорожек всего четыре, и больше восьми не будет: под них хватает трёх бит.
+const TRACK_MASK: u8 = 0x07;
+/// Кодек живёт в соседних трёх битах того же байта — лишний байт на кадр при
+/// полусотне кадров в секунду на каждого собеседника не стоит своей ясности.
+const CODEC_SHIFT: u8 = 3;
+const CODEC_MASK: u8 = 0x07;
+
 /// Счётчик nonce на проводе.
 const NONCE_WIRE: usize = 8;
 /// Тег Poly1305.
@@ -105,6 +112,14 @@ pub const WIRE_OVERHEAD: usize = NONCE_WIRE + HEADER + TAG;
 struct Head {
     track: Track,
     keyframe: bool,
+    /// Каким кодеком сжат кадр. Ядро в него не заглядывает и не перекодирует —
+    /// только доносит до чужого вебвью, которому иначе нечем настроить декодер.
+    ///
+    /// Кодек выбирает отправитель, и на разных машинах он разный: где есть
+    /// аппаратный H.264, картинка идёт им, а VP8 остаётся для тех, у кого нет
+    /// ничего лучше. Раньше кодек был прибит гвоздями с обеих сторон, и любая
+    /// попытка взять кодек получше кончалась чёрным прямоугольником.
+    codec: u8,
     channel_tag: [u8; 4],
     seq: u32,
     part: u16,
@@ -114,7 +129,11 @@ struct Head {
 
 impl Head {
     fn write(&self, out: &mut Vec<u8>) {
-        out.push(self.track.code() | if self.keyframe { 0x80 } else { 0 });
+        out.push(
+            self.track.code()
+                | ((self.codec & CODEC_MASK) << CODEC_SHIFT)
+                | if self.keyframe { 0x80 } else { 0 },
+        );
         out.extend_from_slice(&self.channel_tag);
         out.extend_from_slice(&self.seq.to_le_bytes());
         out.extend_from_slice(&self.part.to_le_bytes());
@@ -127,8 +146,9 @@ impl Head {
             return None;
         }
         Some(Self {
-            track: Track::from_code(raw[0] & 0x7f)?,
+            track: Track::from_code(raw[0] & TRACK_MASK)?,
             keyframe: raw[0] & 0x80 != 0,
+            codec: (raw[0] >> CODEC_SHIFT) & CODEC_MASK,
             channel_tag: raw[1..5].try_into().ok()?,
             seq: u32::from_le_bytes(raw[5..9].try_into().ok()?),
             part: u16::from_le_bytes(raw[9..11].try_into().ok()?),
@@ -216,6 +236,12 @@ pub enum Track {
     Screen,
     /// Звук вместе с демонстрацией экрана.
     ScreenAudio,
+    /// Общий плеер комнаты: звук приложения, который ведущий включил на всех.
+    ///
+    /// Отдельно от звука экрана, и не по формальности: у него своя громкость у
+    /// каждого слушателя, свой битрейт и два канала вместо одного. Музыка в
+    /// моно на тридцати двух килобитах — это уже не музыка.
+    Music,
 }
 
 impl Track {
@@ -232,6 +258,7 @@ impl Track {
             Track::Video => 1,
             Track::Screen => 2,
             Track::ScreenAudio => 3,
+            Track::Music => 4,
         }
     }
 
@@ -241,6 +268,7 @@ impl Track {
             1 => Some(Track::Video),
             2 => Some(Track::Screen),
             3 => Some(Track::ScreenAudio),
+            4 => Some(Track::Music),
             _ => None,
         }
     }
@@ -252,6 +280,7 @@ impl Track {
             Track::Video => "video",
             Track::Screen => "screen",
             Track::ScreenAudio => "screen-audio",
+            Track::Music => "music",
         }
     }
 }
@@ -259,16 +288,19 @@ impl Track {
 /// Заголовок обмена с интерфейсом. Компактный бинарный формат: гонять кадры
 /// видео через JSON было бы вчетверо дороже.
 ///
-/// `[0]` версия, `[1]` дорожка, `[2]` флаги, `[3..35]` автор, `[35..43]` время,
-/// `[43..47]` номер кадра — по нему вебвью видит потерю и растит буфер вместо
-/// того, чтобы булькать.
+/// `[0]` версия, `[1]` дорожка, `[2]` флаги — ключевой кадр в бите 0 и кодек
+/// в битах 1-3, `[3..35]` автор, `[35..43]` время, `[43..47]` номер кадра — по
+/// нему вебвью видит потерю и растит буфер вместо того, чтобы булькать.
 pub const UI_HEADER: usize = 47;
-const UI_VERSION: u8 = 2;
+const UI_VERSION: u8 = 3;
+/// Сдвиг кодека во флагах обмена с интерфейсом: бит 0 занят ключевым кадром.
+const UI_CODEC_SHIFT: u8 = 1;
 
 pub fn encode_for_ui(
     author: Id,
     track: Track,
     keyframe: bool,
+    codec: u8,
     ts: i64,
     seq: u32,
     data: &[u8],
@@ -276,7 +308,7 @@ pub fn encode_for_ui(
     let mut out = Vec::with_capacity(UI_HEADER + data.len());
     out.push(UI_VERSION);
     out.push(track.code());
-    out.push(u8::from(keyframe));
+    out.push(u8::from(keyframe) | ((codec & CODEC_MASK) << UI_CODEC_SHIFT));
     out.extend_from_slice(&author.0);
     out.extend_from_slice(&ts.to_le_bytes());
     out.extend_from_slice(&seq.to_le_bytes());
@@ -286,7 +318,7 @@ pub fn encode_for_ui(
 
 /// Разбор того, что прислал интерфейс. Автор в заголовке игнорируется:
 /// подставить чужой идентификатор из UI не должно быть возможно.
-pub fn decode_from_ui(raw: &[u8]) -> Result<(Track, bool, i64, &[u8])> {
+pub fn decode_from_ui(raw: &[u8]) -> Result<(Track, bool, u8, i64, &[u8])> {
     if raw.len() < UI_HEADER {
         return Err(anyhow!("кадр короче заголовка"));
     }
@@ -294,9 +326,10 @@ pub fn decode_from_ui(raw: &[u8]) -> Result<(Track, bool, i64, &[u8])> {
         return Err(anyhow!("незнакомая версия кадра: {}", raw[0]));
     }
     let track = Track::from_code(raw[1]).ok_or_else(|| anyhow!("неизвестная дорожка"))?;
-    let keyframe = raw[2] != 0;
+    let keyframe = raw[2] & 1 != 0;
+    let codec = (raw[2] >> UI_CODEC_SHIFT) & CODEC_MASK;
     let ts = i64::from_le_bytes(raw[35..43].try_into().expect("восемь байт на месте"));
-    Ok((track, keyframe, ts, &raw[UI_HEADER..]))
+    Ok((track, keyframe, codec, ts, &raw[UI_HEADER..]))
 }
 
 // ── очередь картинки ────────────────────────────────────────────────────────
@@ -374,11 +407,16 @@ const GOVERNOR_TICK: Duration = Duration::from_secs(2);
 const CALM_TICKS: u32 = 2;
 
 /// Потолки: столько дорожка получит, когда собеседник один и канал свободен.
+///
+/// У демонстрации он выше камеры на порядок, и это не щедрость. Лицо в плитке
+/// шириной в ладонь прощает и шум, и мыло; чужой экран разворачивают на весь
+/// монитор и читают на нём код — а буквы держатся не на разрешении, а на битах,
+/// и при 2.5 Мбит/с на 1080p первая же прокрутка превращала текст в кашу.
 const CEILING_VIDEO: u32 = 900_000;
-const CEILING_SCREEN: u32 = 2_500_000;
+const CEILING_SCREEN: u32 = 8_000_000;
 /// Полы: ниже картинка бессмысленна, лучше её выключить, чем показывать кашу.
 const FLOOR_VIDEO: u32 = 120_000;
-const FLOOR_SCREEN: u32 = 350_000;
+const FLOOR_SCREEN: u32 = 600_000;
 
 /// Состояние подбора битрейта по одной дорожке.
 struct Governor {
@@ -530,7 +568,14 @@ impl Media {
     ///
     /// Синхронно и намеренно: внутри нет ни одной точки ожидания, а обёртка в
     /// задачу порождала бы под сотню задач в секунду, каждую с копией кадра.
-    pub fn broadcast(&self, track: Track, keyframe: bool, ts: i64, data: &[u8]) -> Result<()> {
+    pub fn broadcast(
+        &self,
+        track: Track,
+        keyframe: bool,
+        codec: u8,
+        ts: i64,
+        data: &[u8],
+    ) -> Result<()> {
         // Шифр и метку комнаты забираем сразу и отпускаем блокировку: держать её
         // до `peers` нельзя, иначе встречный порядок захвата с `join`.
         let Some((cipher, tag)) = ({
@@ -550,6 +595,7 @@ impl Media {
         let head = |part: u16, parts: u16| Head {
             track,
             keyframe,
+            codec,
             channel_tag: tag,
             seq,
             part,
@@ -924,6 +970,7 @@ struct Partial {
     parts: Vec<Option<Vec<u8>>>,
     filled: usize,
     keyframe: bool,
+    codec: u8,
     ts: i64,
 }
 
@@ -939,6 +986,7 @@ impl Reassembly {
                 author,
                 head.track,
                 head.keyframe,
+                head.codec,
                 head.ts,
                 head.seq,
                 &data,
@@ -950,6 +998,7 @@ impl Reassembly {
             parts: vec![None; head.parts as usize],
             filled: 0,
             keyframe: head.keyframe,
+            codec: head.codec,
             ts: head.ts,
         });
 
@@ -972,6 +1021,7 @@ impl Reassembly {
                 author,
                 head.track,
                 done.keyframe,
+                done.codec,
                 done.ts,
                 head.seq,
                 &whole,
@@ -1038,6 +1088,7 @@ mod tests {
         Head {
             track: Track::Video,
             keyframe: true,
+            codec: 1,
             channel_tag: [2, 2, 2, 2],
             seq,
             part,
@@ -1061,6 +1112,7 @@ mod tests {
         let original = Head {
             track: Track::ScreenAudio,
             keyframe: false,
+            codec: CODEC_MASK,
             channel_tag: [1, 2, 3, 4],
             seq: 4_000_000_000,
             part: 7,
@@ -1279,11 +1331,42 @@ mod tests {
     }
 
     #[test]
+    fn codec_survives_the_wire() {
+        // Кодек и дорожка делят один байт. Ошибись в маске — и кадр H.264
+        // приедет с чужим номером дорожки или с кодеком VP8, то есть чёрным
+        // прямоугольником вместо картинки.
+        for codec in 0..=CODEC_MASK {
+            for track in [
+                Track::Audio,
+                Track::Video,
+                Track::Screen,
+                Track::ScreenAudio,
+                Track::Music,
+            ] {
+                let original = Head {
+                    track,
+                    keyframe: true,
+                    codec,
+                    channel_tag: [0; 4],
+                    seq: 1,
+                    part: 0,
+                    parts: 1,
+                    ts: 0,
+                };
+                let mut raw = Vec::new();
+                original.write(&mut raw);
+                assert_eq!(Head::read(&raw), Some(original), "кодек {codec}");
+            }
+        }
+    }
+
+    #[test]
     fn ui_frame_round_trips() {
-        let raw = encode_for_ui(Id([9u8; 32]), Track::Audio, true, -42, 77, b"payload");
-        let (track, keyframe, ts, data) = decode_from_ui(&raw).unwrap();
+        let raw = encode_for_ui(Id([9u8; 32]), Track::Audio, true, 5, -42, 77, b"payload");
+        let (track, keyframe, codec, ts, data) = decode_from_ui(&raw).unwrap();
         assert_eq!(track, Track::Audio);
         assert!(keyframe);
+        assert_eq!(codec, 5, "вебвью нечем настроить декодер без номера кодека");
         assert_eq!(ts, -42);
         assert_eq!(data, b"payload");
         assert_eq!(
@@ -1296,7 +1379,7 @@ mod tests {
     #[test]
     fn short_or_unknown_ui_frame_is_rejected() {
         assert!(decode_from_ui(&[1, 0, 0]).is_err());
-        let mut raw = encode_for_ui(Id::ZERO, Track::Video, false, 0, 0, b"x");
+        let mut raw = encode_for_ui(Id::ZERO, Track::Video, false, 0, 0, 0, b"x");
         raw[0] = 99;
         assert!(decode_from_ui(&raw).is_err(), "чужая версия формата");
     }

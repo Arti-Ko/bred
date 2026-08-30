@@ -123,7 +123,27 @@ export type Notice =
   /** В звонке появился новый собеседник — кодировщику пора выдать ключевой кадр. */
   | { kind: 'keyframe' }
   /** Ядро подобрало битрейт дорожки под реальный исходящий канал. */
-  | { kind: 'bitrate'; track: string; bps: number };
+  | { kind: 'bitrate'; track: string; bps: number }
+  /** Изменилось состояние общего плеера: сменился ведущий, источник или пауза. */
+  | { kind: 'player'; space: Id };
+
+/** Приложение, чей звук можно включить на комнату. */
+export interface MusicSource {
+  /** Идентификатор бандла, либо `*` — весь звук системы. */
+  id: string;
+  name: string;
+}
+
+/** Что играет в комнате и у кого. */
+export interface PlayerState {
+  host: Id;
+  channel: Id;
+  source: string;
+  playing: boolean;
+  ts: number;
+}
+
+export type PlayerCommand = 'toggle' | 'next' | 'previous';
 
 export const api = {
   bootstrap: () => invoke<Bootstrap>('bootstrap'),
@@ -178,6 +198,12 @@ export const api = {
   leaveCall: () => invoke<void>('leave_call'),
   callState: () => invoke<CallState>('call_state'),
   voiceMap: (space: Id) => invoke<Array<[Id, Id]>>('voice_map', { space }),
+
+  musicSources: () => invoke<MusicSource[]>('music_sources'),
+  musicStart: (source: string) => invoke<void>('music_start', { source }),
+  musicStop: () => invoke<void>('music_stop'),
+  musicControl: (command: PlayerCommand) => invoke<void>('music_control', { command }),
+  playerState: (space: Id) => invoke<PlayerState | null>('player_state', { space }),
 
   react: (space: Id, target: Id, emoji: string, remove: boolean) =>
     invoke<void>('react', { space, target, emoji, remove }),

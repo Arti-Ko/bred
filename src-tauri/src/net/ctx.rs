@@ -16,7 +16,14 @@ use crate::{
     store::{Applied, Store},
 };
 
-use super::wire::Presence;
+use super::wire::{PlayerState, Presence};
+
+/// Сколько живёт состояние общего плеера без подтверждения.
+///
+/// Втрое короче присутствия: ведущий подтверждает его каждые две секунды, и
+/// панель плеера, висящая после того, как трансляцию выключили, — это кнопки,
+/// которые ничего не делают.
+const PLAYER_TTL_MS: i64 = 6_000;
 
 /// Сколько присутствие считается свежим. Удар сердца идёт раз в 10 секунд,
 /// так что три пропуска подряд — надёжный признак, что узла больше нет.
@@ -46,6 +53,10 @@ pub enum Notice {
     },
     /// Изменилось состояние сети (число соседей, адрес).
     Net,
+    /// Изменилось состояние общего плеера в пространстве.
+    Player { space: SpaceId },
+    /// Нам, как ведущему, нажали кнопку на пульте.
+    PlayerCommand { command: super::wire::PlayerCommand },
     /// Кодировщику пора выдать ключевой кадр.
     ///
     /// В звонке появился новый собеседник, а декодер не начинает работу, пока
@@ -69,6 +80,9 @@ pub struct Ctx {
     pub clock: Mutex<Clock>,
     /// Присутствие живёт только в памяти и умирает вместе с процессом.
     pub presence: RwLock<HashMap<SpaceId, HashMap<Id, Presence>>>,
+    /// Общий плеер — по одному на пространство: комнат много, но ведущий,
+    /// который транслирует звук, обычно один, и путать их незачем.
+    pub players: RwLock<HashMap<SpaceId, PlayerState>>,
     pub notices: UnboundedSender<Notice>,
     /// Куда складываются байты вложений.
     blob_dir: PathBuf,
@@ -90,6 +104,7 @@ impl Ctx {
             spaces: RwLock::new(map),
             clock: Mutex::new(clock),
             presence: RwLock::new(HashMap::new()),
+            players: RwLock::new(HashMap::new()),
             notices,
             blob_dir: blob_dir.as_ref().to_path_buf(),
         }
@@ -228,6 +243,55 @@ impl Ctx {
             .unwrap_or_else(|| author.short())
     }
 
+    /// Запомнить состояние плеера, пришедшее от ведущего. `None` — выключили.
+    pub fn note_player(&self, space: SpaceId, state: Option<PlayerState>) {
+        let changed = {
+            let mut all = self.players.write();
+            match state {
+                None => all.remove(&space).is_some(),
+                Some(state) => {
+                    // Подтверждения идут каждые две секунды и сами по себе
+                    // ничего не сообщают. Будим интерфейс, только если что-то
+                    // и правда поменялось.
+                    let same = all.get(&space).is_some_and(|old| {
+                        old.host == state.host
+                            && old.playing == state.playing
+                            && old.source == state.source
+                    });
+                    all.insert(space, state);
+                    !same
+                }
+            }
+        };
+        if changed {
+            let _ = self.notices.send(Notice::Player { space });
+        }
+    }
+
+    /// Что играет в пространстве прямо сейчас.
+    pub fn player_of(&self, space: SpaceId) -> Option<PlayerState> {
+        let deadline = crate::domain::now_ms() - PLAYER_TTL_MS;
+        self.players
+            .read()
+            .get(&space)
+            .filter(|state| state.ts >= deadline)
+            .cloned()
+    }
+
+    /// Убрать плеер, о котором давно ничего не слышно.
+    pub fn sweep_players(&self) -> Vec<SpaceId> {
+        let deadline = crate::domain::now_ms() - PLAYER_TTL_MS;
+        let mut gone = Vec::new();
+        self.players.write().retain(|space, state| {
+            let alive = state.ts >= deadline;
+            if !alive {
+                gone.push(*space);
+            }
+            alive
+        });
+        gone
+    }
+
     /// Кто сейчас на связи в пространстве.
     ///
     /// Протухшие записи отсеиваются: узел может исчезнуть без прощания —
@@ -313,6 +377,43 @@ mod tests {
             ctx.presence_of(space).is_empty(),
             "пропавший узел не должен вечно висеть в сети и в звонке"
         );
+    }
+
+    fn player(ts: i64) -> PlayerState {
+        PlayerState {
+            host: Id([9u8; 32]),
+            channel: Id([4u8; 32]),
+            source: "Яндекс Музыка".into(),
+            playing: true,
+            ts,
+        }
+    }
+
+    #[test]
+    fn player_state_is_remembered_and_expires() {
+        let ctx = ctx();
+        let space = Id([3u8; 32]);
+        ctx.note_player(space, Some(player(now_ms())));
+        assert!(ctx.player_of(space).is_some(), "свежее состояние читается");
+
+        // Ведущий пропал вместе с ноутбуком: подтверждений больше нет.
+        ctx.note_player(space, Some(player(now_ms() - 30_000)));
+        assert!(
+            ctx.player_of(space).is_none(),
+            "панель с кнопками не должна висеть после исчезновения ведущего"
+        );
+        assert_eq!(ctx.sweep_players(), vec![space]);
+    }
+
+    #[test]
+    fn player_switched_off_disappears_at_once() {
+        let ctx = ctx();
+        let space = Id([3u8; 32]);
+        ctx.note_player(space, Some(player(now_ms())));
+        // Выключили вслух — ждать, пока протухнет, было бы шесть секунд
+        // кнопок, которые уже ничего не делают.
+        ctx.note_player(space, None);
+        assert!(ctx.player_of(space).is_none());
     }
 
     #[test]

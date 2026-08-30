@@ -10,7 +10,12 @@ use crate::{
         now_ms, Attachment, Clock, Event, EventKind, Hello, Id, Invite, SignedEvent, Space, SpaceId,
     },
     identity::{load_avatar, load_nick, save_avatar, save_nick, Identity},
-    net::{ctx::Notice, Ctx, Net},
+    net::{
+        ctx::Notice,
+        wire::{PlayerCommand, PlayerState},
+        Ctx, Net,
+    },
+    player,
     store::{ChannelRow, MemberRow, MessageRow, SpaceRow, Store},
 };
 
@@ -23,12 +28,42 @@ const LINK_WAIT: Duration = Duration::from_secs(10);
 
 const PREVIEW_LIMIT: u64 = 16 * 1024 * 1024;
 
+/// Как часто ведущий подтверждает состояние общего плеера.
+///
+/// Чаще присутствия: по этому же сообщению едет «играет / на паузе», а его
+/// человек меняет кнопкой и ждёт, что у соседей отзовётся сразу, а не через
+/// десять секунд.
+const PLAYER_BEAT: Duration = Duration::from_secs(2);
+
+/// Сколько блоков звука ждут отправки в интерфейс.
+///
+/// Очередь короткая намеренно: музыка идёт в реальном времени, и блок, который
+/// не успел уехать за полсекунды, слушателю уже не нужен — а неограниченная
+/// очередь при задумавшемся вебвью съедает память.
+pub const MUSIC_QUEUE: usize = 32;
+
+/// Живая трансляция звука приложения.
+struct Music {
+    /// Пока эта запись жива, жив и захват: остановка — в `Drop` у `Tap`.
+    tap: player::Tap,
+    source: String,
+    space: SpaceId,
+    channel: Id,
+}
+
 pub struct App {
     pub store: Arc<Store>,
     /// Ключ согласования для личных переписок.
     dh: x25519_dalek::StaticSecret,
     pub ctx: Arc<Ctx>,
     pub net: Arc<Net>,
+    /// Что мы сами сейчас транслируем. Пусто — ведущий не мы.
+    music: parking_lot::Mutex<Option<Music>>,
+    /// Идёт ли уже цикл подтверждений. Иначе перезапуск трансляции оставлял бы
+    /// второй такой цикл, и состояние уходило бы в рой дважды за такт.
+    music_beating: std::sync::atomic::AtomicBool,
+    /// Куда уходят отсчёты захвата — в вебвью, кодировщику.
+    music_sink: parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
 }
 
 impl App {
@@ -70,6 +105,9 @@ impl App {
                 dh,
                 ctx,
                 net,
+                music: parking_lot::Mutex::new(None),
+                music_beating: std::sync::atomic::AtomicBool::new(false),
+                music_sink: parking_lot::Mutex::new(None),
             }),
             rx,
         ))
@@ -530,8 +568,155 @@ impl App {
 
     /// Кадр из интерфейса — в сеть. Синхронно: путь кадра должен быть коротким.
     pub fn send_media(&self, raw: &[u8]) -> Result<()> {
-        let (track, keyframe, ts, data) = crate::net::media::decode_from_ui(raw)?;
-        self.net.media().broadcast(track, keyframe, ts, data)
+        let (track, keyframe, codec, ts, data) = crate::net::media::decode_from_ui(raw)?;
+        self.net.media().broadcast(track, keyframe, codec, ts, data)
+    }
+
+    // ── общий плеер ─────────────────────────────────────────────────────────
+
+    /// Что можно подключить: приложения плюс весь звук системы.
+    pub fn music_sources(&self) -> Result<Vec<player::Source>> {
+        player::sources()
+    }
+
+    /// Начать транслировать звук приложения на всю комнату.
+    pub fn music_start(self: &Arc<Self>, source: &str) -> Result<()> {
+        let Some((space, channel)) = self.net.media().active() else {
+            return Err(anyhow!("сначала надо войти в звонок"));
+        };
+        // Ведущий один на пространство. Двое сразу — это две музыки поверх
+        // друг друга, и никто не поймёт, чью паузу он нажимает.
+        if let Some(state) = self.ctx.player_of(space) {
+            if state.host != self.ctx.identity.id() {
+                let who = self.ctx.nick_of(space, state.host);
+                return Err(anyhow!(
+                    "в пространстве уже транслирует {who} — сначала пусть выключит"
+                ));
+            }
+        }
+        // Свой прежний захват отпускаем до нового: два потока с одного
+        // источника система не даст, да он и не нужен.
+        self.music.lock().take();
+
+        let name = self
+            .music_sources()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|candidate| candidate.id == source)
+            .map(|candidate| candidate.name)
+            .unwrap_or_else(|| source.to_string());
+
+        // Слабая ссылка: захват живёт внутри самого приложения, и сильная
+        // замкнула бы кольцо, из которого приложение уже не освободится.
+        let weak = Arc::downgrade(self);
+        let sink: player::Sink = Arc::new(move |samples: &[f32]| {
+            let Some(app) = weak.upgrade() else { return };
+            let Some(tx) = app.music_sink.lock().clone() else {
+                return;
+            };
+            let mut bytes = Vec::with_capacity(samples.len() * 4);
+            for sample in samples {
+                bytes.extend_from_slice(&sample.to_le_bytes());
+            }
+            // Именно `try_send`: захват зовёт нас из потока аудиорендера,
+            // и ждать там нельзя ни миллисекунды.
+            let _ = tx.try_send(bytes);
+        });
+
+        let tap = player::Tap::start(source, sink)?;
+        *self.music.lock() = Some(Music {
+            tap,
+            source: name,
+            space,
+            channel,
+        });
+        self.clone().beat_player();
+        Ok(())
+    }
+
+    /// Выключить свою трансляцию.
+    pub async fn music_stop(&self) {
+        let Some(music) = self.music.lock().take() else {
+            return;
+        };
+        // Сказать вслух, а не дать протухнуть: иначе у слушателей ещё шесть
+        // секунд висит панель с кнопками, которые уже никуда не ведут.
+        let _ = self.net.publish_player(music.space, None).await;
+    }
+
+    /// Что играет в пространстве — для интерфейса.
+    pub fn player_state(&self, space: SpaceId) -> Option<PlayerState> {
+        self.ctx.player_of(space)
+    }
+
+    /// Нажать кнопку на пульте: у себя напрямую, у ведущего — через рой.
+    pub async fn music_control(&self, command: PlayerCommand) -> Result<()> {
+        let Some((space, channel)) = self.net.media().active() else {
+            return Err(anyhow!("сначала надо войти в звонок"));
+        };
+        let Some(state) = self.ctx.player_of(space) else {
+            return Err(anyhow!("в комнате ничего не играет"));
+        };
+        if state.host == self.ctx.identity.id() {
+            return player::control(command.into());
+        }
+        self.net
+            .publish_player_command(space, state.host, channel, command)
+            .await
+    }
+
+    /// Нам нажали кнопку. Исполняем, только если ведущий и правда мы.
+    pub fn player_command(&self, command: PlayerCommand) {
+        if self.music.lock().is_none() {
+            return;
+        }
+        if let Err(err) = player::control(command.into()) {
+            tracing::warn!(%err, "пульт не сработал");
+        }
+    }
+
+    /// Куда складывать отсчёты захвата, чтобы их забрал кодировщик в вебвью.
+    pub fn set_music_sink(&self, sink: tokio::sync::mpsc::Sender<Vec<u8>>) {
+        *self.music_sink.lock() = Some(sink);
+    }
+
+    /// Подтверждать состояние плеера, пока трансляция жива.
+    fn beat_player(self: Arc<Self>) {
+        use std::sync::atomic::Ordering;
+        if self.music_beating.swap(true, Ordering::SeqCst) {
+            return; // цикл уже идёт и подхватит новую трансляцию сам
+        }
+        tauri::async_runtime::spawn(async move {
+            let mut ticker = tokio::time::interval(PLAYER_BEAT);
+            loop {
+                ticker.tick().await;
+                let Some(state) = ({
+                    let music = self.music.lock();
+                    music.as_ref().map(|music| {
+                        (
+                            music.space,
+                            PlayerState {
+                                host: self.ctx.identity.id(),
+                                channel: music.channel,
+                                source: music.source.clone(),
+                                // Состояние берём из самого звука, а не из
+                                // того, что когда-то нажали: музыку могли
+                                // остановить и мимо нас, прямо в приложении.
+                                playing: music.tap.sounding(),
+                                ts: now_ms(),
+                            },
+                        )
+                    })
+                }) else {
+                    self.music_beating.store(false, Ordering::SeqCst);
+                    break; // трансляцию выключили
+                };
+                let (space, state) = state;
+                if let Err(err) = self.net.publish_player(space, Some(state)).await {
+                    tracing::debug!(%err, "состояние плеера не ушло");
+                }
+            }
+        });
     }
 
     /// Кто из участников в каком голосовом канале — для списка справа.

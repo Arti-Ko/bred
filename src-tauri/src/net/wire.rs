@@ -27,7 +27,7 @@ pub const SYNC_BATCH: usize = 512;
 /// «подставляется по умолчанию», а сдвигает весь поток. Поэтому узлы разных
 /// версий не могут читать события друг друга в принципе — и об этом надо
 /// говорить вслух, а не молча отбрасывать чужие сообщения.
-pub const PROTOCOL: u16 = 2;
+pub const PROTOCOL: u16 = 3;
 
 /// Конверт: версия снаружи, чтобы её можно было прочитать всегда.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -46,6 +46,58 @@ pub enum Broadcast {
     Presence(Presence),
     /// «Печатает…». Тоже эфемерное.
     Typing { channel: ChannelId, author: Id },
+    /// Состояние общего плеера. Рассылает ведущий, пока идёт трансляция.
+    ///
+    /// `None` — трансляцию выключили. Ждать, пока состояние протухнет само,
+    /// было бы шесть секунд панели с кнопками, которые уже ничего не делают.
+    Player(Option<PlayerState>),
+    /// Нажатие на пульте: любой участник комнаты — ведущему.
+    ///
+    /// Отправителя, как и в присутствии, никто не подписывает: ключ пространства
+    /// общий, и внутри него все равны. Ведущий поэтому проверяет не подпись, а
+    /// то, что человек и правда сидит с ним в одной комнате.
+    PlayerCommand {
+        to: Id,
+        from: Id,
+        channel: ChannelId,
+        command: PlayerCommand,
+    },
+}
+
+/// Что играет в комнате и у кого.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlayerState {
+    /// Чей это звук: он же единственный, кто может нажимать на кнопки источника.
+    pub host: Id,
+    pub channel: ChannelId,
+    /// Имя приложения-источника — «Яндекс Музыка», «весь звук системы».
+    pub source: String,
+    /// Играет ли прямо сейчас.
+    ///
+    /// Не то, что мы когда-то нажали, а то, что слышно: ведущий смотрит на
+    /// собственный поток. Иначе плеер врал бы каждый раз, когда музыку
+    /// остановили мимо него — из самой Яндекс Музыки, например.
+    pub playing: bool,
+    pub ts: i64,
+}
+
+/// Кнопка на пульте.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlayerCommand {
+    Toggle,
+    Next,
+    Previous,
+}
+
+impl From<PlayerCommand> for crate::player::Command {
+    fn from(command: PlayerCommand) -> Self {
+        match command {
+            PlayerCommand::Toggle => Self::Toggle,
+            PlayerCommand::Next => Self::Next,
+            PlayerCommand::Previous => Self::Previous,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,6 +250,54 @@ mod tests {
         let sealed = seal(&key, &msg).unwrap();
         let opened: Presence = open(&key, &sealed).unwrap();
         assert_eq!(opened.nick, "марина");
+    }
+
+    #[test]
+    fn player_state_survives_the_swarm() {
+        let key = [5u8; 32];
+        let sealed = wrap(
+            &key,
+            &Broadcast::Player(Some(PlayerState {
+                host: Id([7u8; 32]),
+                channel: Id([8u8; 32]),
+                source: "Яндекс Музыка".into(),
+                playing: true,
+                ts: 99,
+            })),
+        )
+        .unwrap();
+
+        match unwrap(&key, &sealed).expect("своё сообщение читается") {
+            Broadcast::Player(Some(state)) => {
+                assert_eq!(state.source, "Яндекс Музыка");
+                assert!(state.playing);
+                assert_eq!(state.host, Id([7u8; 32]));
+            }
+            other => panic!("приехало не состояние плеера: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn player_command_survives_the_swarm() {
+        let key = [5u8; 32];
+        let sealed = wrap(
+            &key,
+            &Broadcast::PlayerCommand {
+                to: Id([1u8; 32]),
+                from: Id([2u8; 32]),
+                channel: Id([3u8; 32]),
+                command: PlayerCommand::Next,
+            },
+        )
+        .unwrap();
+
+        match unwrap(&key, &sealed).expect("своё сообщение читается") {
+            Broadcast::PlayerCommand { to, command, .. } => {
+                assert_eq!(to, Id([1u8; 32]));
+                assert_eq!(command, PlayerCommand::Next);
+            }
+            other => panic!("приехала не команда пульта: {other:?}"),
+        }
     }
 
     #[test]

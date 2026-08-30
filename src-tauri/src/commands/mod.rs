@@ -289,6 +289,84 @@ pub fn call_state(app: State<'_, Arc<App>>) -> Answer<CallState> {
     })
 }
 
+// ── общий плеер ─────────────────────────────────────────────────────────────
+
+/// Что можно подключить: приложения плюс весь звук системы.
+///
+/// Асинхронная и в отдельном потоке не для красоты: синхронная команда Tauri
+/// исполняется в главном потоке, а система на первый такой запрос показывает
+/// диалог разрешения и держит ответ до тех пор, пока человек не нажмёт. В
+/// главном потоке это выглядело бы как зависшее окно.
+#[tauri::command]
+pub async fn music_sources(app: State<'_, Arc<App>>) -> Answer<Vec<crate::player::Source>> {
+    let app = app.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || app.music_sources())
+        .await
+        .map_err(|err| format!("опрос источников не завершился: {err}"))?
+        .map_err(fail)
+}
+
+/// Начать транслировать звук источника на комнату.
+///
+/// Тоже в отдельном потоке — см. `music_sources`: запуск захвата ждёт системы.
+#[tauri::command]
+pub async fn music_start(app: State<'_, Arc<App>>, source: String) -> Answer<()> {
+    let app = app.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || app.music_start(&source))
+        .await
+        .map_err(|err| format!("запуск захвата не завершился: {err}"))?
+        .map_err(fail)
+}
+
+#[tauri::command]
+pub async fn music_stop(app: State<'_, Arc<App>>) -> Answer<()> {
+    app.music_stop().await;
+    Ok(())
+}
+
+/// Нажатие на пульте — своё или соседа.
+#[tauri::command]
+pub async fn music_control(
+    app: State<'_, Arc<App>>,
+    command: crate::net::wire::PlayerCommand,
+) -> Answer<()> {
+    app.music_control(command).await.map_err(fail)
+}
+
+/// Что играет в пространстве прямо сейчас.
+#[tauri::command]
+pub fn player_state(
+    app: State<'_, Arc<App>>,
+    space: SpaceId,
+) -> Answer<Option<crate::net::wire::PlayerState>> {
+    Ok(app.player_state(space))
+}
+
+/// Отсчёты захваченного звука — в вебвью, кодировщику.
+///
+/// Сырыми байтами, как и кадры звонка: музыка в JSON стоила бы вчетверо
+/// дороже ровно там, где данных больше всего.
+#[tauri::command]
+pub fn music_stream(
+    app: State<'_, Arc<App>>,
+    channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
+) -> Answer<()> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::app::MUSIC_QUEUE);
+    app.set_music_sink(tx);
+
+    tauri::async_runtime::spawn(async move {
+        while let Some(block) = rx.recv().await {
+            if channel
+                .send(tauri::ipc::InvokeResponseBody::Raw(block))
+                .is_err()
+            {
+                break; // окно закрыли — слушать некому
+            }
+        }
+    });
+    Ok(())
+}
+
 /// Кто в каком голосовом канале — чтобы рисовать состав комнат в списке каналов.
 #[tauri::command]
 pub fn voice_map(app: State<'_, Arc<App>>, space: SpaceId) -> Answer<Vec<(Id, Id)>> {
