@@ -8,6 +8,7 @@ pub mod commands;
 pub mod domain;
 pub mod identity;
 pub mod net;
+pub mod player;
 pub mod store;
 
 use serde::Serialize;
@@ -69,6 +70,9 @@ enum UiNotice {
         track: &'static str,
         bps: u32,
     },
+    Player {
+        space: Id,
+    },
 }
 
 impl From<Notice> for UiNotice {
@@ -98,6 +102,11 @@ impl From<Notice> for UiNotice {
                 nick,
             },
             Notice::Net => UiNotice::Net,
+            Notice::Player { space } => UiNotice::Player { space },
+            // Сюда не доходит: нажатие на пульте исполняет ядро, а интерфейсу
+            // показывать нечего — человек узнаёт о результате по тому, что
+            // музыка замолчала.
+            Notice::PlayerCommand { .. } => UiNotice::Net,
             Notice::Keyframe => UiNotice::Keyframe,
             Notice::Bitrate { track, bps } => UiNotice::Bitrate { track, bps },
         }
@@ -135,6 +144,14 @@ fn start_core(handle: &tauri::AppHandle) -> anyhow::Result<()> {
         let emitter = handle.clone();
         tauri::async_runtime::spawn(async move {
             while let Some(notice) = notices.recv().await {
+                // Пульт исполняется здесь и наверх не идёт: нажали у соседа —
+                // нажать надо в приложении-источнике, а не в интерфейсе.
+                if let Notice::PlayerCommand { command } = notice {
+                    if let Some(app) = emitter.try_state::<std::sync::Arc<App>>() {
+                        app.player_command(command);
+                    }
+                    continue;
+                }
                 let _ = emitter.emit(NOTICE_EVENT, UiNotice::from(notice));
             }
         });
@@ -229,6 +246,12 @@ pub fn run() {
             commands::call_state,
             commands::voice_map,
             commands::send_media,
+            commands::music_sources,
+            commands::music_start,
+            commands::music_stop,
+            commands::music_control,
+            commands::music_stream,
+            commands::player_state,
             commands::media_stream,
         ])
         .run(tauri::generate_context!())

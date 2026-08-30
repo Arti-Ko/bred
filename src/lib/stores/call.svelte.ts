@@ -4,9 +4,30 @@
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import type { UnlistenFn } from '@tauri-apps/api/event';
 
-import { api, errorText, type Id } from '../ipc';
-import { Capture, missingCapabilities, Playback } from '../media';
+import {
+  api,
+  errorText,
+  type Id,
+  type MusicSource,
+  type PlayerCommand,
+  type PlayerState,
+} from '../ipc';
+import { Capture, missingCapabilities, MusicCapture, Playback } from '../media';
 import { prefs } from './prefs.svelte';
+
+/**
+ * Шкала индикатора громкости.
+ *
+ * Логарифмическая: линейная среднеквадратичная громкость речи почти всё время
+ * прижата к нулю, и полоска по ней стоит на месте. Нижняя граница — тишина
+ * комнаты после шумодава, верхняя — обычный разговорный уровень, а не крик.
+ */
+const LEVEL_FLOOR_DB = -60;
+const LEVEL_TOP_DB = -15;
+/** Столько ступенек у индикатора: меньше — рвано, больше — лишние перерисовки. */
+const LEVEL_STEPS = 12;
+/** С какой ступеньки считаем, что человек говорит, а не дышит в микрофон. */
+const SPEAKING_LEVEL = 2 / LEVEL_STEPS;
 
 export interface Participant {
   id: Id;
@@ -48,8 +69,27 @@ export class Call {
   status = $state('');
   /** Чего не хватает платформе. Непусто — звонки недоступны, и надо сказать честно. */
   gaps = $state<string[]>([]);
+  /**
+   * Насколько громко звучит собственный микрофон, 0..1, ступеньками.
+   *
+   * Своего голоса в звонке не слышно, и без индикатора «меня слышно?» узнаётся
+   * только вопросом вслух — обычно после минуты речи в отключённый микрофон.
+   */
+  level = $state(0);
+  /**
+   * Что играет в комнате и у кого. Приезжает от ведущего, а не считается
+   * локально: источник звука один на всех, и состояние у него тоже одно.
+   */
+  player = $state<PlayerState | null>(null);
+  /** Что можно подключить. Заполняется, когда открывают выбор источника. */
+  sources = $state<MusicSource[]>([]);
+  /** Транслируем ли звук мы сами. */
+  sharingMusic = $state(false);
+  /** Открыт ли выбор источника. */
+  musicPicker = $state(false);
 
   #capture: Capture | null = null;
+  #music: MusicCapture | null = null;
   #playback: Playback | null = null;
   #poll: number | null = null;
   /**
@@ -60,6 +100,11 @@ export class Call {
    * перерисовку вызывало что-то другое, то есть раз в полторы секунды.
    */
   #speakers = $state<Record<Id, number>>({});
+  /**
+   * Несглаженная громкость. Обычное поле, а не состояние: она меняется полсотни
+   * раз в секунду, а перерисовывать индикатор надо на порядок реже.
+   */
+  #rawLevel = 0;
   /** Что было развёрнуто до полного экрана — чтобы вернуть, а не сбросить. */
   #beforeFullscreen: { expanded: boolean; screenOnly: boolean } | null = null;
   /** Слежение за окном: из полного экрана можно выйти и мимо нашей кнопки. */
@@ -73,6 +118,114 @@ export class Call {
   speaking(id: Id): boolean {
     const at = this.#speakers[id];
     return at !== undefined && Date.now() - at < 400;
+  }
+
+  /** Говорим ли сейчас мы сами. Выключенный микрофон — сразу нет, без задержки. */
+  get speakingSelf(): boolean {
+    return !this.micMuted && this.level > SPEAKING_LEVEL;
+  }
+
+  /**
+   * Принять громкость микрофона от захвата.
+   *
+   * Вверх — сразу, вниз — плавно: индикатор, гаснущий в паузах между слогами,
+   * мигает и читается хуже, чем неподвижный. Наружу отдаём ступеньками, иначе
+   * полсотни перерисовок в секунду ради полоски в три пикселя.
+   */
+  #takeLevel(rms: number): void {
+    const db = 20 * Math.log10(Math.max(rms, 1e-6));
+    const value = Math.max(0, Math.min(1, (db - LEVEL_FLOOR_DB) / (LEVEL_TOP_DB - LEVEL_FLOOR_DB)));
+    this.#rawLevel = value > this.#rawLevel ? value : this.#rawLevel + (value - this.#rawLevel) * 0.2;
+    const shown = Math.round(this.#rawLevel * LEVEL_STEPS) / LEVEL_STEPS;
+    if (shown !== this.level) this.level = shown;
+  }
+
+  // ── общий плеер ─────────────────────────────────────────────────────────
+
+  /** Играет ли плеер в этой комнате, а не в соседней. */
+  get playerHere(): boolean {
+    return this.player !== null && this.player.channel === this.channel;
+  }
+
+  /** Громкость общего плеера у себя. Соседей она не касается. */
+  get musicVolume(): number {
+    return prefs.musicVolume;
+  }
+
+  setMusicVolume(value: number): void {
+    prefs.setMusicVolume(value);
+    this.#playback?.setMusicVolume(value);
+  }
+
+  /** Открыть или закрыть выбор источника. Список спрашиваем при открытии:
+   *  приложения запускают и закрывают, а список, собранный час назад, врёт. */
+  async toggleMusicPicker(): Promise<void> {
+    this.musicPicker = !this.musicPicker;
+    if (this.musicPicker) await this.loadSources();
+  }
+
+  /** Спросить у системы, чей звук можно подключить. */
+  async loadSources(): Promise<void> {
+    try {
+      this.sources = await api.musicSources();
+    } catch (error) {
+      this.sources = [];
+      this.status = errorText(error);
+    }
+  }
+
+  /** Включить звук приложения на всю комнату. */
+  async startMusic(source: string): Promise<void> {
+    if (!this.active) return;
+    try {
+      // Сначала подписка, потом захват: иначе первые блоки звука упадут в
+      // никуда, и трансляция начнётся с провала на четверть секунды.
+      const music = new MusicCapture();
+      await music.start((message) => (this.status = message));
+      this.#music = music;
+
+      await api.musicStart(source);
+      this.sharingMusic = true;
+      this.musicPicker = false;
+      this.status = '';
+      await this.refreshPlayer();
+    } catch (error) {
+      this.#music?.stop();
+      this.#music = null;
+      this.sharingMusic = false;
+      this.status = errorText(error);
+    }
+  }
+
+  /** Выключить свою трансляцию. */
+  async stopMusic(): Promise<void> {
+    this.#music?.stop();
+    this.#music = null;
+    this.sharingMusic = false;
+    await api.musicStop().catch(() => undefined);
+    this.player = null;
+  }
+
+  /** Нажать кнопку на пульте — своём или чужом. */
+  async musicCommand(command: PlayerCommand): Promise<void> {
+    try {
+      await api.musicControl(command);
+    } catch (error) {
+      this.status = errorText(error);
+    }
+  }
+
+  /** Перечитать состояние плеера. Зовётся по уведомлению от ядра. */
+  async refreshPlayer(): Promise<void> {
+    if (!this.space) {
+      this.player = null;
+      return;
+    }
+    try {
+      this.player = await api.playerState(this.space);
+    } catch {
+      // Ядро ответит на следующем уведомлении — паниковать не из-за чего.
+    }
   }
 
   /** Громкость собеседника: 0 — не слышно, 1 — как есть, до 4 — усиление. */
@@ -238,11 +391,13 @@ export class Call {
       for (const [author, value] of Object.entries(prefs.volumes)) {
         this.#playback.setVolume(author, value);
       }
+      this.#playback.setMusicVolume(prefs.musicVolume);
 
       this.#capture = new Capture();
       await this.#capture.start({
         video: withVideo,
         onError: (message) => (this.status = message),
+        onLevel: (rms) => this.#takeLevel(rms),
       });
 
       await api.joinCall(space, channel);
@@ -255,6 +410,9 @@ export class Call {
       this.micMuted = false;
       this.status = '';
       this.#startPolling();
+      // В комнате уже может кто-то транслировать — панель обязана появиться
+      // сразу, а не через два удара сердца ведущего.
+      await this.refreshPlayer();
     } catch (error) {
       // Не оставляем захват висеть, если на полпути что-то отвалилось:
       // иначе индикатор камеры продолжит гореть при отсутствующем звонке.
@@ -267,6 +425,9 @@ export class Call {
     // Первым делом отпускаем экран: выйти из звонка и остаться в полноэкранном
     // окне без единой кнопки — это тупик, из которого не видно выхода.
     await this.exitFullscreen().catch(() => undefined);
+    // Трансляцию гасим до всего остального: захват чужого приложения, который
+    // пережил выход из звонка, — это уже не функция, а слежка.
+    if (this.sharingMusic) await this.stopMusic().catch(() => undefined);
     // Ни одна поломка при остановке не должна запереть человека в звонке.
     try {
       this.#capture?.stop();
@@ -285,6 +446,11 @@ export class Call {
       this.#poll = null;
     }
     this.#speakers = {};
+    this.#rawLevel = 0;
+    this.level = 0;
+    this.player = null;
+    this.sources = [];
+    this.musicPicker = false;
     this.participants = [];
     this.stream = null;
     this.screens = [];
@@ -304,6 +470,12 @@ export class Call {
   toggleMic(): void {
     this.micMuted = !this.micMuted;
     this.#capture?.setMuted(this.micMuted);
+    // Выключенный микрофон отдаёт тишину, и полоска сползёт сама — но не сразу,
+    // а за десяток блоков. Заметно: кнопку нажали, индикатор ещё живой.
+    if (this.micMuted) {
+      this.#rawLevel = 0;
+      this.level = 0;
+    }
   }
 
   /**
@@ -339,6 +511,7 @@ export class Call {
       await this.#capture.start({
         video: next,
         onError: (message) => (this.status = message),
+        onLevel: (rms) => this.#takeLevel(rms),
       });
       this.#capture.setMuted(this.micMuted);
       this.stream = this.#capture.stream;

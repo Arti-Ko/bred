@@ -691,6 +691,9 @@ export class Session {
       case 'net':
         void this.#pollNet();
         break;
+      case 'player':
+        if (notice.space === this.spaceId) void call.refreshPlayer();
+        break;
       case 'keyframe':
         // Декодер собеседника не начнёт работу, пока не увидит ключевой кадр.
         call.requestKeyframe();

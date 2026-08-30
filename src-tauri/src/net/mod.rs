@@ -406,6 +406,35 @@ impl Net {
             .await
     }
 
+    /// Разослать состояние общего плеера. Зовётся ведущим по таймеру.
+    pub async fn publish_player(
+        &self,
+        space: SpaceId,
+        state: Option<wire::PlayerState>,
+    ) -> Result<()> {
+        self.publish(space, &Broadcast::Player(state)).await
+    }
+
+    /// Нажать кнопку на пульте ведущего.
+    pub async fn publish_player_command(
+        &self,
+        space: SpaceId,
+        to: crate::domain::Id,
+        channel: crate::domain::ChannelId,
+        command: wire::PlayerCommand,
+    ) -> Result<()> {
+        self.publish(
+            space,
+            &Broadcast::PlayerCommand {
+                to,
+                from: self.ctx.identity.id(),
+                channel,
+                command,
+            },
+        )
+        .await
+    }
+
     pub async fn publish_typing(
         &self,
         space: SpaceId,
@@ -482,6 +511,30 @@ impl Net {
                     author,
                     nick,
                 });
+            }
+            Broadcast::Player(state) => self.ctx.note_player(space, state),
+            Broadcast::PlayerCommand {
+                to,
+                from,
+                channel,
+                command,
+            } => {
+                if to != self.ctx.identity.id() {
+                    return;
+                }
+                // Пульт работает только изнутри комнаты. Подписи под сообщением
+                // нет — ключ пространства общий, — поэтому единственная разумная
+                // проверка: человек и правда сидит в этом голосовом канале.
+                let inside = self
+                    .ctx
+                    .presence_of(space)
+                    .into_iter()
+                    .any(|p| p.author == from && p.voice == Some(channel));
+                if !inside {
+                    tracing::debug!("команда плеера снаружи комнаты — отброшена");
+                    return;
+                }
+                let _ = self.ctx.notices.send(Notice::PlayerCommand { command });
             }
         }
     }
@@ -649,6 +702,11 @@ impl Net {
                 ticker.tick().await;
                 for space in self.ctx.sweep_presence() {
                     let _ = self.ctx.notices.send(Notice::Presence { space });
+                }
+                // Плеер протухает втрое быстрее присутствия, но убираем его тем
+                // же тиком: отдельный таймер ради этого не нужен.
+                for space in self.ctx.sweep_players() {
+                    let _ = self.ctx.notices.send(Notice::Player { space });
                 }
             }
         });

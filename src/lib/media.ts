@@ -16,11 +16,28 @@ import { invoke, Channel } from '@tauri-apps/api/core';
 
 /** Разметка кадра. Должна совпадать с `net::media` в Rust. */
 const HEADER = 47;
-const VERSION = 2;
+const VERSION = 3;
 const TRACK_AUDIO = 0;
 const TRACK_VIDEO = 1;
 const TRACK_SCREEN = 2;
 const TRACK_SCREEN_AUDIO = 3;
+const TRACK_MUSIC = 4;
+
+/**
+ * Кодеки картинки. Номер едет в заголовке кадра, строка настраивает кодировщик
+ * и декодер.
+ *
+ * Раньше VP8 был прибит гвоздями с обеих сторон. Он есть везде — и он же
+ * единственный, который на маке кодируется процессором: аппаратного VP8 нет ни
+ * у Intel, ни у Apple. На демонстрации 1080p это половина ядра под кодирование
+ * и картинка, которая рассыпается ровно тогда, когда в неё вглядываются.
+ * H.264 кодируется чипом и при том же битрейте держит текст заметно чётче,
+ * поэтому его и пробуем первым, а VP8 остаётся последним рубежом.
+ */
+const VIDEO_CODECS = ['vp8', 'avc1.42E01F', 'avc1.640028', 'vp09.00.10.08'] as const;
+/** Порядок предпочтения: сначала аппаратный H.264, VP8 — если больше нечем. */
+const CODEC_ORDER = [2, 1, 3, 0];
+const CODEC_VP8 = 0;
 
 /** Через сколько молчания дорожка считается погасшей. */
 const STALE_AFTER = 1500;
@@ -33,6 +50,14 @@ const STALE_AFTER = 1500;
  * Теперь запас считается по реальному разбросу времени прихода.
  */
 const AUDIO_LEAD_MIN = 0.04;
+/**
+ * Запас буфера для музыки — втрое больше разговорного.
+ *
+ * В разговоре лишняя десятая доля секунды мешает: люди перебивают друг друга.
+ * В музыке она не значит ничего, а вот щелчок на месте недостающего блока
+ * слышен всем и сразу.
+ */
+const MUSIC_LEAD_MIN = 0.12;
 const AUDIO_LEAD_MAX = 0.2;
 /** Предел отставания. Больше — выгоднее пропустить накопившееся, чем тянуть его. */
 const AUDIO_MAX_LAG = 0.4;
@@ -47,10 +72,19 @@ const AUDIO_BLOCK = 960;
  * страховка: реже — значит дешевле.
  */
 const KEYFRAME_EVERY = 90;
+/**
+ * Битрейт общего плеера.
+ *
+ * Вчетверо выше голосового: голос на 32 кбит/с разборчив, а музыка на них
+ * превращается в телефонный звонок из подвала. И два канала вместо одного —
+ * сведение стерео в моно слышно на первой же гитаре.
+ */
+const MUSIC_BITRATE = 128_000;
+
 /** Модуль захвата звука. Лежит в `public/`, отдаётся со своего origin. */
 const CAPTURE_WORKLET = '/audio-capture-worklet.js';
 
-export type TrackKind = 'audio' | 'video' | 'screen' | 'screen-audio';
+export type TrackKind = 'audio' | 'video' | 'screen' | 'screen-audio' | 'music';
 
 /**
  * Закрыть кодировщик или декодер, чем бы это ни кончилось.
@@ -71,6 +105,14 @@ export interface IncomingFrame {
   author: string;
   track: TrackKind;
   keyframe: boolean;
+  /**
+   * У картинки — номер кодека из `VIDEO_CODECS`.
+   *
+   * У общего плеера то же поле означает число каналов: стерео даётся не на
+   * каждой платформе, а декодер настраивается до первого кадра, и угадывать
+   * раскладку ему нечем. У голоса поле не значит ничего.
+   */
+  codec: number;
   ts: number;
   seq: number;
   data: Uint8Array;
@@ -103,12 +145,19 @@ function idToHex(bytes: Uint8Array): string {
   return out;
 }
 
-function pack(track: number, keyframe: boolean, ts: number, data: Uint8Array): Uint8Array {
+function pack(
+  track: number,
+  keyframe: boolean,
+  codec: number,
+  ts: number,
+  data: Uint8Array,
+): Uint8Array {
   const out = new Uint8Array(HEADER + data.byteLength);
   const view = new DataView(out.buffer);
   out[0] = VERSION;
   out[1] = track;
-  out[2] = keyframe ? 1 : 0;
+  // Ключевой кадр в нулевом бите, кодек — в трёх следующих.
+  out[2] = (keyframe ? 1 : 0) | ((codec & 7) << 1);
   // Байты автора ядро игнорирует и подставляет свои — подделать нельзя.
   // Номер кадра тоже назначает ядро: у него один счётчик на всех собеседников.
   view.setBigInt64(35, BigInt(Math.round(ts)), true);
@@ -126,10 +175,13 @@ function unpack(raw: Uint8Array): IncomingFrame | null {
         ? 'screen'
         : raw[1] === TRACK_SCREEN_AUDIO
           ? 'screen-audio'
-          : raw[1] === TRACK_VIDEO
-            ? 'video'
-            : 'audio',
-    keyframe: raw[2] !== 0,
+          : raw[1] === TRACK_MUSIC
+            ? 'music'
+            : raw[1] === TRACK_VIDEO
+              ? 'video'
+              : 'audio',
+    keyframe: (raw[2] & 1) !== 0,
+    codec: (raw[2] >> 1) & 7,
     ts: Number(view.getBigInt64(35, true)),
     seq: view.getUint32(43, true),
     data: raw.subarray(HEADER),
@@ -146,6 +198,14 @@ async function send(frame: Uint8Array): Promise<void> {
 export interface CaptureOptions {
   video: boolean;
   onError: (message: string) => void;
+  /**
+   * Насколько громко звучит собственный микрофон, 0..1.
+   *
+   * Нужен ровно для одного: показать человеку, что звук идёт от него. Своего
+   * голоса в звонке не слышно — эхоподавление на то и стоит, — поэтому без
+   * индикатора «меня слышно?» проверяется только вопросом вслух.
+   */
+  onLevel?: (level: number) => void;
 }
 
 interface VideoConfig {
@@ -157,16 +217,109 @@ interface VideoConfig {
 
 /** Стартовые настройки дорожек картинки. Дальше их двигает governor в ядре. */
 const CAMERA: VideoConfig = { width: 640, height: 360, bitrate: 500_000, framerate: 24 };
-// Битрейт выше, чем у камеры: на экране читают текст, и его портит не шум,
-// а нехватка бит.
-const SCREEN: VideoConfig = { width: 1280, height: 720, bitrate: 2_500_000, framerate: 12 };
+
+/**
+ * Потолок демонстрации.
+ *
+ * 1080p, а не «сколько дал экран»: на маке getDisplayMedia отдаёт retina-кадр
+ * вдвое больше самого экрана, и кодировать его — это вчетверо больше пикселей
+ * ради разницы, которой не видно. Ниже 1080p опускаться тоже нельзя: 720p,
+ * растянутые на весь монитор, — это ровно то мыло, из-за которого демонстрацию
+ * и разворачивать не хотелось.
+ */
+const SCREEN_MAX_WIDTH = 1920;
+const SCREEN_MAX_HEIGHT = 1080;
+/** Плавность демонстрации. Двенадцать кадров хватало на слайды и рвало прокрутку. */
+const SCREEN_FPS = 30;
+/**
+ * Бит на пиксель в секунду. Экран сжимается лучше камеры — он почти весь
+ * неподвижен, — но платит за резкость: мыло на лице незаметно, мыло на букве
+ * делает её нечитаемой.
+ */
+const SCREEN_BITS_PER_PIXEL = 0.07;
+/** Границы битрейта демонстрации. Верхняя совпадает с потолком governor'а в ядре. */
+const SCREEN_BITRATE_MIN = 1_500_000;
+const SCREEN_BITRATE_MAX = 8_000_000;
+
+/** Тише этого — тишина, а не речь. Порог по среднеквадратичной громкости. */
+const SPEAKING_RMS = 0.012;
 
 /** Кодировщик картинки вместе со всем, что нужно, чтобы его перенастроить. */
 interface VideoLane {
   encoder: VideoEncoder;
   config: VideoConfig;
+  /** Номер кодека, которым настроен кодировщик, — он же едет в заголовке кадра. */
+  codec: number;
   /** Выдать ключевой кадр при ближайшей возможности. */
   forced: boolean;
+}
+
+/**
+ * Настройки кодировщика под выбранный кодек.
+ *
+ * H.264 просим отдавать в annex-b: в этом формате заголовки последовательности
+ * едут внутри каждого ключевого кадра. Формат по умолчанию отдаёт их отдельным
+ * описанием, один раз, — а у нас поток без начала: собеседник подключается
+ * посреди разговора и такого описания уже не увидит.
+ */
+function encoderConfig(codec: number, config: VideoConfig): VideoEncoderConfig {
+  const name = VIDEO_CODECS[codec] ?? VIDEO_CODECS[CODEC_VP8];
+  return {
+    codec: name,
+    ...config,
+    latencyMode: 'realtime',
+    ...(name.startsWith('avc1') ? { avc: { format: 'annexb' as const } } : {}),
+  };
+}
+
+/**
+ * Первый кодек из списка предпочтений, который движок согласен взять.
+ *
+ * Спрашиваем именно с теми настройками, с какими будем кодировать: поддержка
+ * кодека сама по себе ничего не обещает — 1080p может не влезть в профиль,
+ * который движок готов дать.
+ */
+async function pickCodec(config: VideoConfig): Promise<number> {
+  for (const codec of CODEC_ORDER) {
+    try {
+      const probe = await VideoEncoder.isConfigSupported(encoderConfig(codec, config));
+      if (probe.supported) return codec;
+    } catch {
+      // Движок не знает такой строки кодека — просто пробуем следующую.
+    }
+  }
+  return CODEC_VP8;
+}
+
+/**
+ * Настройки демонстрации по тому, что реально отдала система.
+ *
+ * Считать их заранее нельзя: экраны бывают от ноутбучных до 5K, и одна и та же
+ * константа для всех означает либо мыло, либо кодирование вчетверо большего
+ * кадра впустую.
+ */
+function screenConfig(track: MediaStreamTrack): VideoConfig {
+  const settings = track.getSettings();
+  const sourceWidth = settings.width ?? SCREEN_MAX_WIDTH;
+  const sourceHeight = settings.height ?? SCREEN_MAX_HEIGHT;
+  const scale = Math.min(1, SCREEN_MAX_WIDTH / sourceWidth, SCREEN_MAX_HEIGHT / sourceHeight);
+  // Стороны чётные: кодеки работают с блоками, нечётная сторона либо
+  // отвергается, либо молча округляется — и картинка едет со сдвигом.
+  const width = Math.max(2, Math.round((sourceWidth * scale) / 2) * 2);
+  const height = Math.max(2, Math.round((sourceHeight * scale) / 2) * 2);
+  const framerate = Math.min(SCREEN_FPS, Math.round(settings.frameRate ?? SCREEN_FPS) || SCREEN_FPS);
+  const bitrate = Math.min(
+    SCREEN_BITRATE_MAX,
+    Math.max(SCREEN_BITRATE_MIN, Math.round(width * height * framerate * SCREEN_BITS_PER_PIXEL)),
+  );
+  return { width, height, bitrate, framerate };
+}
+
+/** Среднеквадратичная громкость блока — по ней и видно, говорит человек или молчит. */
+function loudness(samples: Float32Array): number {
+  let sum = 0;
+  for (const sample of samples) sum += sample * sample;
+  return Math.sqrt(sum / Math.max(1, samples.length));
 }
 
 /**
@@ -179,6 +332,8 @@ export class Capture {
   #screenStream: MediaStream | null = null;
   #screenStop: (() => void) | null = null;
   #screenAudioStop: (() => void) | null = null;
+  /** Куда сообщать громкость микрофона. Экрана это не касается: он не «говорит». */
+  #onLevel: ((level: number) => void) | null = null;
   /** Дорожки картинки по виду: камера и демонстрация настраиваются порознь. */
   #lanes = new Map<TrackKind, VideoLane>();
 
@@ -187,6 +342,7 @@ export class Capture {
   }
 
   async start(options: CaptureOptions): Promise<void> {
+    this.#onLevel = options.onLevel ?? null;
     this.#stream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
@@ -256,7 +412,7 @@ export class Capture {
 
     lane.config = { ...lane.config, bitrate: bps };
     try {
-      lane.encoder.configure({ codec: 'vp8', ...lane.config, latencyMode: 'realtime' });
+      lane.encoder.configure(encoderConfig(lane.codec, lane.config));
       // После перенастройки нужен ключевой кадр: иначе собеседник ещё несколько
       // секунд декодирует дельты, рассчитанные на прежний битрейт.
       lane.forced = true;
@@ -269,8 +425,12 @@ export class Capture {
   async #startAudio(onError: (message: string) => void): Promise<void> {
     const track = this.#stream?.getAudioTracks()[0];
     if (!track) return;
-    this.#audioEncoder = await this.#startAudioTrack(track, TRACK_AUDIO, onError, (stop) =>
-      this.#stopFns.push(stop),
+    this.#audioEncoder = await this.#startAudioTrack(
+      track,
+      TRACK_AUDIO,
+      onError,
+      (stop) => this.#stopFns.push(stop),
+      (level) => this.#onLevel?.(level),
     );
   }
 
@@ -280,12 +440,13 @@ export class Capture {
     kind: number,
     onError: (message: string) => void,
     keepStop: (stop: () => void) => void,
+    onLevel?: (level: number) => void,
   ): Promise<AudioEncoder> {
     const encoder = new AudioEncoder({
       output: (chunk) => {
         const data = new Uint8Array(chunk.byteLength);
         chunk.copyTo(data);
-        void send(pack(kind, true, chunk.timestamp, data));
+        void send(pack(kind, true, CODEC_VP8, chunk.timestamp, data));
       },
       error: (error) => onError(`кодировщик звука: ${error.message}`),
     });
@@ -307,6 +468,9 @@ export class Capture {
     // 5.7 TypeScript различает, чем подложен типизированный массив, и
     // `AudioData` не принимает тот, за которым может стоять `SharedArrayBuffer`.
     const push = (samples: Float32Array<ArrayBuffer>) => {
+      // Громкость считаем до кодирования и независимо от него: индикатор
+      // обязан работать и тогда, когда кодировщик отвалился.
+      onLevel?.(loudness(samples));
       if (encoder.state !== 'configured') return;
       // AudioData держит память вне кучи JavaScript, и сборщик мусора её не
       // освобождает — только явный close(). Без него звук в звонке утекает
@@ -406,11 +570,19 @@ export class Capture {
     // Звук просим сразу: система сама решит, отдавать его или нет. На macOS
     // вебвью его не отдаёт, поэтому наличие дорожки проверяем, а не полагаемся.
     const stream = await navigator.mediaDevices.getDisplayMedia({
-      video: { frameRate: 12 },
+      video: {
+        frameRate: { ideal: SCREEN_FPS },
+        width: { max: SCREEN_MAX_WIDTH },
+        height: { max: SCREEN_MAX_HEIGHT },
+      },
       audio: true,
     });
     this.#screenStream = stream;
     const track = stream.getVideoTracks()[0];
+    // Подсказка источнику: на экране важнее резкость, чем плавность. Без неё
+    // система при нехватке ресурсов режет разрешение — то самое, ради которого
+    // демонстрацию и смотрят.
+    track.contentHint = 'detail';
     // Пользователь может остановить показ кнопкой самой системы, не нашей.
     track.addEventListener('ended', () => this.stopScreen());
 
@@ -418,7 +590,7 @@ export class Capture {
       track,
       'screen',
       TRACK_SCREEN,
-      SCREEN,
+      screenConfig(track),
       onError,
       (stop) => (this.#screenStop = stop),
     );
@@ -467,17 +639,27 @@ export class Capture {
     keepStop: (stop: () => void) => void,
   ): Promise<void> {
     let frames = 0;
+    let codec = await pickCodec(config);
     const encoder = new VideoEncoder({
       output: (chunk) => {
         const data = new Uint8Array(chunk.byteLength);
         chunk.copyTo(data);
-        void send(pack(kind, chunk.type === 'key', chunk.timestamp, data));
+        void send(pack(kind, chunk.type === 'key', codec, chunk.timestamp, data));
       },
       error: (error) => onError(`кодировщик картинки: ${error.message}`),
     });
-    encoder.configure({ codec: 'vp8', ...config, latencyMode: 'realtime' });
+    try {
+      encoder.configure(encoderConfig(codec, config));
+    } catch {
+      // Движок сказал, что кодек поддержан, и отказался его настраивать. Так
+      // бывает: поддержка проверяется по строке кодека, а упирается в профиль
+      // или в разрешение. Отступаем на VP8 — он медленнее и хуже, но он есть
+      // везде, а звонок без картинки хуже картинки похуже.
+      codec = CODEC_VP8;
+      encoder.configure(encoderConfig(codec, config));
+    }
 
-    const entry: VideoLane = { encoder, config, forced: true };
+    const entry: VideoLane = { encoder, config, codec, forced: true };
     this.#lanes.set(lane, entry);
 
     const video = document.createElement('video');
@@ -486,8 +668,20 @@ export class Capture {
     await video.play();
 
     let running = true;
+    let encodedAt = 0;
     const pump = () => {
       if (!running || encoder.state !== 'configured') return;
+      // Кодировщику задан свой темп, а requestAnimationFrame зовёт нас со
+      // скоростью монитора — на маке это до ста двадцати раз в секунду. Лишние
+      // кадры не добавляют плавности: битрейт один на всех, и каждый кадр сверх
+      // темпа отбирает биты у остальных, то есть делает картинку хуже, а не
+      // лучше. Миллисекунда допуска — на дрожание самого таймера.
+      const now = performance.now();
+      if (now - encodedAt < 1000 / entry.config.framerate - 1) {
+        schedule();
+        return;
+      }
+      encodedAt = now;
       // Очередь длиннее двух кадров означает, что кодировщик не успевает.
       // Пропускаем кадр вместо того, чтобы копить и задержку, и память.
       if (encoder.encodeQueueSize < 2) {
@@ -505,7 +699,7 @@ export class Capture {
     // видел, будто камеру выключили.
     const schedule = () => {
       if (!running) return;
-      if (document.hidden) window.setTimeout(pump, 1000 / 12);
+      if (document.hidden) window.setTimeout(pump, 1000 / entry.config.framerate);
       else requestAnimationFrame(pump);
     };
     schedule();
@@ -515,6 +709,114 @@ export class Capture {
       video.srcObject = null;
     });
   }
+}
+
+/**
+ * Общий плеер: отсчёты приходят из ядра, а кодируются здесь.
+ *
+ * Захват нативный — вебвью на маке системный звук не отдаёт вовсе, — но
+ * кодирование осталось на своём месте, рядом с микрофонным. Ядру от этого
+ * достался ровно один новый путь: сырые отсчёты наверх.
+ */
+export class MusicCapture {
+  #encoder: AudioEncoder | null = null;
+  /** Хвост, не набравший целого блока Opus. Чередующийся, как и всё остальное. */
+  #tail = new Float32Array(0);
+  #channels = 2;
+  #timestamp = 0;
+
+  get channels(): number {
+    return this.#channels;
+  }
+
+  async start(onError: (message: string) => void): Promise<void> {
+    const encoder = new AudioEncoder({
+      output: (chunk) => {
+        const data = new Uint8Array(chunk.byteLength);
+        chunk.copyTo(data);
+        // Число каналов едет в тех же битах, где у картинки кодек: декодер
+        // настраивается до первого кадра, и угадывать раскладку ему нечем.
+        void send(pack(TRACK_MUSIC, true, this.#channels, chunk.timestamp, data));
+      },
+      error: (error) => onError(`кодировщик музыки: ${error.message}`),
+    });
+
+    // Стерео даётся не везде. Молча свести в моно нельзя — слушатель настроит
+    // декодер на два канала и получит шум, — поэтому раскладка едет в кадре.
+    try {
+      encoder.configure({
+        codec: 'opus',
+        sampleRate: 48000,
+        numberOfChannels: 2,
+        bitrate: MUSIC_BITRATE,
+      });
+    } catch {
+      this.#channels = 1;
+      encoder.configure({
+        codec: 'opus',
+        sampleRate: 48000,
+        numberOfChannels: 1,
+        bitrate: MUSIC_BITRATE / 2,
+      });
+    }
+    this.#encoder = encoder;
+
+    const channel = new Channel<ArrayBuffer>();
+    channel.onmessage = (payload) => this.#take(new Float32Array(payload));
+    await invoke('music_stream', { channel });
+  }
+
+  stop(): void {
+    shut(this.#encoder);
+    this.#encoder = null;
+    this.#tail = new Float32Array(0);
+  }
+
+  /**
+   * Нарезать пришедшее на кадры Opus.
+   *
+   * Система отдаёт блоки своего размера, а кодек ждёт ровно двадцать
+   * миллисекунд. Без нарезки каждый второй блок приезжал бы неполным.
+   */
+  #take(incoming: Float32Array): void {
+    const encoder = this.#encoder;
+    if (!encoder || encoder.state !== 'configured') return;
+
+    // Захват отдаёт всегда два канала; если кодируем в моно — сводим сами.
+    const samples = this.#channels === 2 ? incoming : downmix(incoming);
+    const merged = new Float32Array(this.#tail.length + samples.length);
+    merged.set(this.#tail);
+    merged.set(samples, this.#tail.length);
+
+    const step = AUDIO_BLOCK * this.#channels;
+    let at = 0;
+    while (merged.length - at >= step) {
+      const block = merged.slice(at, at + step);
+      at += step;
+      const frame = new AudioData({
+        format: 'f32',
+        sampleRate: 48000,
+        numberOfFrames: AUDIO_BLOCK,
+        numberOfChannels: this.#channels,
+        timestamp: this.#timestamp,
+        data: block,
+      });
+      encoder.encode(frame);
+      // Память AudioData живёт вне кучи JavaScript, и сборщик её не трогает.
+      frame.close();
+      this.#timestamp += Math.round((AUDIO_BLOCK / 48000) * 1_000_000);
+    }
+    this.#tail = merged.slice(at);
+  }
+}
+
+/** Свести чередующееся стерео в моно. */
+function downmix(samples: Float32Array): Float32Array {
+  const out = new Float32Array(samples.length >> 1);
+  for (let i = 0; i < out.length; i += 1) {
+    out[i] = (samples[i * 2] + samples[i * 2 + 1]) / 2;
+  }
+  return out;
 }
 
 // ── входящий поток ──────────────────────────────────────────────────────────
@@ -528,9 +830,15 @@ export class Capture {
  * запас чуть выше него.
  */
 class Jitter {
-  #lead = AUDIO_LEAD_MIN;
+  #floor: number;
+  #lead: number;
   #spread = 0;
   #last = 0;
+
+  constructor(floor = AUDIO_LEAD_MIN) {
+    this.#floor = floor;
+    this.#lead = floor;
+  }
 
   /** Отметить приход кадра длительностью `frameMs`. */
   observe(frameMs: number): void {
@@ -551,7 +859,7 @@ class Jitter {
   get lead(): number {
     const target = Math.min(
       AUDIO_LEAD_MAX,
-      Math.max(AUDIO_LEAD_MIN, (this.#spread * 2.5 + 20) / 1000),
+      Math.max(this.#floor, (this.#spread * 2.5 + 20) / 1000),
     );
     // Вверх — сразу: недобор слышно немедленно. Вниз — медленно: поспешное
     // снижение возвращает бульканье, ради избавления от которого всё и делалось.
@@ -567,12 +875,21 @@ class Jitter {
 export class Playback {
   #audio = new Map<string, AudioDecoder>();
   #video = new Map<string, VideoDecoder>();
+  /** Каким кодеком настроен декодер дорожки: сменился — надо пересобирать. */
+  #codecs = new Map<string, number>();
   #canvases = new Map<string, HTMLCanvasElement>();
   #context: AudioContext | null = null;
   #nextPlay = new Map<string, number>();
   /** По регулятору громкости на каждого: в звонке люди звучат по-разному. */
   #gains = new Map<string, GainNode>();
   #volumes = new Map<string, number>();
+  /**
+   * Громкость общего плеера — своя у каждого слушателя и отдельно от голоса.
+   *
+   * Иначе не выйдет главного: сделать музыку потише, чтобы за ней было слышно
+   * разговор. Один регулятор на всё двигал бы их вместе.
+   */
+  #musicVolume = 1;
   /** Когда последний раз приходил кадр по каждой дорожке. */
   #lastFrame = new Map<string, number>();
   /** Подбор буфера и учёт потерь — на каждого собеседника свой. */
@@ -597,6 +914,16 @@ export class Playback {
    * Ограничиваем сверху: усиление выше четырёх превращает тихого человека не в
    * громкого, а в хрип пополам с шумом микрофона.
    */
+  /** Громкость общего плеера у себя. Соседей она не касается. */
+  setMusicVolume(value: number): void {
+    this.#musicVolume = Math.max(0, Math.min(2, value));
+    for (const [key, node] of this.#gains) {
+      if (key.startsWith('music:') && this.#context) {
+        node.gain.setTargetAtTime(this.#musicVolume, this.#context.currentTime, 0.02);
+      }
+    }
+  }
+
   setVolume(author: string, value: number): void {
     const gain = Math.max(0, Math.min(4, value));
     this.#volumes.set(author, gain);
@@ -609,17 +936,22 @@ export class Playback {
 
   /** Забыть участника: декодеры на ушедших иначе копятся всю встречу. */
   forget(author: string): void {
-    shut(this.#audio.get(author));
-    this.#audio.delete(author);
-    this.#nextPlay.delete(author);
-    this.#jitter.delete(author);
-    this.#gains.get(author)?.disconnect();
-    this.#gains.delete(author);
-    for (const track of ['audio', 'screen-audio']) this.#lastSeq.delete(`${track}:${author}`);
+    for (const key of [author, `music:${author}`]) {
+      shut(this.#audio.get(key));
+      this.#audio.delete(key);
+      this.#nextPlay.delete(key);
+      this.#jitter.delete(key);
+      this.#gains.get(key)?.disconnect();
+      this.#gains.delete(key);
+    }
+    for (const track of ['audio', 'screen-audio', 'music']) {
+      this.#lastSeq.delete(`${track}:${author}`);
+    }
     for (const track of ['video', 'screen']) {
       const key = `${track}:${author}`;
       shut(this.#video.get(key));
       this.#video.delete(key);
+      this.#codecs.delete(key);
       this.#canvases.delete(key);
     }
   }
@@ -657,6 +989,7 @@ export class Playback {
     for (const node of this.#gains.values()) node.disconnect();
     this.#audio.clear();
     this.#video.clear();
+    this.#codecs.clear();
     this.#gains.clear();
     this.#nextPlay.clear();
     this.#jitter.clear();
@@ -673,6 +1006,13 @@ export class Playback {
     }
   }
 
+  /** Кто из участников сейчас транслирует музыку. */
+  playingMusic(): string[] {
+    return [...this.#audio.keys()]
+      .filter((key) => key.startsWith('music:'))
+      .map((key) => key.slice('music:'.length));
+  }
+
   /** Кто из участников сейчас показывает экран. */
   sharingScreen(): string[] {
     return [...this.#video.keys()]
@@ -682,26 +1022,36 @@ export class Playback {
 
   #handleAudio(frame: IncomingFrame, onError: (message: string) => void): void {
     // Звук экрана микшируется с голосом того же человека — это его звук.
-    let decoder = this.#audio.get(frame.author);
+    // Музыка общего плеера — нет: у неё своя громкость и своя раскладка.
+    const music = frame.track === 'music';
+    const key = music ? `music:${frame.author}` : frame.author;
+
+    let decoder = this.#audio.get(key);
     if (!decoder) {
       decoder = new AudioDecoder({
-        output: (data) => this.#play(frame.author, data),
+        output: (data) => this.#play(key, data, music),
         error: (error) => onError(`декодер звука: ${error.message}`),
       });
-      decoder.configure({ codec: 'opus', sampleRate: 48000, numberOfChannels: 1 });
-      this.#audio.set(frame.author, decoder);
+      decoder.configure({
+        codec: 'opus',
+        sampleRate: 48000,
+        // У музыки число каналов приезжает в кадре: ведущий мог не получить
+        // стерео от своего движка и кодировать в моно.
+        numberOfChannels: music ? Math.max(1, Math.min(2, frame.codec)) : 1,
+      });
+      this.#audio.set(key, decoder);
     }
     if (decoder.state !== 'configured') return;
 
     // Пропуск в номерах — это потерянная датаграмма. Считаем её: по потерям
     // видно, что буфер пора растить, а не гадать по одному только разбросу.
-    const key = `${frame.track}:${frame.author}`;
-    const previous = this.#lastSeq.get(key);
+    const seqKey = `${frame.track}:${frame.author}`;
+    const previous = this.#lastSeq.get(seqKey);
     if (previous !== undefined && frame.seq > previous + 1) {
       this.#lost += frame.seq - previous - 1;
-      this.#jitterFor(frame.author).underrun();
+      this.#jitterFor(key, music).underrun();
     }
-    if (previous === undefined || frame.seq > previous) this.#lastSeq.set(key, frame.seq);
+    if (previous === undefined || frame.seq > previous) this.#lastSeq.set(seqKey, frame.seq);
 
     decoder.decode(
       new EncodedAudioChunk({
@@ -717,6 +1067,15 @@ export class Playback {
     const key = `${frame.track}:${frame.author}`;
     this.#lastFrame.set(key, Date.now());
     let decoder = this.#video.get(key);
+    // Собеседник мог пересобрать кодировщик на другом кодеке — например, включив
+    // демонстрацию, под которую нашёлся аппаратный H.264. Старый декодер такой
+    // поток не поймёт и будет молча выдавать ошибку за ошибкой.
+    if (decoder && this.#codecs.get(key) !== frame.codec) {
+      if (!frame.keyframe) return;
+      shut(decoder);
+      this.#video.delete(key);
+      decoder = undefined;
+    }
     if (!decoder) {
       // До первого ключевого кадра декодер запускать бессмысленно.
       if (!frame.keyframe) return;
@@ -724,8 +1083,12 @@ export class Playback {
         output: (image) => this.#draw(key, image),
         error: (error) => onError(`декодер картинки: ${error.message}`),
       });
-      decoder.configure({ codec: 'vp8', optimizeForLatency: true });
+      decoder.configure({
+        codec: VIDEO_CODECS[frame.codec] ?? VIDEO_CODECS[CODEC_VP8],
+        optimizeForLatency: true,
+      });
       this.#video.set(key, decoder);
+      this.#codecs.set(key, frame.codec);
     }
     if (decoder.state !== 'configured') return;
     decoder.decode(
@@ -737,40 +1100,47 @@ export class Playback {
     );
   }
 
-  #jitterFor(author: string): Jitter {
-    let jitter = this.#jitter.get(author);
+  #jitterFor(key: string, music = false): Jitter {
+    let jitter = this.#jitter.get(key);
     if (!jitter) {
-      jitter = new Jitter();
-      this.#jitter.set(author, jitter);
+      jitter = new Jitter(music ? MUSIC_LEAD_MIN : AUDIO_LEAD_MIN);
+      this.#jitter.set(key, jitter);
     }
     return jitter;
   }
 
   /** Планирование звука с запасом, подобранным под реальный разброс прихода. */
-  #play(author: string, data: AudioData): void {
+  #play(key: string, data: AudioData, music = false): void {
     this.#context ??= new AudioContext({ sampleRate: 48000 });
     const context = this.#context;
     if (context.state === 'suspended') void context.resume();
 
     const frames = data.numberOfFrames;
-    const buffer = context.createBuffer(1, frames, data.sampleRate);
-    const channel = new Float32Array(frames);
-    data.copyTo(channel, { planeIndex: 0, format: 'f32-planar' });
-    buffer.copyToChannel(channel, 0);
+    const channels = Math.max(1, data.numberOfChannels);
+    const buffer = context.createBuffer(channels, frames, data.sampleRate);
+    const plane = new Float32Array(frames);
+    for (let index = 0; index < channels; index += 1) {
+      data.copyTo(plane, { planeIndex: index, format: 'f32-planar' });
+      buffer.copyToChannel(plane, index);
+    }
     data.close();
+    // Громкость до регулятора: подсветка говорит о человеке, а не о том, как
+    // громко его сделали у себя. Считаем по последнему каналу — для голоса он
+    // единственный, а музыке подсветка не нужна вовсе.
+    const level = loudness(plane);
 
-    const jitter = this.#jitterFor(author);
+    const jitter = this.#jitterFor(key, music);
     jitter.observe(buffer.duration * 1000);
 
     const source = context.createBufferSource();
     source.buffer = buffer;
-    source.connect(this.#gainFor(author, context));
+    source.connect(this.#gainFor(key, context));
     // Отыгравший источник обязан отцепиться от графа. Иначе за десятиминутный
     // разговор их накапливается под тридцать тысяч на человека, и каждый
     // держит свой буфер.
     source.onended = () => source.disconnect();
 
-    const queued = this.#nextPlay.get(author) ?? 0;
+    const queued = this.#nextPlay.get(key) ?? 0;
     // Очередь опустела — значит запаса не хватило. Этот кадр играть уже поздно,
     // но буфер после такого обязан подрасти.
     if (queued > 0 && queued < context.currentTime) jitter.underrun();
@@ -791,10 +1161,13 @@ export class Playback {
     }
 
     source.start(at);
-    this.#nextPlay.set(author, at + buffer.duration);
+    this.#nextPlay.set(key, at + buffer.duration);
 
-    // Грубый индикатор «говорит»: по факту прихода звука, без анализа громкости.
-    this.#onSpeaker(author);
+    // Индикатор «говорит» — по громкости, а не по факту прихода кадра. Opus
+    // шлёт их непрерывно, и молчащий человек подсвечивался наравне с
+    // говорящим: рамка горела у всех и не значила ничего. Музыка сюда не
+    // попадает: она играет у всех, а «говорит» — это про человека.
+    if (!music && level > SPEAKING_RMS) this.#onSpeaker(key);
   }
 
   /**
@@ -816,19 +1189,22 @@ export class Playback {
       if (key.startsWith('screen:')) {
         shut(this.#video.get(key));
         this.#video.delete(key);
+        this.#codecs.delete(key);
         this.#canvases.delete(key);
       }
     }
   }
 
-  /** Регулятор громкости участника, создаётся при первом же кадре звука. */
-  #gainFor(author: string, context: AudioContext): GainNode {
-    let node = this.#gains.get(author);
+  /** Регулятор громкости дорожки, создаётся при первом же кадре звука. */
+  #gainFor(key: string, context: AudioContext): GainNode {
+    let node = this.#gains.get(key);
     if (!node) {
       node = context.createGain();
-      node.gain.value = this.#volumes.get(author) ?? 1;
+      node.gain.value = key.startsWith('music:')
+        ? this.#musicVolume
+        : (this.#volumes.get(key) ?? 1);
       node.connect(context.destination);
-      this.#gains.set(author, node);
+      this.#gains.set(key, node);
     }
     return node;
   }
