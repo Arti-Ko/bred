@@ -1,7 +1,11 @@
 # Проверки на каждый push и pull request.
 #
-# Гоняем только на Linux: тесты не трогают ни камеру, ни микрофон, ни окно —
-# им достаточно любой машины, а сборка под три платформы нужна лишь для релиза.
+# Тесты гоняем на Linux: они не трогают ни камеру, ни микрофон, ни окно, и им
+# достаточно любой машины. Но с появлением общего плеера у нас есть код, который
+# на Linux не компилируется вовсе — захват звука приложения написан отдельно под
+# каждую систему. Поэтому рядом идут короткие проверки на macOS и Windows: без
+# них поломка в платформенном модуле всплыла бы только на сборке релиза, то есть
+# после тега, когда исправлять уже поздно.
 
 name: Проверки
 
@@ -46,3 +50,34 @@ jobs:
       - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
       - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  # Только проверка компиляции: полная сборка нужна лишь релизу, а поймать
+  # неверную привязку к системному API она успевает и так.
+  platform:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            label: macOS
+          - os: windows-latest
+            label: Windows
+
+    name: Платформенный код — ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.os }}
+
+      # Интерфейс собирать незачем, но tauri ждёт каталог сборки на месте.
+      - run: mkdir dist
+
+      - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings

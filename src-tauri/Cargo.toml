@@ -1,6 +1,6 @@
 [package]
 name = "bred"
-version = "0.3.0"
+version = "0.4.0"
 description = "БРЕД — Быстрая Ретрансляция Электронных Данных"
 edition = "2021"
 rust-version = "1.82"
@@ -55,6 +55,24 @@ objc2-core-graphics = "0.3.2"
 objc2-core-media = "0.3.2"
 objc2-foundation = "0.3.2"
 objc2-screen-capture-kit = "0.3.2"
+
+# Захват звука чужого приложения и медиа-клавиши на Windows: петля по процессу
+# в WASAPI плюс `SendInput`. Список возможностей узкий намеренно — привязки
+# генерируются по нему, и лишние заметно удлиняют сборку.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-core = "0.62.2"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 # Скорость, а не размер. На горячем пути — шифрование каждого пакета звонка,
