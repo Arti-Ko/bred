@@ -87,6 +87,46 @@ const CAPTURE_WORKLET = '/audio-capture-worklet.js';
 export type TrackKind = 'audio' | 'video' | 'screen' | 'screen-audio' | 'music';
 
 /**
+ * Какие дорожки — звук. Всё остальное считается картинкой.
+ *
+ * Одно место правды намеренно: раньше развилка приёма перечисляла звуковые
+ * дорожки прямо в условии, и добавленная музыка в него не попала. Кадры уезжали
+ * в видеодекодер, который вдобавок читал число каналов как номер кодека и
+ * настраивался на H.264 — музыки не было слышно вовсе.
+ */
+const AUDIO_TRACKS = new Set<TrackKind>(['audio', 'screen-audio', 'music']);
+
+/**
+ * Как часто проверяем, не уснул ли аудиоконтекст.
+ *
+ * Событие `statechange` приходит не всегда: у прерванного системой контекста
+ * Safari держит нестандартное состояние `interrupted`, о котором не сообщает.
+ * Поэтому рядом с подпиской идёт и опрос.
+ */
+const AWAKE_CHECK = 1000;
+
+/**
+ * Держать аудиоконтекст в работе, что бы с ним ни делала система.
+ *
+ * Это не перестраховка. Захват звука приложения поднимает свою аудиосессию, и
+ * система вправе прервать ею нашу: контекст микрофона уходит в приостановку и
+ * сам уже не возвращается. Воркер перестаёт отдавать кадры — собеседники
+ * перестают слышать человека, причём насовсем, до перезахода в комнату.
+ * Лечится это одной строчкой `resume()`, надо только заметить.
+ */
+function keepAwake(context: AudioContext): () => void {
+  const wake = () => {
+    if (context.state !== 'running') void context.resume().catch(() => undefined);
+  };
+  context.addEventListener('statechange', wake);
+  const timer = window.setInterval(wake, AWAKE_CHECK);
+  return () => {
+    context.removeEventListener('statechange', wake);
+    window.clearInterval(timer);
+  };
+}
+
+/**
  * Закрыть кодировщик или декодер, чем бы это ни кончилось.
  *
  * Повторный `close()` бросает исключение, и оно уносит с собой всё, что должно
@@ -461,6 +501,15 @@ export class Capture {
     // Без явного возобновления контекст может остаться приостановленным,
     // и захват молча не даст ни одного кадра.
     if (context.state === 'suspended') await context.resume();
+    // И дальше следим за ним всю жизнь захвата: усыпить контекст система может
+    // и потом — например, когда мы же поднимем захват звука приложения.
+    const awake = keepAwake(context);
+    // А если система оборвала саму дорожку, `resume()` уже не поможет — и это
+    // ровно тот случай, когда молчание хуже всего: человек говорит, его не
+    // слышат, и никто не понимает почему.
+    track.addEventListener('ended', () =>
+      onError('система отключила микрофон — перезайдите в звонок'),
+    );
     const source = context.createMediaStreamSource(new MediaStream([track]));
 
     let timestamp = 0;
@@ -491,6 +540,7 @@ export class Capture {
     const stop = await this.#pumpAudio(context, source, push);
 
     keepStop(() => {
+      awake();
       stop();
       source.disconnect();
       shut(encoder);
@@ -999,18 +1049,11 @@ export class Playback {
   }
 
   #handle(frame: IncomingFrame, onError: (message: string) => void): void {
-    if (frame.track === 'audio' || frame.track === 'screen-audio') {
+    if (AUDIO_TRACKS.has(frame.track)) {
       this.#handleAudio(frame, onError);
     } else {
       this.#handleVideo(frame, onError);
     }
-  }
-
-  /** Кто из участников сейчас транслирует музыку. */
-  playingMusic(): string[] {
-    return [...this.#audio.keys()]
-      .filter((key) => key.startsWith('music:'))
-      .map((key) => key.slice('music:'.length));
   }
 
   /** Кто из участников сейчас показывает экран. */
