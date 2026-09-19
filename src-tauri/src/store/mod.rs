@@ -958,8 +958,12 @@ mod tests {
     #[test]
     fn newer_address_replaces_the_old_one() {
         let store = Store::in_memory().unwrap();
-        store.remember_peer_seen(SPACE, PEER, "", Some(&[1])).unwrap();
-        store.remember_peer_seen(SPACE, PEER, "", Some(&[2])).unwrap();
+        store
+            .remember_peer_seen(SPACE, PEER, "", Some(&[1]))
+            .unwrap();
+        store
+            .remember_peer_seen(SPACE, PEER, "", Some(&[2]))
+            .unwrap();
         assert_eq!(store.known_peers(SPACE).unwrap()[0].1, Some(vec![2]));
     }
 }

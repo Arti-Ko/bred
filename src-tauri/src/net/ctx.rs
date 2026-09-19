@@ -290,18 +290,14 @@ impl Ctx {
     /// момент всегда «сейчас», и подделать его иначе нечем.
     #[cfg(test)]
     pub fn note_presence_at(&self, space: SpaceId, presence: Presence, at: i64) {
-        self.presence
-            .write()
-            .entry(space)
-            .or_default()
-            .insert(
-                presence.author,
-                Seen {
-                    presence,
-                    at,
-                    persisted: at,
-                },
-            );
+        self.presence.write().entry(space).or_default().insert(
+            presence.author,
+            Seen {
+                presence,
+                at,
+                persisted: at,
+            },
+        );
     }
 
     pub fn drop_presence(&self, space: SpaceId, author: Id) {
