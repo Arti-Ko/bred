@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { call } from '../stores/call.svelte';
+  import { call, SHARE_PLAYER } from '../stores/call.svelte';
   import PlayerPanel from './PlayerPanel.svelte';
   import { prefs } from '../stores/prefs.svelte';
   import { session } from '../stores/session.svelte';
@@ -92,12 +92,14 @@
           {call.screenAudio ? 'звук экрана вкл' : 'звук экрана выкл'}
         </button>
       {/if}
-      <button
-        class:off={!call.sharingMusic}
-        onclick={() => (call.sharingMusic ? call.stopMusic() : call.toggleMusicPicker())}
-      >
-        {call.sharingMusic ? 'плеер вкл' : 'слушать вместе'}
-      </button>
+      {#if SHARE_PLAYER}
+        <button
+          class:off={!call.sharingMusic}
+          onclick={() => (call.sharingMusic ? call.stopMusic() : call.toggleMusicPicker())}
+        >
+          {call.sharingMusic ? 'плеер вкл' : 'слушать вместе'}
+        </button>
+      {/if}
       {#if hasScreen}
         <button class:off={!call.screenOnly} onclick={() => call.toggleScreenOnly()}>
           только экран
