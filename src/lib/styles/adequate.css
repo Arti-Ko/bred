@@ -1,36 +1,16 @@
-/* Адекватный режим — второе оформление БРЕД.
-   Включается не настройкой, а победой (см. src/lib/games): в настройках есть
-   кнопка «адекватный дизайн», и за ней стоят три игры.
+/* Адекватный режим — второй интерфейс БРЕД.
+   Открывается не настройкой, а победой (см. src/lib/games).
 
-   Направление другое, чем у терминала: тёплые чернила вместо люминофора,
-   человеческий шрифт для текста и один живой акцент — уголь. Сетка, размеры
-   панелей и вся разметка при этом те же самые: переключение меняет вид, а не
-   расположение, и привычка работать не ломается.
+   Палитра остаётся монохромной, как в tokens.css: ни одного цветового акцента,
+   активное помечается инверсией. Меняется не вид, а способ работы — вместо
+   командной строки кнопки и диалоги, у каждого действия своё видимое место.
 
-   Всё держится на переопределении токенов; правила ниже — только там, где у
-   терминала осознанно нет ничего: скругления, тени, ритм. Селекторы начинаются
-   с :root[data-skin], чтобы уверенно перебивать стили компонентов. */
+   Здесь живёт только общее: типографика, кнопки, поля и правки для тех
+   компонентов терминала, которые режим переиспользует (лента, звонок,
+   настройки). Каркас со своими стилями — в src/lib/adequate. */
 
 :root[data-skin='adequate'] {
-  /* Поверхности: глубокая чернильная база с фиолетовым подтоном */
-  --bg: #100e15;
-  --bg-raised: #191723;
-  --line: #292634;
-
-  /* Текст — тёплая бумага, а не белый по чёрному */
-  --fg: #e9e3dc;
-  --fg-hi: #fffaf3;
-  --fg-dim: #a49cae;
-  --fg-dimmer: #79718a;
-  --fg-faint: #3b364a;
-
-  /* Единственный акцент: уголь. Он же — активный элемент вместо инверсии */
-  --ember: #e8734a;
-  --gold: #d9b26a;
-  --inv-bg: var(--ember);
-  --inv-fg: #150f14;
-
-  --sans: ui-sans-serif, -apple-system, 'SF Pro Text', 'Segoe UI', Inter, system-ui, sans-serif;
+  --sans: ui-sans-serif, -apple-system, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
   --text: 13.5px;
   --text-sm: 12.5px;
 
@@ -40,198 +20,235 @@
   --gap-5: 16px;
 
   --fast: 140ms;
-  --radius: 10px;
-  --radius-sm: 7px;
+  --radius: 12px;
+  --radius-sm: 8px;
+
+  /* Подъём поверхности вместо второго цвета */
+  --lift: rgba(255, 255, 255, 0.06);
+  --lift-2: rgba(255, 255, 255, 0.11);
+  --edge: rgba(255, 255, 255, 0.3);
 }
 
 :root[data-skin='adequate'] body {
   font-family: var(--sans);
   letter-spacing: 0;
-  background:
-    radial-gradient(1200px 700px at 88% -12%, rgba(232, 115, 74, 0.09), transparent 62%),
-    radial-gradient(900px 600px at -6% 108%, rgba(120, 96, 200, 0.08), transparent 64%),
-    var(--bg);
 }
 
-/* Зернистость люминофора — часть терминала, здесь ей делать нечего */
+/* Зернистость люминофора — приём терминала, здесь ей делать нечего */
 :root[data-skin='adequate'] body::after {
   opacity: 0;
 }
 
 :root[data-skin='adequate'] ::selection {
-  background: rgba(232, 115, 74, 0.32);
+  background: rgba(255, 255, 255, 0.24);
   color: var(--fg-hi);
 }
 
-/* Моноширинным остаётся только машинное: ключи, адреса, время, отметки.
-   Переписка — обычным шрифтом: её читают, а не сверяют посимвольно.
-   `.selectable` сюда не годится — им помечен и текст сообщений. */
+/* Моноширинным остаётся машинное: ключи, адреса, время, код */
 :root[data-skin='adequate'] .v.selectable,
 :root[data-skin='adequate'] .b,
 :root[data-skin='adequate'] time,
-:root[data-skin='adequate'] .k,
 :root[data-skin='adequate'] .mark {
   font-family: var(--mono);
   font-size: var(--text-xs);
 }
-
-/* Код остаётся кодом */
 :root[data-skin='adequate'] pre {
   font-family: var(--mono);
   border-radius: var(--radius-sm);
 }
 
-/* ── каркас ───────────────────────────────────────────────────────────────── */
+/* ── общие органы управления каркаса ──────────────────────────────────────── */
 
-:root[data-skin='adequate'] .wins {
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.045), transparent);
-  border-bottom: 1px solid var(--line);
-}
-
-:root[data-skin='adequate'] .brand {
-  letter-spacing: 0.22em;
-  color: var(--ember);
-  font-weight: 700;
-}
-
-:root[data-skin='adequate'] .pane {
-  background: linear-gradient(180deg, rgba(255, 255, 255, 0.022), transparent 40%);
-}
-
-:root[data-skin='adequate'] .pane-head,
-:root[data-skin='adequate'] .group {
-  font-size: 10.5px;
-  letter-spacing: 0.2em;
-  color: var(--fg-dimmer);
-}
-
-/* ── списки каналов и участников ──────────────────────────────────────────── */
-
-:root[data-skin='adequate'] .row {
+:root[data-skin='adequate'] .btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 14px;
+  border: 1px solid var(--line);
   border-radius: var(--radius-sm);
-  width: calc(100% - 12px);
-  margin: 1px 6px;
-  padding: 3px var(--gap-3);
+  background: var(--bg-raised);
+  color: var(--fg);
+  font: inherit;
+  font-size: var(--text-sm);
+  white-space: nowrap;
+  transition: background var(--fast) var(--ease), border-color var(--fast) var(--ease),
+    color var(--fast) var(--ease);
 }
-:root[data-skin='adequate'] .row:hover {
-  background: rgba(232, 115, 74, 0.1);
+:root[data-skin='adequate'] .btn:hover:not(:disabled) {
+  border-color: var(--fg-dim);
   color: var(--fg-hi);
 }
-:root[data-skin='adequate'] .row[aria-current='true'] {
-  background: linear-gradient(90deg, var(--ember), #cf5f3c);
-  box-shadow: 0 6px 18px -12px var(--ember);
+:root[data-skin='adequate'] .btn:disabled {
+  color: var(--fg-dimmer);
+  cursor: default;
+}
+/* Главное действие — полная инверсия: в монохроме заметнее нет ничего */
+:root[data-skin='adequate'] .btn.primary {
+  background: var(--inv-bg);
+  border-color: var(--inv-bg);
+  color: var(--inv-fg);
+  font-weight: 650;
+}
+:root[data-skin='adequate'] .btn.primary:hover:not(:disabled) {
+  background: var(--fg-hi);
+  color: var(--inv-fg);
+}
+:root[data-skin='adequate'] .btn.quiet {
+  background: none;
+  border-color: transparent;
+  color: var(--fg-dim);
+}
+:root[data-skin='adequate'] .btn.small {
+  padding: 4px 10px;
+  font-size: var(--text-xs);
 }
 
-/* ── лента ────────────────────────────────────────────────────────────────── */
+:root[data-skin='adequate'] .icon-btn {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--fg-dim);
+  transition: background var(--fast) var(--ease), color var(--fast) var(--ease);
+}
+:root[data-skin='adequate'] .icon-btn:hover {
+  background: var(--lift);
+  color: var(--fg-hi);
+}
+:root[data-skin='adequate'] .icon-btn.bordered {
+  border-color: var(--line);
+  background: var(--bg-raised);
+}
 
+:root[data-skin='adequate'] .field-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--fg-dimmer);
+  font-size: 11.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+:root[data-skin='adequate'] .input {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--fg);
+  font: inherit;
+  font-size: var(--text);
+}
+:root[data-skin='adequate'] .input:focus,
+:root[data-skin='adequate'] .input:focus-within {
+  border-color: var(--edge);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.06);
+  outline: none;
+}
+:root[data-skin='adequate'] .input.mono {
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+  color: var(--fg-dim);
+  word-break: break-all;
+}
+:root[data-skin='adequate'] .hint-text {
+  color: var(--fg-dimmer);
+  font-size: var(--text-sm);
+  line-height: 1.45;
+}
+
+/* ── переиспользованные компоненты терминала ──────────────────────────────── */
+
+/* Лента: в адекватном режиме у неё своя шапка, отступы шире, углы мягче */
 :root[data-skin='adequate'] .log {
   line-height: 1.58;
+  padding-block: var(--gap-3);
 }
-
 :root[data-skin='adequate'] .msg {
-  padding: 6px 16px 7px;
-  border-radius: var(--radius-sm);
   margin: 1px 6px;
-  border-left-width: 2px;
+  padding: 7px 14px;
+  border-radius: var(--radius-sm);
 }
 :root[data-skin='adequate'] .msg:hover {
-  background: rgba(255, 255, 255, 0.035);
-  border-left-color: var(--fg-faint);
+  background: var(--lift);
 }
 :root[data-skin='adequate'] .msg.selected {
-  background: rgba(232, 115, 74, 0.08);
-  border-left-color: var(--ember);
+  background: var(--lift-2);
+  border-left-color: var(--fg-hi);
 }
 :root[data-skin='adequate'] .who {
-  color: var(--fg-hi);
   font-weight: 640;
   letter-spacing: -0.005em;
 }
 :root[data-skin='adequate'] .tag {
-  background: rgba(232, 115, 74, 0.2);
-  color: var(--ember);
+  background: var(--lift-2);
+  color: var(--fg-hi);
   border-radius: 4px;
   font-family: var(--sans);
 }
-:root[data-skin='adequate'] .day {
-  color: var(--fg-dimmer);
-  letter-spacing: 0.16em;
-}
-
-/* ── строка ввода и полоса команд ─────────────────────────────────────────── */
-
-:root[data-skin='adequate'] .prompt {
-  margin: 0 8px 8px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  background: var(--bg-raised);
-  box-shadow: 0 14px 34px -28px rgba(0, 0, 0, 0.9);
-}
-:root[data-skin='adequate'] .prompt:focus-within {
-  border-color: rgba(232, 115, 74, 0.55);
-}
-:root[data-skin='adequate'] .p {
-  color: var(--ember);
-}
-:root[data-skin='adequate'] .bar button {
+:root[data-skin='adequate'] .rx {
   border-radius: 999px;
-  padding: 1px 10px;
+  padding: 1px 9px;
 }
-:root[data-skin='adequate'] .bar button:hover {
-  background: rgba(232, 115, 74, 0.12);
-  color: var(--fg-hi);
+:root[data-skin='adequate'] .file {
+  border-radius: var(--radius-sm);
+}
+/* День — разделитель по центру, а не строка с хвостом из тире */
+:root[data-skin='adequate'] .day {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  letter-spacing: 0.12em;
+  border: 0;
+  padding: 10px 14px 12px;
+}
+:root[data-skin='adequate'] .day::before,
+:root[data-skin='adequate'] .day::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--line);
 }
 
-/* ── окна поверх: настройки, звонок, ветка ────────────────────────────────── */
-
+/* Окна поверх: настройки, ветка, выбор эмодзи */
 :root[data-skin='adequate'] .panel,
 :root[data-skin='adequate'] .picker {
   border-radius: var(--radius);
   border-color: var(--line);
-  box-shadow: 0 40px 80px -50px rgba(0, 0, 0, 0.95);
+  box-shadow: 0 40px 80px -50px #000;
   overflow: hidden;
 }
-
 :root[data-skin='adequate'] .act {
   border-radius: var(--radius-sm);
   border-color: var(--line);
   padding: 2px 12px;
 }
 :root[data-skin='adequate'] .act:hover:not(:disabled) {
-  border-color: var(--ember);
+  border-color: var(--fg-dim);
   color: var(--fg-hi);
-  background: rgba(232, 115, 74, 0.1);
-}
-:root[data-skin='adequate'] .act.primary {
-  background: var(--ember);
-  border-color: var(--ember);
-  color: var(--inv-fg);
+  background: var(--lift);
 }
 
+/* Звонок: кнопки выглядят кнопками, плитки со скруглением */
+:root[data-skin='adequate'] .call header button {
+  padding: 4px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+:root[data-skin='adequate'] .call header button:hover {
+  border-color: var(--fg-dim);
+  background: var(--lift);
+}
 :root[data-skin='adequate'] .tile {
   border-radius: var(--radius-sm);
   overflow: hidden;
 }
 
-/* Строка состояния внизу. В терминале она инверсная — это его приём, и в
-   тёплой палитре сплошная угольная полоса во всю ширину орёт. Здесь она
-   становится спокойной поверхностью, а акцент достаётся тексту. */
-:root[data-skin='adequate'] .status {
-  background: var(--bg-raised);
-  color: var(--fg-dim);
-  font-weight: 500;
-  border-top: 1px solid var(--line);
-}
-:root[data-skin='adequate'] .status .mode {
-  background: rgba(232, 115, 74, 0.16);
-  color: var(--ember);
-}
-:root[data-skin='adequate'] .status b,
-:root[data-skin='adequate'] .status strong {
-  color: var(--fg-hi);
-}
-
 :root[data-skin='adequate'] *:focus-visible {
-  outline: 2px solid rgba(232, 115, 74, 0.75);
+  outline: 2px solid var(--edge);
   outline-offset: 1px;
 }

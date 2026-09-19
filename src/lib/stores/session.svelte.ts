@@ -156,7 +156,12 @@ export class Session {
     );
   }
 
-  /** Кто сидит в конкретном голосовом канале. */
+  /** Ключи тех, кто сидит в голосовом канале. Имя по ключу найдёт тот, кому оно нужно. */
+  voiceIds(channel: Id): Id[] {
+    return this.voice.filter(([, room]) => room === channel).map(([who]) => who);
+  }
+
+  /** Кто сидит в конкретном голосовом канале — именами, для терминала. */
   voiceMembers(channel: Id): string[] {
     return this.voice
       .filter(([, room]) => room === channel)
@@ -494,6 +499,66 @@ export class Session {
 
   // ── команды ───────────────────────────────────────────────────────────────
 
+  // ── действия ──────────────────────────────────────────────────────────────
+  //
+  // Одни и те же для кнопок и для команд: интерфейс в адекватном режиме зовёт
+  // их напрямую, `#runCommand` — тоже. Двух путей к одному действию быть не
+  // должно, иначе они разойдутся на первой же правке.
+
+  async createSpace(name: string): Promise<void> {
+    const title = name.trim();
+    if (!title) throw new Error('нужно название пространства');
+    await this.#refreshSpaces(await api.createSpace(title));
+    this.#note(`пространство «${title}» создано`);
+  }
+
+  async createChannel(name: string, category: string, voice: boolean): Promise<void> {
+    if (!this.spaceId) throw new Error('сначала выберите пространство');
+    const title = name.trim();
+    if (!title) throw new Error('нужно название канала');
+    await api.createChannel(this.spaceId, title, category.trim() || (voice ? 'голос' : 'общее'), voice);
+    await this.#loadChannels();
+    this.#note(voice ? `голосовой канал «${title}» создан` : `канал #${title} создан`);
+  }
+
+  /** Вход по любой ссылке: приглашение в пространство или чужая визитка. */
+  async joinByLink(link: string): Promise<void> {
+    const ticket = link.trim();
+    if (!ticket) throw new Error('нужна ссылка вида bred://…');
+    const space = ticket.includes('bred://hello/')
+      ? await api.openDirectLink(ticket)
+      : await api.joinSpace(ticket);
+    await this.#refreshSpaces(space);
+    this.#note('подключено');
+  }
+
+  async rename(name: string): Promise<void> {
+    const next = name.trim();
+    if (!next) throw new Error('имя не может быть пустым');
+    const was = this.nick;
+    await api.setNick(next);
+    this.nick = next;
+    await this.#loadMembers();
+    this.#note(`имя изменено: ${was} → ${next}`);
+  }
+
+  async leaveSpace(): Promise<void> {
+    if (!this.spaceId) throw new Error('пространство не выбрано');
+    const name = this.space?.name ?? '';
+    await api.leaveSpace(this.spaceId);
+    this.spaces = await api.listSpaces();
+    this.spaceId = null;
+    this.channelId = null;
+    this.messages = [];
+    this.channels = [];
+    this.members = [];
+    forgetPreviews();
+    forgetPrefetched();
+    await api.collectGarbage().catch(() => undefined);
+    if (this.spaces.length > 0) await this.selectSpace(this.spaces[0].id);
+    this.#note(`вы вышли из «${name}», история стёрта`);
+  }
+
   async #runCommand(line: string): Promise<void> {
     const [command, ...rest] = line.slice(1).split(' ');
     const argument = rest.join(' ').trim();
@@ -502,26 +567,19 @@ export class Session {
         case 'простор':
         case 'space': {
           if (!argument) throw new Error('нужно название: /простор Орбита');
-          await this.#refreshSpaces(await api.createSpace(argument));
-          this.#note(`пространство «${argument}» создано`);
+          await this.createSpace(argument);
           break;
         }
         case 'канал':
         case 'channel': {
-          if (!this.spaceId) throw new Error('сначала выберите пространство');
           if (!argument) throw new Error('нужно название: /канал баги');
-          await api.createChannel(this.spaceId, argument, 'общее', false);
-          await this.#loadChannels();
-          this.#note(`канал #${argument} создан`);
+          await this.createChannel(argument, 'общее', false);
           break;
         }
         case 'голос':
         case 'voice': {
-          if (!this.spaceId) throw new Error('сначала выберите пространство');
           if (!argument) throw new Error('нужно название: /голос стендап');
-          await api.createChannel(this.spaceId, argument, 'голос', true);
-          await this.#loadChannels();
-          this.#note(`голосовой канал «${argument}» создан`);
+          await this.createChannel(argument, 'голос', true);
           break;
         }
         case 'звонок':
@@ -537,21 +595,13 @@ export class Session {
           if (!argument) throw new Error('нужна ссылка: /войти bred://…');
           // Одна команда на обе ссылки: человеку незачем помнить, какая из них
           // на пространство, а какая на личную переписку.
-          const space = argument.includes('bred://hello/')
-            ? await api.openDirectLink(argument)
-            : await api.joinSpace(argument);
-          await this.#refreshSpaces(space);
-          this.#note('подключено');
+          await this.joinByLink(argument);
           break;
         }
         case 'имя':
         case 'nick': {
           if (!argument) throw new Error('нужно имя: /имя тимур');
-          const was = this.nick;
-          await api.setNick(argument);
-          this.nick = argument;
-          await this.#loadMembers();
-          this.#note(`имя изменено: ${was} → ${argument}`);
+          await this.rename(argument);
           break;
         }
         case 'позвать':
@@ -573,23 +623,9 @@ export class Session {
           break;
         }
         case 'покинуть':
-        case 'leave': {
-          if (!this.spaceId) throw new Error('пространство не выбрано');
-          const name = this.space?.name ?? '';
-          await api.leaveSpace(this.spaceId);
-          this.spaces = await api.listSpaces();
-          this.spaceId = null;
-          this.channelId = null;
-          this.messages = [];
-          this.channels = [];
-          this.members = [];
-          forgetPreviews();
-          forgetPrefetched();
-          await api.collectGarbage().catch(() => undefined);
-          if (this.spaces.length > 0) await this.selectSpace(this.spaces[0].id);
-          this.#note(`вы вышли из «${name}», история стёрта`);
+        case 'leave':
+          await this.leaveSpace();
           break;
-        }
         case 'экран':
         case 'screen':
           await call.toggleScreen();

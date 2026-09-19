@@ -7,6 +7,7 @@
   import EmojiPicker from './lib/components/EmojiPicker.svelte';
   import Settings from './lib/components/Settings.svelte';
   import ThreadPanel from './lib/components/ThreadPanel.svelte';
+  import Shell from './lib/adequate/Shell.svelte';
   import { call } from './lib/stores/call.svelte';
   import { prefs } from './lib/stores/prefs.svelte';
   import { session } from './lib/stores/session.svelte';
@@ -107,6 +108,9 @@
     // выходит из звонка, а `Ctrl+I` кладёт в буфер приглашение.
     if (arcadeOpen) return;
     const mod = event.ctrlKey || event.metaKey;
+    // В адекватном режиме строки ввода в терминальном смысле нет: фокус в поле
+    // ставится мышью или Tab, как в любом другом приложении.
+    if (prefs.adequate && mod && event.key.toLowerCase() === 'k') return;
     if (mod && event.key.toLowerCase() === 'k') {
       event.preventDefault();
       input?.focus();
@@ -162,6 +166,12 @@
   <Arcade onclose={closeArcade} />
 {/if}
 
+{#if prefs.adequate}
+  <!-- Адекватный режим — другой каркас, а не перекраска: у каждого действия
+       появляется своё место, и командная строка перестаёт быть единственным
+       входом. Сама она остаётся: строка со слэшем уходит тем же путём. -->
+  <Shell onsettings={() => (settingsOpen = true)} />
+{:else}
 <div class="term">
   <header class="wins">
     <span class="brand">БРЕД</span>
@@ -267,6 +277,7 @@
     {/if}
   </footer>
 </div>
+{/if}
 
 <style>
   .term {

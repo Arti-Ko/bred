@@ -193,7 +193,11 @@ void import('./main').then(async () => {
   }
 
   if (mode === 'адекватный') {
-    // Только вид: трофеи настоящего человека снимок не подделывает.
+    // Включаем сам режим, а не только оформление: снимок должен показывать тот
+    // каркас, который человек увидит, выиграв в зале.
+    const { prefs } = await import('./lib/stores/prefs.svelte');
+    prefs.trophies = ['шашки'];
+    prefs.adequate = true;
     document.documentElement.dataset.skin = 'adequate';
     return;
   }

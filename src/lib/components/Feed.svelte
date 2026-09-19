@@ -1,14 +1,31 @@
 <script lang="ts">
+  import Avatar from '../adequate/Avatar.svelte';
   import Message from './Message.svelte';
   import { session } from '../stores/session.svelte';
   import { dayStamp } from '../format';
+
+  interface Props {
+    /** Своя шапка. В адекватном режиме её рисует каркас — с аватарами и счётчиком. */
+    head?: boolean;
+    /** Строка поиска по открытому каналу. Пусто — показываем всё. */
+    filter?: string;
+    /** Аватар автора рядом с сообщением: людей проще узнавать в лицо. */
+    avatars?: boolean;
+  }
+  const { head = true, filter = '', avatars = false }: Props = $props();
 
   let viewport: HTMLElement | undefined = $state();
   let selectedId = $state<string | null>(null);
   /** Прокручиваем вниз только если пользователь и так был внизу. */
   let pinned = $state(true);
 
-  const messages = $derived(session.messages);
+  const messages = $derived(
+    filter.trim()
+      ? session.messages.filter((message) =>
+          message.body.toLowerCase().includes(filter.trim().toLowerCase()),
+        )
+      : session.messages,
+  );
 
   function onScroll() {
     if (!viewport) return;
@@ -57,16 +74,18 @@
 </script>
 
 <main class="pane">
-  <div class="pane-head">
-    <span>
-      {#if session.channel}
-        #{session.channel.name}
-      {:else}
-        канал не выбран
-      {/if}
-    </span>
-    <b>{session.members.filter((m) => m.online).length} online</b>
-  </div>
+  {#if head}
+    <div class="pane-head">
+      <span>
+        {#if session.channel}
+          #{session.channel.name}
+        {:else}
+          канал не выбран
+        {/if}
+      </span>
+      <b>{session.members.filter((m) => m.online).length} online</b>
+    </div>
+  {/if}
 
   <div class="log" bind:this={viewport} onscroll={onScroll} role="listbox" tabindex="-1" aria-label="Лента сообщений">
     {#if session.hasOlder}
@@ -91,12 +110,17 @@
         <div class="day">{stamp}</div>
       {/if}
       <div
+        class="line"
+        class:with-face={avatars}
         role="option"
         aria-selected={selectedId === message.id}
         tabindex="0"
         onclick={() => toggle(message.id)}
         onkeydown={(event) => event.key === 'Enter' && toggle(message.id)}
       >
+        {#if avatars}
+          <Avatar id={message.author} nick={message.nick} />
+        {/if}
         <Message
           {message}
           mine={message.author === session.me}
@@ -126,6 +150,29 @@
 </main>
 
 <style>
+  /* Строка с аватаром: подсветка при наведении переезжает на неё целиком,
+     иначе картинка висела бы рядом с подсвеченным сообщением. */
+  .line.with-face {
+    display: grid;
+    grid-template-columns: 32px minmax(0, 1fr);
+    gap: 10px;
+    align-items: start;
+    margin: 1px 8px;
+    padding: 6px 8px;
+    border-radius: 8px;
+  }
+  .line.with-face:hover {
+    background: rgba(255, 255, 255, 0.05);
+  }
+  .line.with-face :global(.msg) {
+    margin: 0;
+    padding: 0;
+    background: none;
+  }
+  .line.with-face :global(.msg:hover) {
+    background: none;
+  }
+
   .log {
     flex: 1;
     overflow-y: auto;
