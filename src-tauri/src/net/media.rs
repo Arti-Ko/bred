@@ -51,14 +51,14 @@ use crate::domain::{ChannelId, Id, SpaceId};
 pub const MEDIA_ALPN: &[u8] = b"bred/media/3";
 
 /// Как часто сверяем состав комнаты с присутствием.
-const RECONCILE: Duration = Duration::from_secs(2);
+const RECONCILE: Duration = Duration::from_secs(1);
 /// Через сколько дозванивается и вторая сторона.
 ///
 /// Обычно соединение поднимает тот, чей идентификатор меньше — иначе получили бы
 /// две встречные. Но если у него дозвон не проходит (бывает при недружелюбном
 /// NAT ровно с одной стороны), ждать его вечно нельзя: связи не будет вообще.
 /// Поэтому через несколько секунд право набирать получает и вторая сторона.
-const DIAL_FALLBACK: Duration = Duration::from_secs(5);
+const DIAL_FALLBACK: Duration = Duration::from_secs(3);
 /// Сколько кадров держим в сборке, прежде чем признать их потерянными.
 const REASSEMBLY_WINDOW: usize = 24;
 /// Запас на служебные поля и шифрование внутри датаграммы.
@@ -510,7 +510,7 @@ impl Media {
         self.call.read().map(|c| (c.space, c.channel))
     }
 
-    pub fn join(&self, space: SpaceId, channel: ChannelId) {
+    pub fn join(self: &Arc<Self>, space: SpaceId, channel: ChannelId) {
         // Смена комнаты — это новая сетка. Старые соединения рвём: иначе к нам
         // продолжали бы идти кадры из покинутого канала, а по ним же считался бы
         // битрейт.
@@ -529,6 +529,10 @@ impl Media {
         });
 
         tracing::info!(channel = %channel.short(), "вошли в звонок");
+
+        // Не ждём очередного тика сверки: тот, кто уже сидит в канале, известен
+        // из присутствия прямо сейчас, и набрать его можно тоже прямо сейчас.
+        self.reconcile();
     }
 
     pub fn leave(&self) {
@@ -765,59 +769,64 @@ impl Media {
         }
     }
 
-    /// Раз в пару секунд сверяем, кто в комнате, и держим сетку соединений.
+    /// Раз в секунду сверяем, кто в комнате, и держим сетку соединений.
     fn reconcile_loop(self: Arc<Self>) {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(RECONCILE);
             loop {
                 ticker.tick().await;
-                let Some(_) = *self.call.read() else {
-                    continue;
-                };
-                let me = self.ctx.identity.id();
-
-                for participant in self.participants() {
-                    if participant == me {
-                        continue;
-                    }
-                    let Ok(peer) = iroh::PublicKey::from_bytes(&participant.0) else {
-                        continue;
-                    };
-                    if self.peers.read().contains_key(&peer) {
-                        self.dialing.lock().remove(&participant);
-                        continue;
-                    }
-
-                    // Обычно набирает тот, чей идентификатор меньше: иначе
-                    // получили бы две встречные связи. Но если у него не
-                    // выходит — а при одностороннем недружелюбном NAT так и
-                    // бывает, — через несколько секунд пробуем и мы. Встречный
-                    // дозвон разрулит `pump`: лишнее соединение он закроет.
-                    let waiting = {
-                        let mut dialing = self.dialing.lock();
-                        let since = dialing.entry(participant).or_insert_with(Instant::now);
-                        since.elapsed()
-                    };
-                    if me.0 > participant.0 && waiting < DIAL_FALLBACK {
-                        continue;
-                    }
-
-                    let media = self.clone();
-                    tokio::spawn(async move {
-                        match media
-                            .endpoint
-                            .connect(EndpointAddr::from(peer), MEDIA_ALPN)
-                            .await
-                        {
-                            Ok(connection) => media.pump(connection).await,
-                            Err(err) => {
-                                tracing::debug!(peer = %peer.fmt_short(), %err, "звонок не дозвонился")
-                            }
-                        }
-                    });
-                }
+                self.reconcile();
             }
         });
+    }
+
+    /// Один проход сверки: дозвониться до всех, кого в сетке ещё нет.
+    fn reconcile(self: &Arc<Self>) {
+        if self.call.read().is_none() {
+            return;
+        }
+        let me = self.ctx.identity.id();
+
+        for participant in self.participants() {
+            if participant == me {
+                continue;
+            }
+            let Ok(peer) = iroh::PublicKey::from_bytes(&participant.0) else {
+                continue;
+            };
+            if self.peers.read().contains_key(&peer) {
+                self.dialing.lock().remove(&participant);
+                continue;
+            }
+
+            // Обычно набирает тот, чей идентификатор меньше: иначе получили бы
+            // две встречные связи. Но если у него не выходит — а при
+            // одностороннем недружелюбном NAT так и бывает, — через несколько
+            // секунд пробуем и мы. Встречный дозвон разрулит `pump`: лишнее
+            // соединение он закроет.
+            let waiting = {
+                let mut dialing = self.dialing.lock();
+                let since = dialing.entry(participant).or_insert_with(Instant::now);
+                since.elapsed()
+            };
+            if me.0 > participant.0 && waiting < DIAL_FALLBACK {
+                continue;
+            }
+
+            let media = self.clone();
+            tokio::spawn(async move {
+                match media
+                    .endpoint
+                    .connect(EndpointAddr::from(peer), MEDIA_ALPN)
+                    .await
+                {
+                    Ok(connection) => media.pump(connection).await,
+                    Err(err) => {
+                        tracing::debug!(peer = %peer.fmt_short(), %err, "звонок не дозвонился")
+                    }
+                }
+            });
+        }
     }
 
     /// Подбор битрейта картинки под то, что реально утекает в провод.

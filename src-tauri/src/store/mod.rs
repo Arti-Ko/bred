@@ -447,15 +447,39 @@ impl Store {
         schema::read_message(&conn, id, *self.me.lock())
     }
 
-    /// Запомнить, как в последний раз выглядел адрес соседа.
+    /// Запомнить, что сосед был на связи: имя, адрес и время.
     ///
-    /// Пригодится при следующем запуске: справочник в памяти к тому моменту
-    /// пуст, а публичный поиск по идентификатору доступен не в каждой сети.
-    pub fn remember_peer_addr(&self, peer: Id, space: SpaceId, addr: &[u8]) -> Result<()> {
+    /// Адрес пригодится при следующем запуске: справочник в памяти к тому
+    /// моменту пуст, а публичный поиск по идентификатору доступен не в каждой
+    /// сети.
+    ///
+    /// Заводит строку, а не только обновляет её. Строка участника появлялась
+    /// раньше единственным путём — применением его события, — а человек,
+    /// пришедший по ссылке, мог ещё ничего не написать. Обновлять было нечего:
+    /// в списке участников его не было, адрес записывать было некуда, и после
+    /// перезапуска звать его было некому. Выглядело это так, что сидишь в
+    /// пространстве один, хотя приложение у собеседника открыто.
+    pub fn remember_peer_seen(
+        &self,
+        space: SpaceId,
+        peer: Id,
+        nick: &str,
+        addr: Option<&[u8]>,
+    ) -> Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "UPDATE peers SET addr = ?3 WHERE id = ?1 AND space = ?2",
-            params![&peer.0[..], &space.0[..], addr],
+            "INSERT INTO peers(id, space, nick, addr, last_seen) VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id, space) DO UPDATE SET
+                 nick      = COALESCE(excluded.nick, peers.nick),
+                 addr      = COALESCE(excluded.addr, peers.addr),
+                 last_seen = MAX(peers.last_seen, excluded.last_seen)",
+            params![
+                &peer.0[..],
+                &space.0[..],
+                (!nick.is_empty()).then_some(nick),
+                addr,
+                crate::domain::now_ms()
+            ],
         )?;
         Ok(())
     }
@@ -883,4 +907,59 @@ fn id_from_row(raw: Vec<u8>) -> Id {
 
 fn key_from_row(raw: Vec<u8>) -> [u8; 32] {
     raw.try_into().unwrap_or([0u8; 32])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SPACE: SpaceId = Id([5u8; 32]);
+    const PEER: Id = Id([7u8; 32]);
+
+    #[test]
+    fn peer_seen_only_in_presence_becomes_a_member() {
+        let store = Store::in_memory().unwrap();
+        // Человек пришёл по ссылке и не написал ни слова: в логе его нет, и
+        // единственное, что о нём известно, — удар сердца.
+        store
+            .remember_peer_seen(SPACE, PEER, "Кирилл", Some(&[1, 2, 3]))
+            .unwrap();
+
+        let members = store.members(SPACE).unwrap();
+        assert_eq!(members.len(), 1, "он обязан быть в списке участников");
+        assert_eq!(members[0].nick, "Кирилл");
+
+        let known = store.known_peers(SPACE).unwrap();
+        assert_eq!(
+            known,
+            vec![(PEER, Some(vec![1, 2, 3]))],
+            "и его адрес обязан пережить перезапуск: звать его больше неоткуда"
+        );
+    }
+
+    #[test]
+    fn empty_nick_does_not_erase_a_known_one() {
+        let store = Store::in_memory().unwrap();
+        store
+            .remember_peer_seen(SPACE, PEER, "Кирилл", Some(&[1, 2, 3]))
+            .unwrap();
+        // Ссылка-приглашение имени не несёт — затирать им живое нельзя.
+        store.remember_peer_seen(SPACE, PEER, "", None).unwrap();
+
+        let members = store.members(SPACE).unwrap();
+        assert_eq!(members[0].nick, "Кирилл");
+        assert_eq!(
+            store.known_peers(SPACE).unwrap()[0].1,
+            Some(vec![1, 2, 3]),
+            "пустой адрес тоже не должен стирать известный"
+        );
+    }
+
+    #[test]
+    fn newer_address_replaces_the_old_one() {
+        let store = Store::in_memory().unwrap();
+        store.remember_peer_seen(SPACE, PEER, "", Some(&[1])).unwrap();
+        store.remember_peer_seen(SPACE, PEER, "", Some(&[2])).unwrap();
+        assert_eq!(store.known_peers(SPACE).unwrap()[0].1, Some(vec![2]));
+    }
 }

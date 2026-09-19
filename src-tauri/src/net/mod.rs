@@ -66,7 +66,10 @@ const STARTUP_WAIT: Duration = Duration::from_secs(20);
 /// через полсекунды, а редкими они становятся, только если стучаться и правда
 /// некуда.
 const REJOIN_MIN: Duration = Duration::from_millis(500);
-const REJOIN_MAX: Duration = Duration::from_secs(20);
+/// Двадцать секунд здесь стоили ровно того же, чего стоили при запуске: столько
+/// оставшийся один узел молчал, пока собеседник открывал приложение. Шесть —
+/// это верхняя граница ожидания, а не средняя: обе стороны зовут навстречу.
+const REJOIN_MAX: Duration = Duration::from_secs(6);
 
 /// Как часто сверяем историю с соседями.
 ///
@@ -78,7 +81,18 @@ const REJOIN_MAX: Duration = Duration::from_secs(20);
 const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Как часто напоминаем о себе соседям по пространству.
-const PRESENCE_INTERVAL: Duration = Duration::from_secs(10);
+///
+/// Раньше было десять секунд, и столько же человек смотрел на список, где
+/// собеседника ещё нет, хотя приложение у того уже открыто. Удар сердца — это
+/// десяток-другой байт под своим именем и адресом: три секунды стоят дёшево, а
+/// разница между «появился сразу» и «появился когда-нибудь» — вся.
+const PRESENCE_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Как часто выбрасываем тех, кто пропал без прощания.
+///
+/// Вдвое чаще, чем срок годности присутствия: иначе ушедший висит «в сети» ещё
+/// целый период после того, как протух.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 
 pub struct Net {
     endpoint: Endpoint,
@@ -134,6 +148,12 @@ impl Net {
             .accept(media::MEDIA_ALPN, media::MediaProtocol::new(media.clone()))
             .spawn();
 
+        // Свой адрес знаем сразу: маячок локальной сети пропускает такт, пока
+        // адрес пуст, и первое «я здесь» уходило бы уже после паузы.
+        let addr_bytes = Arc::new(RwLock::new(
+            postcard::to_stdvec(&endpoint.addr()).unwrap_or_default(),
+        ));
+
         let net = Arc::new(Self {
             endpoint,
             gossip,
@@ -142,7 +162,7 @@ impl Net {
             media,
             senders: RwLock::new(HashMap::new()),
             neighbors: RwLock::new(HashMap::new()),
-            addr_bytes: Arc::new(RwLock::new(Vec::new())),
+            addr_bytes,
             sync_pool: parking_lot::Mutex::new(HashMap::new()),
             syncing: parking_lot::Mutex::new(std::collections::HashSet::new()),
             _router: router,
@@ -330,6 +350,15 @@ impl Net {
             // Кладём адрес в справочник, иначе gossip не сможет дозвониться:
             // идентификатор он знает, а как до него добраться — нет.
             self.lookup.add_endpoint_info(addr.clone());
+            // И сразу на диск. Ссылка-приглашение срабатывает ровно один раз,
+            // и пока пригласивший не напишет ни слова, в базе его нет: после
+            // перезапуска новичок оставался в пространстве один навсегда.
+            let _ = self.ctx.store.remember_peer_seen(
+                space.id,
+                crate::domain::Id(*addr.id.as_bytes()),
+                "",
+                Some(raw),
+            );
             entry_points.push(addr.id);
         }
         entry_points.sort();
@@ -358,6 +387,15 @@ impl Net {
                             .or_default()
                             .insert(peer);
                         me.clone().catch_up(space_id, peer);
+                        // Рой не пересказывает новичку то, что разлетелось до
+                        // его прихода, а присутствие живёт только в таких
+                        // рассылках. Без немедленного ответа сосед узнавал бы о
+                        // нас только со следующего удара сердца — и ровно
+                        // столько же не видел бы, что мы сидим в его звонке.
+                        let greeting = me.clone();
+                        tokio::spawn(async move {
+                            let _ = greeting.announce_presence(space_id).await;
+                        });
                         let _ = me.ctx.notices.send(Notice::Net);
                     }
                     Ok(GossipEvent::NeighborDown(peer)) => {
@@ -491,16 +529,12 @@ impl Net {
                     if let Ok(addr) = postcard::from_bytes::<EndpointAddr>(&presence.addr) {
                         if addr.id != self.endpoint.id() {
                             self.lookup.add_endpoint_info(addr);
-                            // И на диск: при следующем запуске справочник в
-                            // памяти будет пуст, а набирать кого-то надо.
-                            let _ = self.ctx.store.remember_peer_addr(
-                                presence.author,
-                                space,
-                                &presence.addr,
-                            );
                         }
                     }
                 }
+                // Запись на диск — внутри `note_presence`: там видно, изменилось
+                // ли что-нибудь с прошлого удара сердца, и большинство их до
+                // базы не доходит вовсе.
                 self.ctx.note_presence(space, presence);
             }
             Broadcast::Typing { channel, author } => {
@@ -697,7 +731,7 @@ impl Net {
     /// Периодически выбрасываем присутствие тех, кто пропал без прощания.
     fn sweep_presence(self: Arc<Self>) {
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(10));
+            let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
             loop {
                 ticker.tick().await;
                 for space in self.ctx.sweep_presence() {
@@ -765,9 +799,11 @@ impl Net {
     /// Позвать соседей туда, где мы остались одни.
     /// Возвращает `true`, если хоть в одном пространстве мы одни.
     async fn rejoin_lonely_spaces(self: &Arc<Self>) -> bool {
-        if !self.reachable() {
-            return false; // звать некого, пока нас самих не видно
-        }
+        // Раньше здесь стояло «не видно нас самих — не зовём никого». Но
+        // «видно» означает ретранслятор или внешний адрес, а в локальной сети
+        // без интернета не будет ни того, ни другого никогда. Получалось, что
+        // именно там, где сосед сидит за соседним столом и его адрес у нас уже
+        // записан, повторный зов не случался ни разу.
         let mut lonely = false;
         for space in self.ctx.space_list() {
             let alone = self

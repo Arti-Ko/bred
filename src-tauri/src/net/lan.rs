@@ -19,7 +19,12 @@ use crate::domain::SpaceId;
 
 const GROUP: Ipv4Addr = Ipv4Addr::new(239, 42, 42, 42);
 const PORT: u16 = 47421;
-const INTERVAL: Duration = Duration::from_secs(5);
+/// Как часто кричим о себе в локальную сеть.
+///
+/// Это единственный способ найтись там, где интернета нет вовсе, и первый
+/// способ там, где он есть: пакет уходит соседям напрямую, без ретранслятора и
+/// без публичного справочника.
+const INTERVAL: Duration = Duration::from_secs(2);
 /// Мультикаст-датаграмма должна помещаться в один пакет без фрагментации.
 const MAX_BEACON: usize = 1400;
 

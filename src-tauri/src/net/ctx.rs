@@ -25,9 +25,35 @@ use super::wire::{PlayerState, Presence};
 /// которые ничего не делают.
 const PLAYER_TTL_MS: i64 = 6_000;
 
-/// Сколько присутствие считается свежим. Удар сердца идёт раз в 10 секунд,
-/// так что три пропуска подряд — надёжный признак, что узла больше нет.
-const PRESENCE_TTL_MS: i64 = 35_000;
+/// Присутствие соседа вместе с моментом, когда мы его услышали.
+///
+/// Момент нужен свой: срок годности отсчитывается по нашим часам, потому что
+/// чужие с нашими не сверены и сверить их нечем.
+#[derive(Debug, Clone)]
+pub struct Seen {
+    pub presence: Presence,
+    /// Когда мы приняли этот удар сердца, по нашим часам.
+    pub at: i64,
+    /// Когда в последний раз записали этого соседа в базу.
+    pub persisted: i64,
+}
+
+/// Сколько присутствие считается свежим. Удар сердца идёт раз в три секунды,
+/// так что четыре пропуска подряд — надёжный признак, что узла больше нет.
+///
+/// Считается по **нашим** часам, а не по отметке отправителя. Отметка ехала из
+/// чужой системы, где время может отличаться на минуты: с коротким сроком
+/// годности сосед с отстающими часами не появился бы в сети никогда, а с
+/// забегающими — не исчез бы вовсе.
+const PRESENCE_TTL_MS: i64 = 12_000;
+
+/// Как часто удар сердца доходит до диска.
+///
+/// Сам он приходит раз в три секунды, но писать его в базу каждый раз незачем:
+/// на диске от этого меняется только «был в сети», и полминуты точности там
+/// более чем достаточно. Всё, что меняется по существу — имя или адрес, —
+/// записывается сразу, не дожидаясь срока.
+const PERSIST_INTERVAL_MS: i64 = 30_000;
 
 /// Уведомление наверх — в UI.
 #[derive(Debug, Clone)]
@@ -79,7 +105,7 @@ pub struct Ctx {
     /// Логические часы Лампорта — общие на все пространства.
     pub clock: Mutex<Clock>,
     /// Присутствие живёт только в памяти и умирает вместе с процессом.
-    pub presence: RwLock<HashMap<SpaceId, HashMap<Id, Presence>>>,
+    pub presence: RwLock<HashMap<SpaceId, HashMap<Id, Seen>>>,
     /// Общий плеер — по одному на пространство: комнат много, но ведущий,
     /// который транслирует звук, обычно один, и путать их незачем.
     pub players: RwLock<HashMap<SpaceId, PlayerState>>,
@@ -199,23 +225,83 @@ impl Ctx {
 
     pub fn note_presence(&self, space: SpaceId, presence: Presence) {
         let author = presence.author;
-        {
+        let now = crate::domain::now_ms();
+
+        let (changed, persist) = {
             let mut all = self.presence.write();
             let per_space = all.entry(space).or_default();
-            let previous = per_space.insert(author, presence);
-            // Перерисовку дёргаем, только если состав или голосовой канал
-            // изменились: удары сердца идут каждые десять секунд и сами по себе
-            // ничего нового не сообщают.
-            let same = previous
-                .map(|old| {
-                    old.voice == per_space[&author].voice && old.nick == per_space[&author].nick
-                })
-                .unwrap_or(false);
-            if same {
-                return;
+            let previous = per_space.get(&author);
+
+            // Протухшую запись считаем за отсутствие: человек уже пропал из
+            // списка, и его возвращение — новость, даже если имя и голосовой
+            // канал у него те же. Перерисовку в остальных случаях не дёргаем:
+            // удары сердца идут часто и сами по себе ничего не сообщают.
+            let changed = previous.is_none_or(|old| {
+                old.at < now - PRESENCE_TTL_MS
+                    || old.presence.voice != presence.voice
+                    || old.presence.nick != presence.nick
+            });
+            let persist = previous.is_none_or(|old| {
+                old.presence.addr != presence.addr
+                    || old.presence.nick != presence.nick
+                    || now - old.persisted >= PERSIST_INTERVAL_MS
+            });
+            let persisted = if persist {
+                now
+            } else {
+                previous.map_or(now, |old| old.persisted)
+            };
+
+            let nick = presence.nick.clone();
+            let addr = presence.addr.clone();
+            per_space.insert(
+                author,
+                Seen {
+                    presence,
+                    at: now,
+                    persisted,
+                },
+            );
+            (changed, persist.then_some((nick, addr)))
+        };
+
+        // На диск — вне блокировки: держать её через запись в базу незачем.
+        //
+        // Человек, приехавший по ссылке, мог ещё ничего не написать: в логе его
+        // нет, а значит нет и в списке участников. Присутствие — первый, а до
+        // первого сообщения единственный признак, что он вообще существует.
+        if let Some((nick, addr)) = persist {
+            if author != self.identity.id() {
+                let _ = self.store.remember_peer_seen(
+                    space,
+                    author,
+                    &nick,
+                    (!addr.is_empty()).then_some(addr.as_slice()),
+                );
             }
         }
-        let _ = self.notices.send(Notice::Presence { space });
+
+        if changed {
+            let _ = self.notices.send(Notice::Presence { space });
+        }
+    }
+
+    /// То же, но с заданным моментом приёма. Только для тестов: настоящий
+    /// момент всегда «сейчас», и подделать его иначе нечем.
+    #[cfg(test)]
+    pub fn note_presence_at(&self, space: SpaceId, presence: Presence, at: i64) {
+        self.presence
+            .write()
+            .entry(space)
+            .or_default()
+            .insert(
+                presence.author,
+                Seen {
+                    presence,
+                    at,
+                    persisted: at,
+                },
+            );
     }
 
     pub fn drop_presence(&self, space: SpaceId, author: Id) {
@@ -237,8 +323,8 @@ impl Ctx {
             .read()
             .get(&space)
             .and_then(|m| m.get(&author))
-            .filter(|p| p.ts >= deadline)
-            .map(|p| p.nick.clone())
+            .filter(|seen| seen.at >= deadline)
+            .map(|seen| seen.presence.nick.clone())
             .filter(|n| !n.is_empty())
             .unwrap_or_else(|| author.short())
     }
@@ -302,7 +388,12 @@ impl Ctx {
         self.presence
             .read()
             .get(&space)
-            .map(|m| m.values().filter(|p| p.ts >= deadline).cloned().collect())
+            .map(|m| {
+                m.values()
+                    .filter(|seen| seen.at >= deadline)
+                    .map(|seen| seen.presence.clone())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -314,7 +405,7 @@ impl Ctx {
         let mut all = self.presence.write();
         for (space, people) in all.iter_mut() {
             let before = people.len();
-            people.retain(|_, p| p.ts >= deadline);
+            people.retain(|_, seen| seen.at >= deadline);
             if people.len() != before {
                 changed.push(*space);
             }
@@ -372,7 +463,7 @@ mod tests {
         let ctx = ctx();
         let space = Id([3u8; 32]);
         // Узел исчез без прощания: последний удар сердца был минуту назад.
-        ctx.note_presence(space, presence(1, now_ms() - 60_000));
+        ctx.note_presence_at(space, presence(1, now_ms()), now_ms() - 60_000);
         assert!(
             ctx.presence_of(space).is_empty(),
             "пропавший узел не должен вечно висеть в сети и в звонке"
@@ -417,10 +508,50 @@ mod tests {
     }
 
     #[test]
+    fn clock_skew_does_not_hide_a_live_neighbour() {
+        let ctx = ctx();
+        let space = Id([3u8; 32]);
+        // Часы собеседника отстали на час — сам он при этом на связи.
+        ctx.note_presence(space, presence(1, now_ms() - 3_600_000));
+        assert_eq!(
+            ctx.presence_of(space).len(),
+            1,
+            "свежесть считается по нашим часам, чужие с нашими не сверены"
+        );
+    }
+
+    #[test]
+    fn return_after_expiry_is_reported() {
+        let ctx = ctx();
+        let space = Id([3u8; 32]);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctx = Ctx::new(
+            ctx.store.clone(),
+            Identity::load_or_create(&ctx.store).unwrap(),
+            vec![Space {
+                id: space,
+                name: "тест".into(),
+                key: [3u8; 32],
+                direct: None,
+            }],
+            Clock::default(),
+            tx,
+            std::env::temp_dir().join("bred-ctx-test"),
+        );
+
+        ctx.note_presence_at(space, presence(1, now_ms()), now_ms() - 60_000);
+        ctx.note_presence(space, presence(1, now_ms()));
+        assert!(
+            rx.try_recv().is_ok(),
+            "вернувшийся участник обязан перерисовать список, даже если имя и канал те же"
+        );
+    }
+
+    #[test]
     fn sweep_reports_only_spaces_it_changed() {
         let ctx = ctx();
         let space = Id([3u8; 32]);
-        ctx.note_presence(space, presence(1, now_ms() - 60_000));
+        ctx.note_presence_at(space, presence(1, now_ms()), now_ms() - 60_000);
         ctx.note_presence(space, presence(2, now_ms()));
 
         assert_eq!(ctx.sweep_presence(), vec![space], "протухшее было убрано");
