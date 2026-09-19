@@ -106,10 +106,48 @@ export class Fight {
     this.scene.add(rim);
   }
 
+  /** Шум на холсте вместо картинки: камню нужна фактура, а файла у нас нет. */
+  private static stoneTexture(): THREE.Texture {
+    const size = 512;
+    const canvas = document.createElement('canvas');
+    canvas.width = size;
+    canvas.height = size;
+    const ctx = canvas.getContext('2d')!;
+    ctx.fillStyle = '#1d1d1d';
+    ctx.fillRect(0, 0, size, size);
+    for (let i = 0; i < 9000; i++) {
+      const shade = 20 + Math.random() * 40;
+      ctx.fillStyle = `rgba(${shade},${shade},${shade},0.5)`;
+      ctx.fillRect(Math.random() * size, Math.random() * size, 2 + Math.random() * 3, 2);
+    }
+    // Плиты: швы дают масштаб, без них пол кажется бесконечной плоскостью.
+    ctx.strokeStyle = 'rgba(0,0,0,0.55)';
+    ctx.lineWidth = 3;
+    for (let i = 0; i <= 8; i++) {
+      const at = (i / 8) * size;
+      ctx.beginPath();
+      ctx.moveTo(at, 0);
+      ctx.lineTo(at, size);
+      ctx.moveTo(0, at);
+      ctx.lineTo(size, at);
+      ctx.stroke();
+    }
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.repeat.set(6, 6);
+    return texture;
+  }
+
   private buildArena(): void {
     const floor = new THREE.Mesh(
       new THREE.CircleGeometry(ARENA.r, 96),
-      new THREE.MeshStandardMaterial({ color: GREY.floor, roughness: 0.95, metalness: 0.05 }),
+      new THREE.MeshStandardMaterial({
+        color: GREY.floor,
+        map: Fight.stoneTexture(),
+        roughness: 0.95,
+        metalness: 0.05,
+      }),
     );
     floor.rotation.x = -Math.PI / 2;
     floor.receiveShadow = true;
@@ -214,6 +252,42 @@ export class Fight {
     shoulders.castShadow = true;
     this.boss.add(shoulders);
 
+    // Наплечники и гребень: по ним фигура читается как рыцарь, а не как бочка.
+    for (const side of [-1, 1]) {
+      const pauldron = new THREE.Mesh(new THREE.SphereGeometry(11, 14, 10), armour);
+      pauldron.scale.set(1, 0.7, 1);
+      pauldron.position.set(side * 20, 48, 0);
+      pauldron.castShadow = true;
+      this.boss.add(pauldron);
+    }
+
+    const crest = new THREE.Mesh(
+      new THREE.ConeGeometry(3, 16, 4),
+      new THREE.MeshStandardMaterial({ color: 0x565656, roughness: 0.9 }),
+    );
+    crest.position.set(0, 70, -2);
+    crest.castShadow = true;
+    this.boss.add(crest);
+
+    const skirt = new THREE.Mesh(new THREE.CylinderGeometry(13, 19, 22, 14, 1, true), armour);
+    skirt.position.y = 12;
+    skirt.castShadow = true;
+    this.boss.add(skirt);
+
+    // Плащ: изогнутая плоскость за спиной. Он же выдаёт движение фигуры.
+    const cape = new THREE.Mesh(
+      new THREE.CylinderGeometry(17, 24, 46, 16, 1, true, Math.PI * 0.75, Math.PI * 0.75),
+      new THREE.MeshStandardMaterial({
+        color: 0x202020,
+        roughness: 1,
+        side: THREE.DoubleSide,
+      }),
+    );
+    cape.position.set(0, 32, 0);
+    cape.rotation.y = -Math.PI / 2;
+    cape.castShadow = true;
+    this.boss.add(cape);
+
     // Алебарда живёт в своей группе: её и вращает анимация замаха.
     const shaft = new THREE.Mesh(
       new THREE.CylinderGeometry(1.4, 1.4, 86, 8),
@@ -240,12 +314,20 @@ export class Fight {
 
   // ── кадр ──────────────────────────────────────────────────────────────────
 
-  render(world: World, dt: number): void {
+  render(world: World, dt: number, lockOn: boolean): void {
     this.placeFigures(world);
     this.animate(world, dt);
     this.drawTells(world);
-    this.moveCamera(world, dt);
+    this.moveCamera(world, dt, lockOn);
     this.renderer.render(this.scene, this.camera);
+  }
+
+  /**
+   * Куда смотрит камера, в координатах мира. От этого угла отсчитывается
+   * движение: «вперёд» — это вперёд по экрану, а не по оси арены.
+   */
+  forwardAngle(): number {
+    return Math.atan2(this.camLook.z - this.camera.position.z, this.camLook.x - this.camera.position.x);
   }
 
   private placeFigures(world: World): void {
@@ -348,12 +430,14 @@ export class Fight {
    * Камера за плечом с захватом цели: стоит позади игрока по линии на босса и
    * смотрит между ними. Это и есть взгляд, ради которого всё затевалось.
    */
-  private moveCamera(world: World, dt: number): void {
+  private moveCamera(world: World, dt: number, lockOn: boolean): void {
     const [px, pz] = toScene(world.player.at.x, world.player.at.y);
     const [bx, bz] = toScene(world.boss.at.x, world.boss.at.y);
 
-    const dx = bx - px;
-    const dz = bz - pz;
+    // С захватом цели камера стоит на линии «вы — босс». Без него она просто
+    // идёт за спиной: так убегают и так осматриваются.
+    const dx = lockOn ? bx - px : Math.cos(world.player.facing) * 140;
+    const dz = lockOn ? bz - pz : Math.sin(world.player.facing) * 140;
     const away = Math.hypot(dx, dz) || 1;
     // Камера за плечом: отходит назад по линии «босс — вы» и сдвигается вбок.
     // Без бокового смещения на ближней дистанции босс оказывается ровно за

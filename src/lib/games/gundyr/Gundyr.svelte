@@ -40,18 +40,26 @@
   });
 
   const keys = new Set<string>();
+  /** Кнопки мыши: левая — удар, правая — блок, средняя — парирование. */
+  const mouse = new Set<number>();
+  /** Захват цели. Выключается на Q — чтобы убежать или осмотреться. */
+  let lockOn = $state(true);
+  /** Куда смотрит камера: от этого угла отсчитывается движение. */
+  let yaw = 0;
 
   function input(): Input {
     return {
+      yaw,
+      lockOn,
       up: keys.has('w') || keys.has('ц') || keys.has('arrowup'),
       down: keys.has('s') || keys.has('ы') || keys.has('arrowdown'),
       left: keys.has('a') || keys.has('ф') || keys.has('arrowleft'),
       right: keys.has('d') || keys.has('в') || keys.has('arrowright'),
       roll: keys.has(' '),
-      light: keys.has('j') || keys.has('о'),
+      light: keys.has('j') || keys.has('о') || mouse.has(0),
       heavy: keys.has('k') || keys.has('л'),
-      block: keys.has('l') || keys.has('д'),
-      parry: keys.has('i') || keys.has('ш'),
+      block: keys.has('l') || keys.has('д') || mouse.has(2),
+      parry: keys.has('i') || keys.has('ш') || mouse.has(1),
       heal: keys.has('r') || keys.has('к'),
       sprint: keys.has('shift'),
     };
@@ -83,7 +91,8 @@
       last = now;
 
       step(world, input(), dt);
-      fight.render(world, dt);
+      fight.render(world, dt, lockOn);
+      yaw = fight.forwardAngle() + Math.PI / 2;
 
       hud = {
         hp: Math.max(0, world.player.hp),
@@ -118,7 +127,10 @@
     if ([' ', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(event.key)) {
       event.preventDefault();
     }
-    keys.add(event.key.toLowerCase());
+    const key = event.key.toLowerCase();
+    // Захват цели переключается нажатием, а не удержанием: держать его незачем.
+    if ((key === 'q' || key === 'й') && !event.repeat) lockOn = !lockOn;
+    keys.add(key);
   }}
   onkeyup={(event) => keys.delete(event.key.toLowerCase())}
   onblur={() => keys.clear()}
@@ -126,7 +138,18 @@
 
 {#snippet arena()}
   <div class="arena" class:bare>
-    <canvas bind:this={canvas} aria-label="Арена боя с Судией Гундиром">
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <canvas
+      bind:this={canvas}
+      aria-label="Арена боя с Судией Гундиром"
+      onmousedown={(event) => {
+        event.preventDefault();
+        mouse.add(event.button);
+      }}
+      onmouseup={(event) => mouse.delete(event.button)}
+      onmouseleave={() => mouse.clear()}
+      oncontextmenu={(event) => event.preventDefault()}
+    >
       Бой с Судией Гундиром. Что происходит — сказано в строке состояния.
     </canvas>
 
@@ -161,6 +184,9 @@
       <span><b>L</b> блок</span>
       <span><b>I</b> парировать</span>
       <span><b>R</b> глоток</span>
+      <span><b>Shift</b> бег</span>
+      <span class:off={!lockOn}><b>Q</b> захват {lockOn ? 'вкл' : 'выкл'}</span>
+      <span class="mouse">мышь: <b>ЛКМ</b> удар · <b>ПКМ</b> блок · <b>СКМ</b> парировать</span>
     </div>
 
     {#if hud.phase === 'завеса'}
@@ -335,6 +361,13 @@
   .keys b {
     color: var(--paper);
     font-weight: 600;
+  }
+  .keys .off {
+    opacity: 0.45;
+  }
+  .keys .mouse {
+    flex-basis: 100%;
+    text-align: right;
   }
 
   .veil {

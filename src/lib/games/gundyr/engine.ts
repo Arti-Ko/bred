@@ -8,6 +8,7 @@ import { approach, BOSS, choose, newBoss, parried, wound, type Boss } from './bo
 import {
   advance,
   begin,
+  heading,
   newPlayer,
   PLAYER,
   spend,
@@ -288,13 +289,25 @@ export function step(world: World, input: Input, dt: number): World {
     return world;
   }
 
-  player.facing = angleTo(player.at, boss.at); // взгляд всегда на босса, как при захвате цели
+  // С захватом цели взгляд приклеен к боссу, без него — к движению: ровно так
+  // это работает в соулсах, и от этого зависит, куда полетит удар и перекат.
+  if (input.lockOn) {
+    player.facing = angleTo(player.at, boss.at);
+  } else {
+    const dir = heading(input);
+    if (dir) player.facing = Math.atan2(dir.y, dir.x);
+  }
 
   advance(player, input, dt);
 
   // Удар игрока: активная фаза наступает после замаха.
   if (player.state === 'удар' || player.state === 'тяжёлый') {
-    const spec = player.state === 'удар' ? PLAYER.light : PLAYER.heavy;
+    const spec =
+      player.state === 'тяжёлый'
+        ? PLAYER.heavy
+        : player.running
+          ? PLAYER.runAttack
+          : PLAYER.light;
     const elapsed = spec.windup + spec.recover - player.timer;
     if (!player.hit && elapsed >= spec.windup) {
       if (!riposte(world)) {
