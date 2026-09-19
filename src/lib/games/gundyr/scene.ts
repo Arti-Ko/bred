@@ -9,6 +9,7 @@
 // не может, и дело не в лени — они чужие.
 
 import * as THREE from 'three';
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 
 import { ARENA, type Shape } from './shapes';
 import { playerRadius, type World } from './engine';
@@ -27,6 +28,15 @@ const GREY = {
   danger: 0xffffff,
 };
 
+/** Загруженная модель со своим проигрывателем анимаций. */
+interface Rig {
+  root: THREE.Object3D;
+  mixer: THREE.AnimationMixer;
+  clips: THREE.AnimationClip[];
+  current: THREE.AnimationAction | null;
+  name: string;
+}
+
 export class Fight {
   readonly scene = new THREE.Scene();
   readonly camera: THREE.PerspectiveCamera;
@@ -43,6 +53,16 @@ export class Fight {
   /** Камера догоняет цель, а не прыгает за ней: рывки тут читаются как лаги. */
   private readonly camAt = new THREE.Vector3(0, 6, 9);
   private readonly camLook = new THREE.Vector3();
+
+  /**
+   * Модели и их анимации. Пока они грузятся, на арене стоят примитивы — бой
+   * начинается сразу, а фигуры подменяются, как только приедут.
+   *
+   * Обе модели — Quaternius, лицензия CC0 (общественное достояние):
+   * «Adventurer» и «Skeleton» с poly.pizza. Ассетов Dark Souls 3 здесь нет.
+   */
+  private heroRig: Rig | null = null;
+  private bossRig: Rig | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
     this.renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
@@ -62,6 +82,81 @@ export class Fight {
 
     this.sword = this.player.getObjectByName('меч') as THREE.Mesh;
     this.shield = this.player.getObjectByName('щит') as THREE.Mesh;
+
+    void this.loadModels();
+  }
+
+  /** Модели грузятся молча: не приехали — бой идёт на примитивах. */
+  private async loadModels(): Promise<void> {
+    const loader = new GLTFLoader();
+    const dress = (root: THREE.Object3D, colour: number, roughness: number) => {
+      root.traverse((node) => {
+        if (!(node instanceof THREE.Mesh)) return;
+        node.castShadow = true;
+        node.receiveShadow = true;
+        // Монохром: у моделей своя раскраска, и она здесь лишняя.
+        node.material = new THREE.MeshStandardMaterial({ color: colour, roughness });
+      });
+    };
+
+    try {
+      const hero = await loader.loadAsync('models/adventurer.glb');
+      hero.scene.scale.setScalar(19);
+      dress(hero.scene, 0xdcdcdc, 0.6);
+      this.player.add(hero.scene);
+      this.heroRig = {
+        root: hero.scene,
+        mixer: new THREE.AnimationMixer(hero.scene),
+        clips: hero.animations,
+        current: null,
+        name: '',
+      };
+      // Примитивы больше не нужны — модель встала на их место.
+      for (const part of [...this.player.children]) {
+        if (part !== hero.scene) part.visible = false;
+      }
+    } catch {
+      // Оставляем примитивы: бой важнее картинки.
+    }
+
+    try {
+      const boss = await loader.loadAsync('models/skeleton.glb');
+      boss.scene.scale.setScalar(42);
+      dress(boss.scene, 0x3c3c3c, 0.85);
+      this.boss.add(boss.scene);
+      this.bossRig = {
+        root: boss.scene,
+        mixer: new THREE.AnimationMixer(boss.scene),
+        clips: boss.animations,
+        current: null,
+        name: '',
+      };
+      for (const part of [...this.boss.children]) {
+        if (part !== boss.scene) part.visible = false;
+      }
+    } catch {
+      // см. выше
+    }
+  }
+
+  /** Включить движение по куску имени: у моделей они длинные и с префиксами. */
+  private play(rig: Rig | null, wanted: string, options: { loop?: boolean; speed?: number } = {}): void {
+    if (!rig || rig.name === wanted) {
+      if (rig?.current && options.speed) rig.current.setEffectiveTimeScale(options.speed);
+      return;
+    }
+    const clip = rig.clips.find((c) => c.name.toLowerCase().includes(wanted.toLowerCase()));
+    if (!clip) return;
+
+    const action = rig.mixer.clipAction(clip);
+    action.reset();
+    action.setLoop(options.loop === false ? THREE.LoopOnce : THREE.LoopRepeat, Infinity);
+    action.clampWhenFinished = options.loop === false;
+    action.setEffectiveTimeScale(options.speed ?? 1);
+    action.fadeIn(0.15).play();
+    rig.current?.fadeOut(0.15);
+    rig.current = action;
+    rig.name = wanted;
   }
 
   resize(width: number, height: number): void {
@@ -330,8 +425,14 @@ export class Fight {
     return Math.atan2(this.camLook.z - this.camera.position.z, this.camLook.x - this.camera.position.x);
   }
 
+  /** Насколько игрок сдвинулся за кадр: по этому и выбирается бег или покой. */
+  private heroMoved = 0;
+  private readonly lastHero = new THREE.Vector2();
+
   private placeFigures(world: World): void {
     const [px, pz] = toScene(world.player.at.x, world.player.at.y);
+    this.heroMoved = this.lastHero.distanceTo(new THREE.Vector2(px, pz));
+    this.lastHero.set(px, pz);
     this.player.position.set(px, 0, pz);
     this.player.rotation.y = -world.player.facing + Math.PI / 2;
 
@@ -340,9 +441,34 @@ export class Fight {
     this.boss.rotation.y = -world.boss.facing + Math.PI / 2;
   }
 
-  /** Позы: анимации нет, но состояние должно читаться с одного взгляда. */
+  /** Позы: движение модели, а если её нет — поворот примитивов. */
   private animate(world: World, dt: number): void {
     const { player, boss } = world;
+
+    this.heroRig?.mixer.update(dt);
+    this.bossRig?.mixer.update(dt);
+
+    if (this.heroRig) {
+      const moving = player.state === 'свободен' && world.phase === 'бой';
+      if (player.hp <= 0) this.play(this.heroRig, 'Death', { loop: false });
+      else if (player.state === 'перекат') this.play(this.heroRig, 'Roll', { loop: false, speed: 1.6 });
+      else if (player.state === 'удар' || player.state === 'тяжёлый' || player.state === 'риспост')
+        this.play(this.heroRig, 'Sword_Slash', { loop: false, speed: 1.5 });
+      else if (player.state === 'лечится') this.play(this.heroRig, 'Interact', { loop: false });
+      else if (player.state === 'оглушён') this.play(this.heroRig, 'HitRecieve', { loop: false });
+      else if (moving && this.heroMoved > 0.4) this.play(this.heroRig, 'Run', { speed: 1.1 });
+      else this.play(this.heroRig, 'Idle_Sword');
+    }
+
+    if (this.bossRig) {
+      if (boss.hp <= 0) this.play(this.bossRig, 'Death', { loop: false });
+      else if (boss.state === 'спит' || boss.state === 'открыт') this.play(this.bossRig, 'Duck', { loop: false });
+      else if (boss.state === 'замах' || boss.state === 'удар')
+        this.play(this.bossRig, 'Sword', { loop: false, speed: 1.3 });
+      else if (boss.state === 'подход') this.play(this.bossRig, 'Walk', { speed: 1.4 });
+      else if (boss.state === 'превращение') this.play(this.bossRig, 'Wave', { loop: false });
+      else this.play(this.bossRig, 'Idle');
+    }
 
     // Босс: спит на колене, замахивается — поднимает алебарду, бьёт — опускает.
     const sleeping = boss.state === 'спит' || boss.state === 'пробуждается';
