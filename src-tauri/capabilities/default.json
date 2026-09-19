@@ -1,9 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Права окна БРЕД: выбор файлов, открытие полученных и полный экран для демонстрации.",
+  "description": "Права окон БРЕД: выбор файлов, открытие полученных, полный экран для демонстрации и отдельное окно боя.",
   "windows": [
-    "main"
+    "main",
+    "gundyr"
   ],
   "permissions": [
     "core:default",
@@ -18,6 +19,8 @@
     "process:allow-restart",
     "dialog:allow-ask",
     "core:window:allow-set-fullscreen",
-    "core:window:allow-is-fullscreen"
+    "core:window:allow-is-fullscreen",
+    "core:webview:allow-create-webview-window",
+    "core:window:allow-close"
   ]
 }

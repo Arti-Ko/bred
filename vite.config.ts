@@ -12,6 +12,11 @@ export default defineConfig({
     watch: { ignored: ['**/src-tauri/**'] },
   },
   build: {
+    // Два окна — две точки входа: мессенджер и бой, который открывается
+    // отдельным окном и мессенджера вокруг себя не имеет.
+    rollupOptions: {
+      input: { index: 'index.html', gundyr: 'gundyr.html' },
+    },
     target: 'esnext',
     // Vite 8 минифицирует через oxc; esbuild-путь объявлен устаревшим
     minify: true,

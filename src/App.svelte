@@ -32,6 +32,19 @@
     void session.init();
   });
 
+  // Победа в отдельном окне боя. Трофей и оформление живут в главном окне,
+  // поэтому окно боя только сообщает о ней событием.
+  $effect(() => {
+    let stop: (() => void) | null = null;
+    void import('@tauri-apps/api/event')
+      .then(({ listen }) => listen('гундир:повержен', () => prefs.win('гундир')))
+      .then((unlisten) => {
+        stop = unlisten;
+      })
+      .catch(() => undefined);
+    return () => stop?.();
+  });
+
   // Оформление — одно на весь документ: компоненты читают токены, а не флаг.
   $effect(() => {
     document.documentElement.dataset.skin = prefs.adequate ? 'adequate' : 'terminal';

@@ -57,6 +57,34 @@
    * человек мгновенно оказывался в меню. Уходит он теперь сам, посмотрев на
    * то, ради чего играл.
    */
+  /**
+   * Бой открывается отдельным окном: ему нужен весь экран и своя картинка, а
+   * мессенджер вокруг только мешает. В браузере (демонстрационный стенд) окна
+   * завести нельзя — там он открывается прямо в зале.
+   */
+  async function fight(): Promise<void> {
+    try {
+      const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
+      const existing = await WebviewWindow.getByLabel('gundyr');
+      if (existing) {
+        await existing.setFocus();
+        return;
+      }
+      new WebviewWindow('gundyr', {
+        url: 'gundyr.html',
+        title: 'Судия Гундир',
+        width: 1280,
+        height: 760,
+        minWidth: 900,
+        minHeight: 540,
+        center: true,
+        resizable: true,
+      });
+    } catch {
+      screen = 'гундир';
+    }
+  }
+
   function finish(trophy: Trophy): void {
     prefs.win(trophy);
     won = trophy;
@@ -102,7 +130,11 @@
 
       <div class="cards">
         {#each games as game, index (game.id)}
-          <button class="card" class:beaten={prefs.trophies.includes(game.id)} onclick={() => (screen = game.id)}>
+          <button
+            class="card"
+            class:beaten={prefs.trophies.includes(game.id)}
+            onclick={() => (game.id === 'гундир' ? fight() : (screen = game.id))}
+          >
             <span class="ordinal">{index + 1}</span>
             <span class="art" aria-hidden="true">
               {#if game.id === 'крестики'}
