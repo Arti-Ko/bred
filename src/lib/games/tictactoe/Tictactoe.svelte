@@ -127,15 +127,16 @@
     transition: background 140ms ease, transform 140ms ease;
   }
   .cell:hover:not(:disabled) {
-    background: rgba(232, 115, 74, 0.13);
+    background: var(--lift-2);
     transform: translateY(-2px);
   }
   .cell:disabled {
     cursor: default;
   }
+  /* Выигравшая линия — светом и рамкой: цвета в системе нет */
   .cell.won {
-    background: rgba(217, 178, 106, 0.18);
-    box-shadow: inset 0 0 0 1px rgba(217, 178, 106, 0.55);
+    background: rgba(255, 255, 255, 0.16);
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.55);
   }
 
   svg {
@@ -145,11 +146,12 @@
     stroke-width: 3.4;
     stroke-linecap: round;
   }
+  /* Свой знак — белый, чужой — серый: различаются светлотой, а не цветом */
   .x {
-    stroke: var(--ember);
+    stroke: var(--accent);
   }
   .o {
-    stroke: var(--paper);
+    stroke: var(--muted);
   }
 
   .ghost {
@@ -161,7 +163,7 @@
     transition: border-color 160ms ease, background 160ms ease;
   }
   .ghost:hover {
-    border-color: var(--ember);
-    background: rgba(232, 115, 74, 0.1);
+    border-color: var(--paper);
+    background: var(--lift);
   }
 </style>

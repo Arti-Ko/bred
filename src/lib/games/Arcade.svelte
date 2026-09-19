@@ -165,17 +165,19 @@
 </div>
 
 <style>
-  /* Палитра зала. Она же лежит в основе адекватного режима: одна система на
-     обоих экранах, поэтому переход из игры в мессенджер не выглядит переездом. */
+  /* Палитра зала — та же монохромная, что и во всём БРЕД: ни одного цветового
+     акцента, активное помечается светом. Переход из мессенджера в игру и обратно
+     не выглядит переездом в другое приложение. */
   .arcade {
-    --ink: #0b0a0f;
-    --surface: #15141c;
-    --raised: #1d1c26;
-    --edge: #2b2936;
-    --paper: #efe9e2;
-    --muted: #9b93a6;
-    --ember: #e8734a;
-    --gold: #d9b26a;
+    --ink: #0a0a0a;
+    --surface: #111111;
+    --raised: #171717;
+    --edge: #242424;
+    --paper: #e9e9e9;
+    --muted: #8b8b8b;
+    --accent: #ffffff;
+    --lift: rgba(255, 255, 255, 0.07);
+    --lift-2: rgba(255, 255, 255, 0.13);
 
     position: fixed;
     inset: 0;
@@ -185,8 +187,7 @@
     font-family: ui-sans-serif, -apple-system, 'SF Pro Text', 'Segoe UI', Inter, system-ui,
       sans-serif;
     background:
-      radial-gradient(1100px 620px at 78% -8%, rgba(232, 115, 74, 0.16), transparent 60%),
-      radial-gradient(760px 520px at 8% 108%, rgba(120, 96, 200, 0.14), transparent 62%),
+      radial-gradient(1100px 620px at 78% -8%, rgba(255, 255, 255, 0.06), transparent 60%),
       var(--ink);
   }
 
@@ -255,10 +256,10 @@
     gap: 0.75rem;
     margin-bottom: 1.6rem;
     padding: 0.85rem 1.1rem;
-    border: 1px solid rgba(217, 178, 106, 0.4);
-    border-left: 3px solid var(--gold);
+    border: 1px solid rgba(255, 255, 255, 0.28);
+    border-left: 3px solid var(--accent);
     border-radius: 10px;
-    background: linear-gradient(90deg, rgba(217, 178, 106, 0.16), transparent 70%);
+    background: linear-gradient(90deg, var(--lift-2), transparent 70%);
     font-size: 0.92rem;
   }
   .banner span {
@@ -291,8 +292,8 @@
   .card:hover,
   .card:focus-visible {
     transform: translateY(-4px);
-    border-color: rgba(232, 115, 74, 0.55);
-    box-shadow: 0 18px 40px -24px rgba(0, 0, 0, 0.9), 0 0 0 1px rgba(232, 115, 74, 0.12);
+    border-color: rgba(255, 255, 255, 0.35);
+    box-shadow: 0 18px 40px -24px rgba(0, 0, 0, 0.9), 0 0 0 1px rgba(255, 255, 255, 0.08);
   }
 
   .ordinal {
@@ -321,13 +322,13 @@
     transition: stroke 200ms ease;
   }
   .art :global(.ink) {
-    stroke: var(--ember);
+    stroke: var(--paper);
   }
   .card:hover .art :global(svg) {
     stroke: var(--muted);
   }
   .card:hover .art :global(.ink) {
-    stroke: #ff8b5e;
+    stroke: var(--accent);
   }
 
   .title {
@@ -338,7 +339,7 @@
   .line {
     font-size: 0.8rem;
     letter-spacing: 0.04em;
-    color: var(--ember);
+    color: var(--paper);
   }
   .about {
     color: var(--muted);
@@ -354,7 +355,7 @@
     border-top: 1px solid var(--edge);
   }
   .card.beaten .go {
-    color: var(--gold);
+    color: var(--accent);
   }
   .card.beaten::after {
     content: '★';
@@ -362,7 +363,7 @@
     top: 1.35rem;
     right: 1.1rem;
     font-size: 1rem;
-    color: var(--gold);
+    color: var(--accent);
   }
 
   footer {
@@ -395,7 +396,7 @@
     transition: border-color 160ms ease, background 160ms ease;
   }
   .ghost:hover {
-    border-color: var(--ember);
-    background: rgba(232, 115, 74, 0.1);
+    border-color: var(--paper);
+    background: var(--lift);
   }
 </style>

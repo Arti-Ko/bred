@@ -176,10 +176,10 @@
     background: rgba(9, 7, 13, 0.62);
   }
   .square.target {
-    background: rgba(232, 115, 74, 0.2);
+    background: rgba(255, 255, 255, 0.16);
   }
   .square.standing {
-    box-shadow: inset 0 0 0 2px var(--gold);
+    box-shadow: inset 0 0 0 2px var(--accent);
   }
   /* Скругление достаётся только углам доски, а не каждой клетке */
   .square:first-child {
@@ -201,15 +201,15 @@
     display: grid;
     place-items: center;
     border-radius: 50%;
-    background: radial-gradient(circle at 34% 28%, #fffdfa, #cdc4b8 70%, #a49a8d);
+    background: radial-gradient(circle at 34% 28%, #ffffff, #c9c9c9 70%, #9e9e9e);
     box-shadow: 0 3px 6px -2px rgba(0, 0, 0, 0.85), inset 0 0 0 2px rgba(255, 255, 255, 0.25);
-    color: #6b5a3a;
+    color: #3a3a3a;
     font-size: 0.7rem;
   }
   .piece.black {
-    background: radial-gradient(circle at 34% 28%, #4a4150, #241f2c 68%, #15121b);
-    box-shadow: 0 3px 6px -2px rgba(0, 0, 0, 0.9), inset 0 0 0 2px rgba(232, 115, 74, 0.35);
-    color: var(--gold);
+    background: radial-gradient(circle at 34% 28%, #4a4a4a, #262626 68%, #161616);
+    box-shadow: 0 3px 6px -2px rgba(0, 0, 0, 0.9), inset 0 0 0 2px rgba(255, 255, 255, 0.22);
+    color: var(--paper);
   }
   .crown {
     line-height: 1;
@@ -219,8 +219,8 @@
     width: 26%;
     height: 26%;
     border-radius: 50%;
-    background: var(--ember);
-    opacity: 0.85;
+    background: var(--accent);
+    opacity: 0.8;
   }
 
   .ghost {
@@ -232,7 +232,7 @@
     transition: border-color 160ms ease, background 160ms ease;
   }
   .ghost:hover {
-    border-color: var(--ember);
-    background: rgba(232, 115, 74, 0.1);
+    border-color: var(--paper);
+    background: var(--lift);
   }
 </style>

@@ -107,11 +107,12 @@
     color: var(--muted);
   }
   .status.win {
-    color: var(--gold);
-    font-weight: 600;
+    color: var(--accent);
+    font-weight: 700;
   }
   .status.lose {
-    color: var(--ember);
+    color: var(--paper);
+    font-weight: 600;
   }
 
   .sp {

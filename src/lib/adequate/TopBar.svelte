@@ -29,7 +29,7 @@
 </script>
 
 <header class="top">
-  <div class="picker">
+  <div class="switcher">
     <button class="pick" onclick={() => (menu = !menu)} aria-expanded={menu}>
       {#if session.space}
         <Avatar id={session.space.id} nick={session.space.name} size="sm" />
@@ -112,7 +112,9 @@
     background: linear-gradient(180deg, rgba(255, 255, 255, 0.035), transparent);
   }
 
-  .picker {
+  /* Не `.picker`: так называется корень выбора эмодзи, и общее правило из
+     adequate.css с `overflow: hidden` срезало бы выпадающий список. */
+  .switcher {
     position: relative;
     flex: none;
   }

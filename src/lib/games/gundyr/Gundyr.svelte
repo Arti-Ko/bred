@@ -95,13 +95,13 @@
 
     // Пол арены.
     const floor = ctx.createRadialGradient(ARENA.x, ARENA.y, 20, ARENA.x, ARENA.y, ARENA.r);
-    floor.addColorStop(0, '#272029');
-    floor.addColorStop(1, '#100d14');
+    floor.addColorStop(0, '#242424');
+    floor.addColorStop(1, '#0d0d0d');
     ctx.fillStyle = floor;
     ctx.beginPath();
     ctx.arc(ARENA.x, ARENA.y, ARENA.r, 0, Math.PI * 2);
     ctx.fill();
-    ctx.strokeStyle = 'rgba(232, 115, 74, 0.22)';
+    ctx.strokeStyle = 'rgba(255, 255, 255, 0.22)';
     ctx.lineWidth = 2;
     ctx.stroke();
 
@@ -132,10 +132,11 @@
         flashes.push({ shape: tell.shape, life: 0.16 });
         continue;
       }
+      // Замах наливается светом: чем ближе удар, тем ярче пятно под ногами.
       path(ctx, tell.shape);
-      ctx.fillStyle = `rgba(232, 115, 74, ${0.06 + 0.2 * tell.progress})`;
+      ctx.fillStyle = `rgba(255, 255, 255, ${0.05 + 0.16 * tell.progress})`;
       ctx.fill();
-      ctx.strokeStyle = `rgba(255, 176, 120, ${0.3 + 0.55 * tell.progress})`;
+      ctx.strokeStyle = `rgba(255, 255, 255, ${0.25 + 0.6 * tell.progress})`;
       ctx.lineWidth = 1.5 + 2 * tell.progress;
       ctx.stroke();
     }
@@ -148,7 +149,7 @@
         continue;
       }
       path(ctx, flash.shape);
-      ctx.fillStyle = `rgba(255, 233, 214, ${0.5 * (flash.life / 0.16)})`;
+      ctx.fillStyle = `rgba(255, 255, 255, ${0.55 * (flash.life / 0.16)})`;
       ctx.fill();
     }
 
@@ -165,14 +166,14 @@
     ctx.translate(boss.at.x, boss.at.y);
     ctx.rotate(boss.facing);
     // Древко и лезвие алебарды — по ним и читается, куда он смотрит.
-    ctx.strokeStyle = boss.phase === 2 ? '#c96144' : '#8d8496';
+    ctx.strokeStyle = boss.phase === 2 ? '#d8d8d8' : '#8b8b8b';
     ctx.lineWidth = 5;
     ctx.lineCap = 'round';
     ctx.beginPath();
     ctx.moveTo(-10, 0);
     ctx.lineTo(62, 0);
     ctx.stroke();
-    ctx.fillStyle = boss.phase === 2 ? '#e8734a' : '#b9b0c6';
+    ctx.fillStyle = boss.phase === 2 ? '#ffffff' : '#b5b5b5';
     ctx.beginPath();
     ctx.moveTo(62, -3);
     ctx.lineTo(84, -14);
@@ -184,7 +185,7 @@
 
     // Во второй фазе из него лезут отростки.
     if (boss.phase === 2) {
-      ctx.strokeStyle = 'rgba(232, 115, 74, 0.75)';
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
       ctx.lineWidth = 3;
       for (let i = 0; i < 3; i++) {
         const wave = Math.sin(world.time * 6 + i * 2.1) * 9;
@@ -196,14 +197,14 @@
     }
 
     // Туловище и щель забрала.
-    ctx.fillStyle = boss.phase === 2 ? '#3a1f26' : '#2b2734';
-    ctx.strokeStyle = boss.phase === 2 ? '#e8734a' : '#6b6279';
+    ctx.fillStyle = boss.phase === 2 ? '#2e2e2e' : '#242424';
+    ctx.strokeStyle = boss.phase === 2 ? '#ffffff' : '#6d6d6d';
     ctx.lineWidth = 3;
     ctx.beginPath();
     ctx.arc(0, 0, bossRadius(), 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
-    ctx.strokeStyle = boss.phase === 2 ? '#ffb48c' : '#9a90a8';
+    ctx.strokeStyle = boss.phase === 2 ? '#ffffff' : '#9a9a9a';
     ctx.lineWidth = 3;
     ctx.beginPath();
     ctx.moveTo(bossRadius() * 0.35, -7);
@@ -213,7 +214,7 @@
 
     // Игрок. В перекате — след и светлое кольцо неуязвимости.
     if (player.state === 'перекат') {
-      ctx.fillStyle = 'rgba(239, 233, 226, 0.14)';
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.14)';
       ctx.beginPath();
       ctx.arc(
         player.at.x - player.roll.x * 26,
@@ -225,12 +226,12 @@
       ctx.fill();
     }
     shadow(player.at.x, player.at.y, playerRadius());
-    ctx.fillStyle = player.state === 'лечится' ? '#d9b26a' : '#efe9e2';
+    ctx.fillStyle = player.state === 'лечится' ? '#bdbdbd' : '#ffffff';
     ctx.beginPath();
     ctx.arc(player.at.x, player.at.y, playerRadius(), 0, Math.PI * 2);
     ctx.fill();
     // Щит со стороны, противоположной клинку: видно, где перёд.
-    ctx.strokeStyle = 'rgba(120, 112, 134, 0.9)';
+    ctx.strokeStyle = 'rgba(130, 130, 130, 0.9)';
     ctx.lineWidth = 4;
     ctx.beginPath();
     ctx.arc(
@@ -242,13 +243,13 @@
     );
     ctx.stroke();
     if (player.iframes > 0) {
-      ctx.strokeStyle = 'rgba(217, 178, 106, 0.85)';
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
       ctx.lineWidth = 2;
       ctx.beginPath();
       ctx.arc(player.at.x, player.at.y, playerRadius() + 5, 0, Math.PI * 2);
       ctx.stroke();
     }
-    ctx.strokeStyle = '#efe9e2';
+    ctx.strokeStyle = '#ffffff';
     ctx.lineWidth = 3;
     ctx.beginPath();
     ctx.moveTo(player.at.x, player.at.y);
@@ -264,11 +265,12 @@
     const barX = (WIDTH - 560) / 2;
     ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
     ctx.fillRect(barX - 2, 26, 564, 14);
-    ctx.fillStyle = 'rgba(217, 178, 106, 0.45)';
+    // Догоняющая полоса — тусклая, живое здоровье — белое: видно откушенный кусок.
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.28)';
     ctx.fillRect(barX, 28, 560 * ghost, 10);
-    ctx.fillStyle = '#e8734a';
+    ctx.fillStyle = '#ffffff';
     ctx.fillRect(barX, 28, 560 * share, 10);
-    ctx.fillStyle = 'rgba(239, 233, 226, 0.75)';
+    ctx.fillStyle = 'rgba(255, 255, 255, 0.75)';
     ctx.font = '12px ui-sans-serif, system-ui, sans-serif';
     ctx.textAlign = 'center';
     ctx.fillText(boss.phase === 2 ? 'СУДИЯ ГУНДИР · ВТОРАЯ ФАЗА' : 'СУДИЯ ГУНДИР', WIDTH / 2, 18);
@@ -434,11 +436,16 @@
     height: 100%;
     transition: width 120ms linear;
   }
+  /* Жизнь и сила различаются светлотой и штриховкой, а не цветом */
   .hp i {
-    background: linear-gradient(90deg, #b8433c, #e8734a);
+    background: linear-gradient(90deg, #9a9a9a, #ffffff);
   }
   .stamina i {
-    background: linear-gradient(90deg, #6f7f4f, #a8bd6e);
+    background: repeating-linear-gradient(
+      -45deg,
+      #7d7d7d 0 4px,
+      #5e5e5e 4px 8px
+    );
   }
   .estus {
     display: flex;
@@ -448,11 +455,11 @@
   .flask {
     width: 0.8rem;
     height: 1.05rem;
-    fill: var(--gold);
+    fill: var(--paper);
   }
   .flask.empty {
     fill: none;
-    stroke: var(--gold);
+    stroke: var(--paper);
     stroke-width: 1.2;
     opacity: 0.35;
   }
@@ -475,15 +482,17 @@
     background: rgba(8, 6, 10, 0.78);
     backdrop-filter: blur(2px);
   }
+  /* «Вы погибли» — тусклым, «враг повержен» — в полный свет: разница читается
+     без цвета, как и всё остальное в этой системе. */
   .veil b {
     font-size: clamp(1.6rem, 1rem + 3vw, 3rem);
     letter-spacing: 0.22em;
-    color: #c9483f;
-    text-shadow: 0 0 28px rgba(201, 72, 63, 0.45);
+    color: #8b8b8b;
+    text-shadow: 0 0 28px rgba(0, 0, 0, 0.8);
   }
   .veil.victory b {
-    color: var(--gold);
-    text-shadow: 0 0 28px rgba(217, 178, 106, 0.4);
+    color: #ffffff;
+    text-shadow: 0 0 28px rgba(255, 255, 255, 0.35);
   }
   .row {
     display: flex;
@@ -500,7 +509,7 @@
     transition: border-color 160ms ease, background 160ms ease;
   }
   .ghost:hover {
-    border-color: var(--ember);
-    background: rgba(232, 115, 74, 0.14);
+    border-color: var(--paper);
+    background: var(--lift-2);
   }
 </style>
