@@ -8,22 +8,27 @@
 
   import CallPanel from '../components/CallPanel.svelte';
   import Feed from '../components/Feed.svelte';
-  import ThreadPanel from '../components/ThreadPanel.svelte';
   import Avatar from './Avatar.svelte';
   import Composer from './Composer.svelte';
   import Dialogs from './Dialogs.svelte';
   import type { Kind } from './kinds';
   import Icon from './Icon.svelte';
   import Members from './Members.svelte';
+  import Settings from './Settings.svelte';
   import Sidebar from './Sidebar.svelte';
+  import ThreadPane from './ThreadPane.svelte';
   import TopBar from './TopBar.svelte';
   import Welcome from './Welcome.svelte';
   import { session } from '../stores/session.svelte';
 
   interface Props {
+    /** Открыты ли настройки. Состояние живёт в приложении: его же дёргает ^, */
+    settingsOpen: boolean;
     onsettings: () => void;
+    onclosesettings: () => void;
+    onarcade: () => void;
   }
-  const { onsettings }: Props = $props();
+  const { settingsOpen, onsettings, onclosesettings, onarcade }: Props = $props();
 
   let dialog = $state<Kind | null>(null);
   let query = $state('');
@@ -54,7 +59,7 @@
         onnewdirect={() => (dialog = 'личное')}
       />
 
-      <main class="middle">
+      <main class="middle" class:with-thread={!!session.threadRoot}>
         <div class="feed-head">
           <div class="title">
             {#if session.channel}
@@ -76,16 +81,25 @@
 
         <CallPanel />
         <Feed head={false} filter={query} avatars />
-        <ThreadPanel />
         <Composer />
       </main>
 
-      <Members oninvite={() => (dialog = 'приглашение')} />
+      {#if session.threadRoot}
+        <!-- Ветка занимает место участников: две колонки справа не помещаются,
+             а разговор в сторону сейчас важнее списка. -->
+        <ThreadPane />
+      {:else}
+        <Members oninvite={() => (dialog = 'приглашение')} />
+      {/if}
     </div>
   {/if}
 
   {#if dialog}
     <Dialogs kind={dialog} onclose={() => (dialog = null)} />
+  {/if}
+
+  {#if settingsOpen}
+    <Settings onclose={onclosesettings} onarcade={onarcade} />
   {/if}
 
   {#if session.status}
@@ -199,7 +213,8 @@
     .body {
       grid-template-columns: 17rem minmax(0, 1fr);
     }
-    .body :global(.people) {
+    .body :global(.people),
+    .body :global(.thread-pane) {
       display: none;
     }
   }

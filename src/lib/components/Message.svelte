@@ -9,6 +9,12 @@
     message: MessageRow;
     mine: boolean;
     selected: boolean;
+    /**
+     * Показывать действия всплывающей панелью при наведении, а не строкой под
+     * сообщением. Так они устроены в адекватном режиме: терминал открывает их
+     * кликом, потому что там нет мыши как основного способа работы.
+     */
+    hoverActions?: boolean;
     onreact: (emoji: string) => void;
     onreply: () => void;
     ondownload: (hash: string) => void;
@@ -21,6 +27,7 @@
     message,
     mine,
     selected,
+    hoverActions = false,
     onreact,
     onreply,
     ondownload,
@@ -36,6 +43,22 @@
   let reactionPicker = $state(false);
 
   const emojiMap = $derived(session.emojiMap);
+
+  /** «1 ответ», «2 ответа», «5 ответов» — иначе подпись режет глаз. */
+  function replies(count: number): string {
+    const tail = count % 100;
+    if (tail >= 11 && tail <= 14) return 'ответов';
+    switch (count % 10) {
+      case 1:
+        return 'ответ';
+      case 2:
+      case 3:
+      case 4:
+        return 'ответа';
+      default:
+        return 'ответов';
+    }
+  }
   const sticker = $derived(loneSticker(message.body, emojiMap));
 
   /** Картинки своих эмодзи: те же превью, что и у вложений. */
@@ -160,7 +183,8 @@
       </button>
     {/each}
 
-    {#if selected}
+    {#if selected || hoverActions}
+      <div class="tools">
       <div class="picker-anchor">
         <button
           class="rx"
@@ -195,6 +219,7 @@
           }}>удалить</button
         >
       {/if}
+      </div>
     {/if}
 
     {#if message.thread_replies > 0 || selected}
@@ -205,13 +230,25 @@
           onthread();
         }}
       >
-        └─ ветка{message.thread_replies > 0 ? ` · ${message.thread_replies}` : ' · начать'}
+        {#if hoverActions}
+          {message.thread_replies > 0
+            ? `${message.thread_replies} ${replies(message.thread_replies)} в ветке`
+            : 'Обсудить веткой'}
+        {:else}
+          └─ ветка{message.thread_replies > 0 ? ` · ${message.thread_replies}` : ' · начать'}
+        {/if}
       </button>
     {/if}
   </div>
 </article>
 
 <style>
+  /* В терминале панель действий не существует как объект: кнопки просто стоят
+     в строке. `display: contents` и означает «меня нет, есть только дети». */
+  .tools {
+    display: contents;
+  }
+
   .msg {
     padding: 5px 14px 6px;
     border-left: 2px solid transparent;

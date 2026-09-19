@@ -125,6 +125,7 @@
           {message}
           mine={message.author === session.me}
           selected={selectedId === message.id}
+          hoverActions={avatars}
           onreact={(emoji) => session.toggleReaction(message, emoji)}
           onreply={() => (session.replyTo = message)}
           ondownload={(hash) => session.download(hash)}

@@ -157,7 +157,7 @@
 
 <svelte:window onkeydown={onGlobalKey} />
 
-{#if settingsOpen}
+{#if settingsOpen && !prefs.adequate}
   <Settings onclose={() => (settingsOpen = false)} onarcade={openArcade} />
 {/if}
 
@@ -170,7 +170,12 @@
   <!-- Адекватный режим — другой каркас, а не перекраска: у каждого действия
        появляется своё место, и командная строка перестаёт быть единственным
        входом. Сама она остаётся: строка со слэшем уходит тем же путём. -->
-  <Shell onsettings={() => (settingsOpen = true)} />
+  <Shell
+    {settingsOpen}
+    onsettings={() => (settingsOpen = true)}
+    onclosesettings={() => (settingsOpen = false)}
+    onarcade={openArcade}
+  />
 {:else}
 <div class="term">
   <header class="wins">

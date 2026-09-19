@@ -77,6 +77,16 @@
 </script>
 
 <div class="composer-wrap">
+  {#if session.threadRoot}
+    <div class="strip">
+      <span class="label">Ветка</span>
+      <span class="quote">ответ уйдёт в ветку, а не в общий канал</span>
+      <button class="icon-btn" onclick={() => session.closeThread()} aria-label="Закрыть ветку">
+        <Icon name="close" size={13} />
+      </button>
+    </div>
+  {/if}
+
   {#if session.replyTo}
     <div class="strip">
       <span class="label">Ответ</span>
@@ -125,9 +135,11 @@
       rows="1"
       onkeydown={onKey}
       oninput={onInput}
-      placeholder={channel
-        ? `Написать в #${channel.name}…`
-        : 'Выберите канал слева или создайте свой'}
+      placeholder={session.threadRoot
+        ? 'Ответить в ветке…'
+        : channel
+          ? `Написать в #${channel.name}…`
+          : 'Выберите канал слева или создайте свой'}
       aria-label="Сообщение"
     ></textarea>
 

@@ -24,6 +24,8 @@
   --radius-sm: 8px;
 
   /* Подъём поверхности вместо второго цвета */
+  --thread-icon: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'><path d='M2.5 4.5h11v6h-6l-3 2.5v-2.5h-2z'/><path d='M5 7h6'/></svg>");
+
   --lift: rgba(255, 255, 255, 0.06);
   --lift-2: rgba(255, 255, 255, 0.11);
   --edge: rgba(255, 255, 255, 0.3);
@@ -195,7 +197,54 @@
   padding: 1px 9px;
 }
 :root[data-skin='adequate'] .file {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: 30rem;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+}
+:root[data-skin='adequate'] .file .glyph {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
   border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--fg-dimmer);
+}
+:root[data-skin='adequate'] .file .name {
+  flex: 1;
+  min-width: 0;
+  color: var(--fg);
+  font-weight: 560;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+:root[data-skin='adequate'] .file .meta {
+  color: var(--fg-dimmer);
+  font-family: var(--mono);
+  font-size: var(--text-xs);
+}
+:root[data-skin='adequate'] .file button {
+  padding: 4px 11px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  color: var(--fg);
+  text-decoration: none;
+  font-size: var(--text-xs);
+}
+:root[data-skin='adequate'] .file button:hover {
+  border-color: var(--fg-dim);
+  color: var(--fg-hi);
+  background: var(--lift);
+}
+/* Картинка в ленте — со скруглением и подписью на подложке */
+:root[data-skin='adequate'] .shot img {
+  border-radius: var(--radius);
 }
 /* День — разделитель по центру, а не строка с хвостом из тире */
 :root[data-skin='adequate'] .day {
@@ -212,6 +261,82 @@
   flex: 1;
   height: 1px;
   background: var(--line);
+}
+
+/* Действия над сообщением — всплывающей панелью у верхнего края, а не строкой
+   под текстом: строка распирала сообщение и сдвигала соседние при каждом
+   выделении. Панель появляется при наведении и остаётся, пока сообщение
+   выбрано — с клавиатуры она достижима так же. */
+:root[data-skin='adequate'] .line {
+  position: relative;
+}
+:root[data-skin='adequate'] .tools {
+  position: absolute;
+  top: -14px;
+  right: 10px;
+  z-index: 3;
+  display: flex;
+  gap: 2px;
+  padding: 3px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg-raised);
+  box-shadow: 0 12px 28px -20px #000;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--fast) var(--ease);
+}
+:root[data-skin='adequate'] .line:hover .tools,
+:root[data-skin='adequate'] .line:focus-within .tools,
+:root[data-skin='adequate'] .line[aria-selected='true'] .tools {
+  opacity: 1;
+  pointer-events: auto;
+}
+:root[data-skin='adequate'] .tools .rx {
+  border: 0;
+  background: none;
+  padding: 3px 9px;
+  border-radius: 6px;
+  color: var(--fg-dim);
+}
+:root[data-skin='adequate'] .tools .rx:hover {
+  background: var(--lift-2);
+  color: var(--fg-hi);
+}
+
+/* Выбранное сообщение: подсветка строки целиком, без рамки слева */
+:root[data-skin='adequate'] .line[aria-selected='true'] {
+  background: var(--lift-2);
+}
+:root[data-skin='adequate'] .line[aria-selected='true'] .msg,
+:root[data-skin='adequate'] .msg.selected {
+  background: none;
+  border-left-color: transparent;
+}
+
+/* Ветка — обычная ссылка со счётчиком, а не псевдографика.
+   Селектор именно по кнопке: `.thread` — ещё и панель ветки, и без уточнения
+   правило превращало целую колонку в пилюлю со скруглением 999px. */
+:root[data-skin='adequate'] button.thread {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 2px 10px;
+  border-radius: 999px;
+  color: var(--fg-hi);
+  font-size: var(--text-sm);
+  font-weight: 560;
+}
+:root[data-skin='adequate'] button.thread::before {
+  content: '';
+  width: 13px;
+  height: 13px;
+  background: currentColor;
+  -webkit-mask: var(--thread-icon) center / contain no-repeat;
+  mask: var(--thread-icon) center / contain no-repeat;
+}
+:root[data-skin='adequate'] button.thread:hover {
+  background: var(--lift-2);
 }
 
 /* Окна поверх: настройки, ветка, выбор эмодзи.
@@ -236,6 +361,62 @@
   background: var(--lift);
 }
 
+/* Выбор эмодзи: вкладки пилюлями, поле поиска видно, клетки с подсветкой */
+:root[data-skin='adequate'] .picker .tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 8px 4px;
+  flex-wrap: wrap;
+}
+:root[data-skin='adequate'] .picker .tabs button {
+  padding: 4px 10px;
+  border-radius: 999px;
+  color: var(--fg-dim);
+  font-size: var(--text-xs);
+}
+:root[data-skin='adequate'] .picker .tabs button:hover {
+  background: var(--lift);
+  color: var(--fg-hi);
+}
+:root[data-skin='adequate'] .picker .tabs button[aria-current='true'],
+:root[data-skin='adequate'] .picker .tabs button.on {
+  background: var(--inv-bg);
+  color: var(--inv-fg);
+  font-weight: 620;
+}
+:root[data-skin='adequate'] .picker input {
+  margin: 4px 8px 6px;
+  padding: 7px 10px;
+  width: calc(100% - 16px);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--bg);
+  color: var(--fg);
+}
+:root[data-skin='adequate'] .picker input::placeholder {
+  color: var(--fg-faint);
+}
+:root[data-skin='adequate'] .picker .grid {
+  padding: 4px 8px 10px;
+  gap: 2px;
+}
+:root[data-skin='adequate'] .picker .cell {
+  border-radius: var(--radius-sm);
+}
+:root[data-skin='adequate'] .picker .cell:hover {
+  background: var(--lift-2);
+}
+:root[data-skin='adequate'] .picker .hint {
+  padding: 4px 10px 10px;
+  color: var(--fg-dimmer);
+  font-size: var(--text-sm);
+}
+
+/* Ссылка на ветку не подчёркивается: это кнопка, а не текст в ссылке */
+:root[data-skin='adequate'] button.thread {
+  text-decoration: none;
+}
+
 /* Звонок: кнопки выглядят кнопками, плитки со скруглением */
 :root[data-skin='adequate'] .call header button {
   padding: 4px 11px;
@@ -245,6 +426,21 @@
 :root[data-skin='adequate'] .call header button:hover {
   border-color: var(--fg-dim);
   background: var(--lift);
+}
+:root[data-skin='adequate'] .call header {
+  gap: 8px;
+  padding: 9px 12px;
+}
+:root[data-skin='adequate'] .call header b {
+  font-weight: 620;
+}
+/* Выход помечен контрастом рамки, а не цветом: цвета в системе нет */
+:root[data-skin='adequate'] .call header button.leave {
+  border-color: var(--edge);
+  color: var(--fg-hi);
+}
+:root[data-skin='adequate'] .call .tile figcaption {
+  font-size: var(--text-sm);
 }
 :root[data-skin='adequate'] .tile {
   border-radius: var(--radius-sm);

@@ -64,11 +64,23 @@
   >
     <header>
       <span class="dot blink">◉</span>
-      <b>{session.channels.find((c) => c.id === call.channel)?.name ?? 'звонок'}</b>
-      <span class="count">{call.participants.length} в комнате</span>
+      {#if prefs.adequate}
+        <b>Идёт разговор</b>
+        <span class="count">
+          {session.channels.find((c) => c.id === call.channel)?.name ?? 'звонок'} ·
+          {call.participants.length} в комнате
+        </span>
+      {:else}
+        <b>{session.channels.find((c) => c.id === call.channel)?.name ?? 'звонок'}</b>
+        <span class="count">{call.participants.length} в комнате</span>
+      {/if}
       <span class="sp"></span>
       <button class:off={call.micMuted} onclick={() => call.toggleMic()}>
-        {call.micMuted ? 'микрофон выкл' : 'микрофон вкл'}
+        {#if prefs.adequate}
+          {call.micMuted ? 'Включить микрофон' : 'Микрофон'}
+        {:else}
+          {call.micMuted ? 'микрофон выкл' : 'микрофон вкл'}
+        {/if}
       </button>
       <!-- Своего голоса в звонке не слышно: эхоподавление на то и стоит.
            Полоска рядом с кнопкой — единственный способ увидеть, что звук
@@ -82,10 +94,18 @@
         <i style="transform: scaleX({call.micMuted ? 0 : call.level})"></i>
       </span>
       <button class:off={!call.camOn} onclick={() => call.toggleCamera()}>
-        {call.camOn ? 'камера вкл' : 'камера выкл'}
+        {#if prefs.adequate}
+          {call.camOn ? 'Камера' : 'Включить камеру'}
+        {:else}
+          {call.camOn ? 'камера вкл' : 'камера выкл'}
+        {/if}
       </button>
       <button class:off={!call.screenOn} onclick={() => call.toggleScreen()}>
-        {call.screenOn ? 'экран вкл' : 'экран выкл'}
+        {#if prefs.adequate}
+          {call.screenOn ? 'Экран' : 'Показать экран'}
+        {:else}
+          {call.screenOn ? 'экран вкл' : 'экран выкл'}
+        {/if}
       </button>
       {#if call.screenOn && call.screenAudioAvailable}
         <button class:off={!call.screenAudio} onclick={() => call.toggleScreenAudio()}>
@@ -102,17 +122,27 @@
       {/if}
       {#if hasScreen}
         <button class:off={!call.screenOnly} onclick={() => call.toggleScreenOnly()}>
-          только экран
+          {prefs.adequate ? 'Только экран' : 'только экран'}
         </button>
         <button onclick={() => call.toggleFullscreen()}>
-          {call.fullscreen ? 'из полного экрана' : 'во весь экран'}
+          {#if prefs.adequate}
+            {call.fullscreen ? 'Из полного экрана' : 'Во весь экран'}
+          {:else}
+            {call.fullscreen ? 'из полного экрана' : 'во весь экран'}
+          {/if}
         </button>
       {/if}
       <button onclick={() => call.toggleExpanded()}>
-        {call.expanded ? 'свернуть' : 'развернуть'}
+        {#if prefs.adequate}
+          {call.expanded ? 'Свернуть' : 'Развернуть'}
+        {:else}
+          {call.expanded ? 'свернуть' : 'развернуть'}
+        {/if}
       </button>
       {#if call.expanded && !call.fullscreen}<span class="tip">Esc — свернуть</span>{/if}
-      <button class="leave" onclick={() => call.leave()}>выйти [^E]</button>
+      <button class="leave" onclick={() => call.leave()}>
+        {prefs.adequate ? 'Выйти' : 'выйти [^E]'}
+      </button>
     </header>
 
     <PlayerPanel />
@@ -212,7 +242,11 @@
               {call.screenOnly ? 'показать всех' : 'только экран'}
             </button>
             <button onclick={() => call.toggleFullscreen()}>
-              {call.fullscreen ? 'из полного экрана' : 'во весь экран'}
+              {#if prefs.adequate}
+                {call.fullscreen ? 'Из полного экрана' : 'Во весь экран'}
+              {:else}
+                {call.fullscreen ? 'из полного экрана' : 'во весь экран'}
+              {/if}
             </button>
           </div>
           <figcaption>{nick(sharer)} · экран · двойной щелчок — во весь экран</figcaption>

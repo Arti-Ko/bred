@@ -87,6 +87,23 @@ const SPACES = [
   { id: id('dmtimur'), name: 'тимур лаас', unread: 2, direct: MEMBERS[1].id },
 ];
 
+/** Ответы в ветке третьего сообщения — для снимков и для проверки вёрстки. */
+const THREAD = [
+  MESSAGES[2],
+  message('t1', 1, 'Собрал на своей: в простое 3% вместо сорока. Тикер и правда крутился.', {
+    ts: base + 200_000,
+    lamport: 10,
+  }),
+  message('t2', 2, 'У меня 4К-монитор, проверю вечером на нём — там было хуже всего.', {
+    ts: base + 260_000,
+    lamport: 11,
+  }),
+  message('t3', 0, 'Тогда я заливаю фикс в ветку, а замеры добьём после.', {
+    ts: base + 320_000,
+    lamport: 12,
+  }),
+];
+
 const HANDLERS: Record<string, (args: Args) => unknown> = {
   bootstrap: () => ({
     me: ME,
@@ -98,7 +115,9 @@ const HANDLERS: Record<string, (args: Args) => unknown> = {
   list_spaces: () => SPACES,
   list_channels: () => CHANNELS,
   list_messages: (args) => (args.before ? [] : MESSAGES),
-  list_thread: () => [],
+  // Ветка у третьего сообщения: снимки должны показывать её с содержимым,
+  // а не пустой колонкой.
+  list_thread: () => THREAD,
   list_members: () => MEMBERS,
   list_emojis: () => [],
   voice_map: () => [
