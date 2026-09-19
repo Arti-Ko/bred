@@ -5,6 +5,9 @@
 
 const STORAGE_KEY = 'bred.prefs';
 
+/** Игры, победа в любой из которых открывает адекватный режим. */
+export type Trophy = 'крестики' | 'шашки' | 'гундир';
+
 interface Stored {
   colorVideo: boolean;
   /** Звук при входящем сообщении. */
@@ -13,6 +16,10 @@ interface Stored {
   volumes: Record<string, number>;
   /** Громкость общего плеера у себя, 1 — как есть. */
   musicVolume: number;
+  /** Включён ли адекватный режим. */
+  adequate: boolean;
+  /** Что уже пройдено. Непустой список — замок открыт. */
+  trophies: Trophy[];
 }
 
 const DEFAULTS: Stored = {
@@ -20,6 +27,8 @@ const DEFAULTS: Stored = {
   soundOnMessage: true,
   volumes: {},
   musicVolume: 0.7,
+  adequate: false,
+  trophies: [],
 };
 
 function load(): Stored {
@@ -65,6 +74,34 @@ export class Prefs {
    */
   soundOnMessage = $state(load().soundOnMessage);
 
+  /**
+   * Другое оформление — то самое, за которым идут в настройки со словами
+   * «сделайте уже адекватный дизайн».
+   *
+   * Просто так не включается: его сперва надо выиграть.
+   */
+  adequate = $state(load().adequate);
+
+  /** Победы. Первая же открывает замок, остальные — для коллекции. */
+  trophies = $state<Trophy[]>(load().trophies);
+
+  get unlocked(): boolean {
+    return this.trophies.length > 0;
+  }
+
+  /** Записать победу и сразу включить то, ради чего играли. */
+  win(trophy: Trophy): void {
+    if (!this.trophies.includes(trophy)) this.trophies = [...this.trophies, trophy];
+    this.adequate = true;
+    this.#save();
+  }
+
+  toggleAdequate(): void {
+    if (!this.unlocked) return; // замок открывается победой, а не кнопкой
+    this.adequate = !this.adequate;
+    this.#save();
+  }
+
   toggleSoundOnMessage(): void {
     this.soundOnMessage = !this.soundOnMessage;
     this.#save();
@@ -94,6 +131,8 @@ export class Prefs {
           soundOnMessage: this.soundOnMessage,
           volumes: this.volumes,
           musicVolume: this.musicVolume,
+          adequate: this.adequate,
+          trophies: this.trophies,
         }),
       );
     } catch {

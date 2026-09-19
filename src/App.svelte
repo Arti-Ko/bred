@@ -8,7 +8,9 @@
   import Settings from './lib/components/Settings.svelte';
   import ThreadPanel from './lib/components/ThreadPanel.svelte';
   import { call } from './lib/stores/call.svelte';
+  import { prefs } from './lib/stores/prefs.svelte';
   import { session } from './lib/stores/session.svelte';
+  import type { Component } from 'svelte';
 
   let draft = $state('');
   let input: HTMLInputElement | undefined = $state();
@@ -18,10 +20,38 @@
   let lastTyping = 0;
   let pickerOpen = $state(false);
   let settingsOpen = $state(false);
+  /**
+   * Зал с играми грузится по требованию: три игры с ботами — это заметный
+   * кусок кода, и в мессенджере, который открыли ради переписки, он не нужен.
+   */
+  let arcade = $state<Component<{ onclose: () => void }> | null>(null);
+  let arcadeOpen = $state(false);
 
   $effect(() => {
     void session.init();
   });
+
+  // Оформление — одно на весь документ: компоненты читают токены, а не флаг.
+  $effect(() => {
+    document.documentElement.dataset.skin = prefs.adequate ? 'adequate' : 'terminal';
+  });
+
+  async function openArcade(): Promise<void> {
+    if (!arcade) {
+      arcade = (await import('./lib/games/Arcade.svelte')).default as Component<{
+        onclose: () => void;
+      }>;
+    }
+    // Настройки уходят: игра занимает весь экран, а Esc должен вести в зал,
+    // а не закрывать то, что под ним.
+    settingsOpen = false;
+    arcadeOpen = true;
+  }
+
+  function closeArcade(): void {
+    arcadeOpen = false;
+    settingsOpen = true; // вернулись ровно туда, откуда уходили
+  }
 
   function submit() {
     const text = draft.trim();
@@ -73,6 +103,9 @@
 
   /** Горячие клавиши приложения. Всё, что делается мышью, делается и с клавиатуры. */
   function onGlobalKey(event: KeyboardEvent) {
+    // Пока открыт зал, клавиатура принадлежит игре: иначе `Ctrl+E` посреди боя
+    // выходит из звонка, а `Ctrl+I` кладёт в буфер приглашение.
+    if (arcadeOpen) return;
     const mod = event.ctrlKey || event.metaKey;
     if (mod && event.key.toLowerCase() === 'k') {
       event.preventDefault();
@@ -121,7 +154,12 @@
 <svelte:window onkeydown={onGlobalKey} />
 
 {#if settingsOpen}
-  <Settings onclose={() => (settingsOpen = false)} />
+  <Settings onclose={() => (settingsOpen = false)} onarcade={openArcade} />
+{/if}
+
+{#if arcadeOpen && arcade}
+  {@const Arcade = arcade}
+  <Arcade onclose={closeArcade} />
 {/if}
 
 <div class="term">

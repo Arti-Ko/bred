@@ -8,7 +8,8 @@
     "build": "svelte-check --tsconfig ./tsconfig.json && vite build",
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test:games": "tsc tools/games-selftest.ts --outDir node_modules/.cache/games --module commonjs --target es2022 --moduleResolution node --skipLibCheck --strict && node node_modules/.cache/games/tools/games-selftest.js"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

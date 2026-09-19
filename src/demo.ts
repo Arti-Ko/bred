@@ -177,11 +177,34 @@ function fakeScreenshot(): string {
 };
 
 void import('./main').then(async () => {
-  // Режим снимка задаётся якорем: #call — панель звонка, иначе обычная лента.
-  if (location.hash === '#call') {
+  // Режим снимка задаётся якорем:
+  //   #call        — панель звонка
+  //   #адекватный  — второе оформление интерфейса
+  //   #зал         — зал с играми, он же замок от него
+  //   #крестики | #шашки | #гундир — сразу нужная игра
+  const mode = decodeURIComponent(location.hash.slice(1));
+
+  if (mode === 'call') {
     const { session } = await import('./lib/stores/session.svelte');
     await new Promise((r) => setTimeout(r, 600));
     const voice = session.channels.find((c) => c.voice);
     if (voice) await session.joinVoice(voice.id, true);
+    return;
+  }
+
+  if (mode === 'адекватный') {
+    // Только вид: трофеи настоящего человека снимок не подделывает.
+    document.documentElement.dataset.skin = 'adequate';
+    return;
+  }
+
+  const rooms = ['зал', 'крестики', 'шашки', 'гундир'];
+  if (rooms.includes(mode)) {
+    const { mount } = await import('svelte');
+    const Arcade = (await import('./lib/games/Arcade.svelte')).default;
+    mount(Arcade, {
+      target: document.body,
+      props: { onclose: () => undefined, start: mode as 'зал' },
+    });
   }
 });

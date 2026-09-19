@@ -19,9 +19,11 @@
 
   interface Props {
     onclose: () => void;
+    /** Открыть зал с играми — он же замок от адекватного режима. */
+    onarcade: () => void;
   }
 
-  const { onclose }: Props = $props();
+  const { onclose, onarcade }: Props = $props();
 
   $effect(() => {
     void updates.init();
@@ -172,6 +174,28 @@
 
     {#if updates.error}
       <div class="row"><span class="k">ошибка</span><span class="v">{updates.error}</span></div>
+    {/if}
+
+    <div class="group">оформление</div>
+    <div class="row">
+      <span class="k">дизайн</span>
+      <button class="act" onclick={onarcade}>адекватный дизайн</button>
+      <span class="hint">
+        {#if prefs.unlocked}
+          {prefs.adequate ? 'включён' : 'выключен'} — переключается там же, где открывался
+        {:else}
+          да, кнопка есть. нет, просто так не включится
+        {/if}
+      </span>
+    </div>
+    {#if prefs.unlocked}
+      <div class="row">
+        <span class="k">режим</span>
+        <button class="act" onclick={() => prefs.toggleAdequate()}>
+          {prefs.adequate ? 'адекватный' : 'терминал'}
+        </button>
+        <span class="hint">трофеев: {prefs.trophies.length} из 3</span>
+      </div>
     {/if}
 
     <div class="group">пространство</div>
