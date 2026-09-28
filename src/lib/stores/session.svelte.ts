@@ -168,6 +168,27 @@ export class Session {
       .map(([who]) => this.members.find((m) => m.id === who)?.nick ?? who.slice(0, 8));
   }
 
+  /**
+   * Что со связью — человеческими словами.
+   *
+   * Раньше состояний было два: «сеть: p2p» и «поднимается», и второе означало
+   * что угодно — от «ещё пара секунд» до «ваш туннель съел разрешение имён, и
+   * никто никогда не появится». Человек должен видеть, что именно сломано, и
+   * понимать, чинить это ему или ждать.
+   */
+  get link(): { text: string; trouble: boolean } {
+    if (this.neighbors > 0) {
+      return { text: `на связи · соседей ${this.neighbors}`, trouble: false };
+    }
+    if (!this.online) {
+      return { text: 'нет выхода наружу — работает только локальная сеть', trouble: true };
+    }
+    if (!this.relay && !this.external) {
+      return { text: 'не вижу ретранслятор — проверьте сеть', trouble: true };
+    }
+    return { text: 'ищем соседей', trouble: false };
+  }
+
   get unreadTotal(): number {
     return this.channels.reduce((sum, c) => sum + c.unread, 0);
   }

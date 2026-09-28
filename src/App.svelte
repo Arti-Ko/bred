@@ -202,7 +202,7 @@
       </button>
     {/each}
     <span class="sp"></span>
-    <span class="meta">{session.online ? 'сеть: p2p' : 'сеть: поднимается'}</span>
+    <span class="meta" class:warn={session.link.trouble}>{session.link.text}</span>
     <button class="gear" onclick={() => (settingsOpen = true)} title="настройки [^,]">⚙</button>
   </header>
 
@@ -339,6 +339,12 @@
   }
   .gear:hover {
     color: var(--fg-hi);
+  }
+
+  /* Поломка связи — светлее остального: её надо заметить, не вглядываясь */
+  .meta.warn {
+    color: var(--fg);
+    font-weight: 700;
   }
 
   .meta {

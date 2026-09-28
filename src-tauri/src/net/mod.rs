@@ -81,6 +81,12 @@ const REJOIN_MAX: Duration = Duration::from_secs(6);
 /// «печатает» в никуда.
 const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 
+/// Через сколько кругов сверки обходим всех известных, а не только соседей.
+///
+/// Соседей по рою мало и они меняются; знакомых больше, и среди них почти
+/// всегда есть кто-то, у кого нужное событие уже есть.
+const POSTMAN_EVERY: u32 = 6;
+
 /// Как часто напоминаем о себе соседям по пространству.
 ///
 /// Раньше было десять секунд, и столько же человек смотрел на список, где
@@ -133,6 +139,19 @@ impl Net {
             // собой ретранслятор, поиск соседей и, следом, всю связь.
             .dns_resolver(dns::resolver(ctx.store.clone()))
             .address_lookup(lookup.clone());
+
+        // Второй каталог адресов — распределённая таблица Mainline, та самая, в
+        // которой двадцать лет живут торренты. Она не принадлежит никому: её
+        // нельзя выключить и нельзя заблокировать целиком, в отличие от одного
+        // чужого домена, на котором мы висели до сих пор. Работает рядом с
+        // прежним поиском, а не вместо: чей ответ придёт первым, тот и годится.
+        match iroh_mainline_address_lookup::DhtAddressLookup::builder()
+            .secret_key(ctx.identity.secret().clone())
+            .build()
+        {
+            Ok(dht) => builder = builder.address_lookup(dht),
+            Err(err) => tracing::warn!(%err, "распределённый каталог адресов недоступен"),
+        }
 
         // Режим «как будто мы в разных сетях»: прямые пути отключены, всё идёт
         // через ретранслятор. Нужен для проверок: на одной машине прямой путь
@@ -763,9 +782,35 @@ impl Net {
                     if changed {
                         *self.addr_bytes.write() = raw;
                         let _ = self.ctx.notices.send(Notice::Net);
+                        // Адрес сменился — значит сменилась сеть: ноутбук
+                        // проснулся, переехали на другой Wi-Fi, поднялся или
+                        // упал туннель. Ждать очередного круга опроса здесь
+                        // нельзя: старые соединения уже мертвы, а новые сами
+                        // не заведутся.
+                        self.clone().after_network_change();
                     }
                 }
             }
+        });
+    }
+
+    /// Сеть под ногами поменялась: бросаем мёртвые соединения и зовём соседей.
+    ///
+    /// Соединения досинхронизации переживают смену сети только на бумаге: путь
+    /// до собеседника изменился, а они об этом узнают по таймауту — минутами.
+    /// Дешевле выбросить их сразу.
+    fn after_network_change(self: Arc<Self>) {
+        tokio::spawn(async move {
+            for (_, connection) in self.sync_pool.lock().drain() {
+                connection.close(0u32.into(), "сменилась сеть".as_bytes());
+            }
+            self.rejoin_lonely_spaces().await;
+            for space in self.ctx.space_list() {
+                for peer in self.known_ids(space.id) {
+                    self.clone().catch_up(space.id, peer);
+                }
+            }
+            let _ = self.ctx.notices.send(Notice::Net);
         });
     }
 
@@ -857,9 +902,17 @@ impl Net {
     fn keep_history_in_sync(self: Arc<Self>) {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(SYNC_INTERVAL);
+            let mut rounds: u32 = 0;
             ticker.tick().await; // первый тик приходит сразу, он не нужен
             loop {
                 ticker.tick().await;
+                rounds = rounds.wrapping_add(1);
+                // Раз в полминуты спрашиваем всех, кого знаем, а не только
+                // соседей по рою. Это и есть почтальон: событие, которое не
+                // дошло до человека напрямую, доезжает через любого, кто
+                // сейчас в сети и уже его получил.
+                let postman = rounds.is_multiple_of(POSTMAN_EVERY);
+
                 for space in self.ctx.space_list() {
                     let mut peers: Vec<_> = self
                         .neighbors
@@ -867,6 +920,13 @@ impl Net {
                         .get(&space.id)
                         .map(|set| set.iter().copied().collect())
                         .unwrap_or_default();
+                    if postman {
+                        for peer in self.known_ids(space.id) {
+                            if !peers.contains(&peer) {
+                                peers.push(peer);
+                            }
+                        }
+                    }
                     // Список соседей ведёт рой, и на нём же он спотыкается:
                     // после переподписки или короткого обрыва набор пустеет,
                     // хотя связь с людьми никуда не делась. Сверять в такую

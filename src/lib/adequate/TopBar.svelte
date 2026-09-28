@@ -89,6 +89,8 @@
     {/if}
   </label>
 
+  <span class="link" class:trouble={session.link.trouble}>{session.link.text}</span>
+
   <span class="sp"></span>
 
   <button class="btn primary" onclick={oninvite} disabled={!session.spaceId}>
@@ -233,6 +235,18 @@
   }
   .clear:hover {
     color: var(--fg-hi);
+  }
+
+  .link {
+    color: var(--fg-dimmer);
+    font-size: var(--text-sm);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .link.trouble {
+    color: var(--fg-hi);
+    font-weight: 600;
   }
 
   .sp {
