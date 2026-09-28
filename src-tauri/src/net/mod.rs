@@ -11,6 +11,7 @@
 
 pub mod blobs;
 pub mod ctx;
+pub mod dns;
 mod lan;
 pub mod media;
 pub mod sync;
@@ -127,6 +128,10 @@ impl Net {
         let lookup = MemoryLookup::new();
         let mut builder = Endpoint::builder(presets::N0)
             .secret_key(ctx.identity.secret().clone())
+            // Своё разрешение имён: по умолчанию оно идёт голым UDP мимо системы,
+            // и в сетях с туннелями и фильтрами отваливается первым, унося с
+            // собой ретранслятор, поиск соседей и, следом, всю связь.
+            .dns_resolver(dns::resolver(ctx.store.clone()))
             .address_lookup(lookup.clone());
 
         // Режим «как будто мы в разных сетях»: прямые пути отключены, всё идёт

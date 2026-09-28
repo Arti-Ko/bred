@@ -79,6 +79,16 @@ CREATE TABLE IF NOT EXISTS peers (
     PRIMARY KEY (id, space)
 );
 
+-- Последние удачно разрешённые адреса имён. Нужны, когда DNS лёг: без
+-- ретранслятора связь не поднимается совсем, а его адрес меняется редко.
+CREATE TABLE IF NOT EXISTS hosts (
+    host    TEXT NOT NULL,
+    family  INTEGER NOT NULL,
+    addrs   TEXT NOT NULL,
+    at      INTEGER NOT NULL,
+    PRIMARY KEY (host, family)
+);
+
 -- Описания вложений едут в событии, сами байты — по требованию.
 CREATE TABLE IF NOT EXISTS attachments (
     message BLOB NOT NULL,

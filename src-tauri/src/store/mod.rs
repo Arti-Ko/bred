@@ -524,6 +524,45 @@ impl Store {
         Ok(rows)
     }
 
+    // ── адреса имён ─────────────────────────────────────────────────────────
+
+    /// Запомнить, во что разрешилось имя. `family` — 4 или 6.
+    pub fn remember_host(&self, host: &str, family: u8, addrs: &[String]) -> Result<()> {
+        if addrs.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO hosts(host, family, addrs, at) VALUES(?1, ?2, ?3, ?4)
+             ON CONFLICT(host, family) DO UPDATE SET addrs = excluded.addrs, at = excluded.at",
+            params![
+                host,
+                family as i64,
+                addrs.join(","),
+                crate::domain::now_ms()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Последние известные адреса имени. Пусто — значит спрашивать было не у кого.
+    pub fn known_host(&self, host: &str, family: u8) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let found: Option<String> = conn
+            .query_row(
+                "SELECT addrs FROM hosts WHERE host = ?1 AND family = ?2",
+                params![host, family as i64],
+                |row| row.get(0),
+            )
+            .ok();
+        Ok(found
+            .unwrap_or_default()
+            .split(',')
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect())
+    }
+
     // ── вложения ────────────────────────────────────────────────────────────
 
     /// Отметить, что байты вложения лежат у нас по указанному пути.
@@ -965,5 +1004,57 @@ mod tests {
             .remember_peer_seen(SPACE, PEER, "", Some(&[2]))
             .unwrap();
         assert_eq!(store.known_peers(SPACE).unwrap()[0].1, Some(vec![2]));
+    }
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+
+    #[test]
+    fn last_known_address_survives_for_next_time() {
+        let store = Store::in_memory().unwrap();
+        store
+            .remember_host("euc1-1.relay.n0.iroh.link.", 4, &["91.99.237.97".into()])
+            .unwrap();
+        assert_eq!(
+            store.known_host("euc1-1.relay.n0.iroh.link.", 4).unwrap(),
+            vec!["91.99.237.97".to_string()],
+            "адрес ретранслятора обязан пережить падение DNS"
+        );
+    }
+
+    #[test]
+    fn unknown_host_is_empty_not_an_error() {
+        let store = Store::in_memory().unwrap();
+        assert!(store.known_host("нет.такого.имени.", 4).unwrap().is_empty());
+    }
+
+    #[test]
+    fn newer_answer_replaces_the_old_one() {
+        let store = Store::in_memory().unwrap();
+        store
+            .remember_host("relay.", 4, &["1.1.1.1".into()])
+            .unwrap();
+        store
+            .remember_host("relay.", 4, &["2.2.2.2".into(), "3.3.3.3".into()])
+            .unwrap();
+        assert_eq!(
+            store.known_host("relay.", 4).unwrap(),
+            vec!["2.2.2.2".to_string(), "3.3.3.3".to_string()]
+        );
+    }
+
+    #[test]
+    fn empty_answer_does_not_erase_what_we_had() {
+        let store = Store::in_memory().unwrap();
+        store
+            .remember_host("relay.", 4, &["1.1.1.1".into()])
+            .unwrap();
+        store.remember_host("relay.", 4, &[]).unwrap();
+        assert_eq!(
+            store.known_host("relay.", 4).unwrap(),
+            vec!["1.1.1.1".to_string()]
+        );
     }
 }
