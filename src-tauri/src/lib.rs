@@ -7,9 +7,13 @@ pub mod app;
 pub mod audio;
 pub mod commands;
 pub mod domain;
+pub mod http;
 pub mod identity;
+pub mod logs;
 pub mod net;
+pub mod news;
 pub mod player;
+pub mod report;
 pub mod store;
 
 use serde::Serialize;
@@ -90,6 +94,11 @@ enum UiNotice {
         from: Id,
         id: String,
     },
+    News {
+        version: String,
+        title: String,
+    },
+    NewsFeed,
 }
 
 impl From<Notice> for UiNotice {
@@ -145,6 +154,8 @@ impl From<Notice> for UiNotice {
                 from,
                 id: id.to_string(),
             },
+            Notice::News { version, title } => UiNotice::News { version, title },
+            Notice::NewsFeed => UiNotice::NewsFeed,
         }
     }
 }
@@ -170,6 +181,8 @@ fn start_core(handle: &tauri::AppHandle) -> anyhow::Result<()> {
         // Уборка при запуске: файлы могли осиротеть, пока приложение
         // было закрыто (например, автор удалил сообщение).
         let janitor = application.clone();
+        // Канал «Обновления БРЕД»: заглядываем в релизы, пока приложение открыто.
+        application.news.watch();
         handle.manage(application);
         tauri::async_runtime::spawn(async move {
             if let Err(err) = janitor.collect_garbage().await {
@@ -202,6 +215,9 @@ pub fn run() {
             tracing_subscriber::EnvFilter::try_from_env("BRED_LOG")
                 .unwrap_or_else(|_| "bred=info,iroh=warn".into()),
         )
+        // Журнал идёт и в терминал, и в хвост в памяти — его можно приложить
+        // к отчёту о проблеме одной галочкой.
+        .with_writer(logs::Tee)
         .init();
 
     let builder = tauri::Builder::default()
@@ -287,6 +303,12 @@ pub fn run() {
             commands::call_state,
             commands::ring,
             commands::account_info,
+            commands::report_info,
+            commands::report_files,
+            commands::send_report,
+            commands::news_feed,
+            commands::news_read,
+            commands::news_refresh,
             commands::voice_map,
             commands::send_media,
             commands::music_sources,

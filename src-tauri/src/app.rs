@@ -52,6 +52,16 @@ struct OwnRing {
     targets: Vec<Id>,
 }
 
+/// Форма отчёта о проблеме: что о ней знает ядро.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReportInfo {
+    /// Зашит ли в эту сборку ключ бота.
+    pub configured: bool,
+    /// Номер человека, вида `4829-1305`, — по нему ищутся его отчёты.
+    pub number: String,
+    pub kinds: Vec<crate::report::format::Kind>,
+}
+
 /// Аккаунт для интерфейса: кто я и какие у меня устройства.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AccountInfo {
@@ -94,6 +104,10 @@ pub struct App {
     ring: parking_lot::Mutex<Option<OwnRing>>,
     /// Аккаунт, к которому привязано это устройство. См. `domain::account`.
     pub account: Account,
+    /// Отчёты о проблемах — в Telegram разработчика.
+    reporter: crate::report::Reporter,
+    /// Канал «Обновления БРЕД» — посты из релизов GitHub.
+    pub news: Arc<crate::news::News>,
 }
 
 impl App {
@@ -120,6 +134,7 @@ impl App {
             .join("blobs");
         let dh = crate::identity::load_or_create_dh(&store)?;
         let audio = AudioEngine::new(tx.clone());
+        let news = crate::news::News::new(store.clone(), tx.clone());
         let ctx = Arc::new(Ctx::new(
             store.clone(),
             identity,
@@ -162,6 +177,8 @@ impl App {
                 audio,
                 ring: parking_lot::Mutex::new(None),
                 account,
+                reporter: crate::report::Reporter::new(),
+                news,
             }),
             rx,
         ))
@@ -312,6 +329,53 @@ impl App {
 
     pub fn me(&self) -> Id {
         self.ctx.identity.id()
+    }
+
+    /// Что показать в форме отчёта: настроена ли отправка, номер человека и
+    /// виды проблем.
+    pub fn report_info(&self) -> ReportInfo {
+        ReportInfo {
+            configured: crate::report::configured(),
+            number: crate::report::format::user_number(self.account.id()),
+            kinds: crate::report::format::KINDS.to_vec(),
+        }
+    }
+
+    /// Отправить отчёт о проблеме. Возвращает его номер.
+    pub async fn send_report(
+        &self,
+        draft: crate::report::Draft,
+        sent_at: String,
+    ) -> Result<String> {
+        let network = {
+            let relay = self.net.relay_now();
+            let neighbors = self.net.neighbor_count();
+            let call = self
+                .net
+                .media()
+                .active()
+                .map(|_| {
+                    format!(
+                        " · в звонке, на связи {} из {}",
+                        self.net.media().connected().len(),
+                        self.net.media().participants().len().saturating_sub(1)
+                    )
+                })
+                .unwrap_or_default();
+            match relay {
+                Some(url) => format!("соседей {neighbors} · ретранслятор {url}{call}"),
+                None => format!("соседей {neighbors} · ретранслятора нет{call}"),
+            }
+        };
+        let context = crate::report::Context {
+            nick: self.nick(),
+            account: self.account.id(),
+            device: self.me(),
+            network,
+            log: draft.with_log.then(crate::logs::snapshot),
+            sent_at,
+        };
+        self.reporter.send(draft, context).await
     }
 
     /// Аккаунт и его устройства — для экрана «мои устройства».

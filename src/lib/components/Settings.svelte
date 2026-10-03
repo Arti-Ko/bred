@@ -2,6 +2,8 @@
   import { session } from '../stores/session.svelte';
   import { prefs } from '../stores/prefs.svelte';
   import { updates } from '../stores/updates.svelte';
+  import { news } from '../stores/news.svelte';
+  import { report } from '../stores/report.svelte';
   import { previewUrl } from '../previews';
 
   /** Своя картинка профиля: человек должен видеть, как его увидят другие. */
@@ -175,6 +177,18 @@
     {#if updates.error}
       <div class="row"><span class="k">ошибка</span><span class="v">{updates.error}</span></div>
     {/if}
+
+    <div class="group">помощь</div>
+    <div class="row">
+      <span class="k">проблема</span>
+      <button class="act" onclick={() => report.show()}>сообщить о проблеме</button>
+      <span class="hint">описание, фото или видео — разработчику в telegram · /баг</span>
+    </div>
+    <div class="row">
+      <span class="k">выпуски</span>
+      <button class="act" onclick={() => { void news.show(); onclose(); }}>обновления бреда</button>
+      <span class="hint">что нового в каждой версии · /обновления</span>
+    </div>
 
     <div class="group">оформление</div>
     <div class="row">

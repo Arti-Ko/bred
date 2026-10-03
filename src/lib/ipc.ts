@@ -131,7 +131,11 @@ export type Notice =
   /** Нас зовут в голосовую комнату. Номер зова — строкой: u64 в JS не влезает. */
   | { kind: 'ring'; space: Id; channel: Id; from: Id; nick: string; id: string }
   /** Звонящий дал отбой. */
-  | { kind: 'ring-cancel'; space: Id; from: Id; id: string };
+  | { kind: 'ring-cancel'; space: Id; from: Id; id: string }
+  /** В канале обновлений новый пост: вышла версия, которую можно поставить. */
+  | { kind: 'news'; version: string; title: string }
+  /** Лента канала обновлений изменилась. */
+  | { kind: 'news-feed' };
 
 /** Приложение, чей звук можно включить на комнату. */
 export interface MusicSource {
@@ -209,6 +213,14 @@ export const api = {
   musicStart: (source: string) => invoke<void>('music_start', { source }),
   musicStop: () => invoke<void>('music_stop'),
   accountInfo: () => invoke<AccountInfo>('account_info'),
+  reportInfo: () => invoke<ReportInfo>('report_info'),
+  reportFiles: (paths: string[]) => invoke<ReportFile[]>('report_files', { paths }),
+  /** Отправить отчёт. Ответ — его номер, по нему он находится в чате. */
+  sendReport: (draft: ReportDraft, sentAt: string) =>
+    invoke<string>('send_report', { draft, sentAt }),
+  newsFeed: () => invoke<NewsFeed>('news_feed'),
+  newsRead: () => invoke<void>('news_read'),
+  newsRefresh: () => invoke<NewsFeed>('news_refresh'),
   /** Позвать в свою комнату: пустой список — всех. Ответ — скольких видно в сети. */
   ring: (to: Id[]) => invoke<number>('ring', { to }),
   /** Громкость собеседника у себя: сводит звук ядро, оно и крутит регулятор. */
@@ -227,6 +239,55 @@ export const api = {
   markRead: (channel: Id) => invoke<void>('mark_read', { channel }),
   typing: (space: Id, channel: Id) => invoke<void>('typing', { space, channel }),
 };
+
+/** Вид проблемы в отчёте: код и подпись. */
+export interface ReportKind {
+  code: string;
+  label: string;
+}
+
+/** Что ядро знает о форме отчёта. */
+export interface ReportInfo {
+  /** Зашит ли в эту сборку ключ бота — без него отправлять некуда. */
+  configured: boolean;
+  /** Номер человека вида 4829-1305: по нему ищутся его отчёты. */
+  number: string;
+  kinds: ReportKind[];
+}
+
+/** Вложение отчёта: как уйдёт или почему не уйдёт. */
+export interface ReportFile {
+  path: string;
+  name: string;
+  size: number;
+  kind: 'photo' | 'video' | 'document';
+  problem: string | null;
+}
+
+export interface ReportDraft {
+  kind: string;
+  title: string;
+  body: string;
+  files: string[];
+  with_log: boolean;
+}
+
+/** Пост канала «Обновления БРЕД» — один выпуск. */
+export interface NewsPost {
+  version: string;
+  title: string;
+  body: string;
+  published: number;
+}
+
+export interface NewsFeed {
+  /** Новые сверху. */
+  posts: NewsPost[];
+  /** До какой версии прочитано. */
+  read: string | null;
+  /** Установленная версия. */
+  current: string;
+}
 
 /** Аккаунт: несколько устройств одного человека. См. domain/account.rs в ядре. */
 export interface AccountInfo {

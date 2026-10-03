@@ -8,6 +8,10 @@
   import Settings from './lib/components/Settings.svelte';
   import ThreadPanel from './lib/components/ThreadPanel.svelte';
   import IncomingCall from './lib/components/IncomingCall.svelte';
+  import NewsPage from './lib/components/NewsPage.svelte';
+  import NewsToast from './lib/components/NewsToast.svelte';
+  import ReportForm from './lib/components/ReportForm.svelte';
+  import { news } from './lib/stores/news.svelte';
   import Shell from './lib/adequate/Shell.svelte';
   import { call } from './lib/stores/call.svelte';
   import { prefs } from './lib/stores/prefs.svelte';
@@ -31,6 +35,7 @@
 
   $effect(() => {
     void session.init();
+    void news.init();
   });
 
   // Победа в отдельном окне боя. Трофей и оформление живут в главном окне,
@@ -171,8 +176,11 @@
 
 <svelte:window onkeydown={onGlobalKey} />
 
-<!-- Зов в комнату — поверх всего и в любом оформлении -->
+<!-- Зов в комнату, отчёт о проблеме и новость о выпуске — поверх всего и в
+     любом оформлении -->
 <IncomingCall />
+<ReportForm />
+<NewsToast />
 
 {#if settingsOpen && !prefs.adequate}
   <Settings onclose={() => (settingsOpen = false)} onarcade={openArcade} />
@@ -214,8 +222,12 @@
     <ChannelPane />
     <div class="middle">
       <CallPanel />
-      <Feed />
-      <ThreadPanel />
+      {#if news.open}
+        <NewsPage />
+      {:else}
+        <Feed />
+        <ThreadPanel />
+      {/if}
     </div>
     <MembersPane />
   </div>

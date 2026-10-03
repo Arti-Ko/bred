@@ -7,7 +7,9 @@
   import Dialog from './Dialog.svelte';
   import Icon from './Icon.svelte';
   import { api, errorText } from '../ipc';
+  import { news } from '../stores/news.svelte';
   import { prefs } from '../stores/prefs.svelte';
+  import { report } from '../stores/report.svelte';
   import { session } from '../stores/session.svelte';
   import { updates } from '../stores/updates.svelte';
 
@@ -160,6 +162,24 @@
     <p class="hint-text">
       Громкость каждого собеседника — правый клик по нему в звонке.
     </p>
+  </section>
+
+  <section>
+    <h3>Помощь</h3>
+    <button class="row-btn" onclick={() => report.show()}>
+      <span class="label">
+        <b>Сообщить о проблеме</b>
+        <span>Описание, фото или видео — разработчику в Telegram</span>
+      </span>
+      <Icon name="send" size={14} />
+    </button>
+    <button class="row-btn" onclick={() => { void news.show(); onclose(); }}>
+      <span class="label">
+        <b>Обновления БРЕД</b>
+        <span>Что нового в каждой версии</span>
+      </span>
+      <Icon name="bell" size={14} />
+    </button>
   </section>
 
   <section>

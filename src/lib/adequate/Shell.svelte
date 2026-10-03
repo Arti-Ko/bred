@@ -19,6 +19,8 @@
   import ThreadPane from './ThreadPane.svelte';
   import TopBar from './TopBar.svelte';
   import Welcome from './Welcome.svelte';
+  import NewsPage from '../components/NewsPage.svelte';
+  import { news } from '../stores/news.svelte';
   import { session } from '../stores/session.svelte';
 
   interface Props {
@@ -77,7 +79,9 @@
       />
 
       <main class="middle" class:with-thread={!!session.threadRoot}>
-        <div class="feed-head">
+        <!-- У канала обновлений своя шапка: эта говорила бы «общий-канал»
+             над тем, что к нему не относится. -->
+        <div class="feed-head" class:hidden={news.open}>
           <button class="icon-btn narrow-only" onclick={() => (drawer = 'nav')} aria-label="Каналы">
             <Icon name="menu" />
           </button>
@@ -103,8 +107,13 @@
         </div>
 
         <CallPanel />
-        <Feed head={false} filter={query} avatars />
-        <Composer />
+        {#if news.open}
+          <!-- Канал обновлений — без поля ввода: писать туда нельзя -->
+          <NewsPage />
+        {:else}
+          <Feed head={false} filter={query} avatars />
+          <Composer />
+        {/if}
       </main>
 
       {#if session.threadRoot}
@@ -162,6 +171,9 @@
     min-height: 0;
   }
 
+  .feed-head.hidden {
+    display: none;
+  }
   .feed-head {
     display: flex;
     align-items: center;

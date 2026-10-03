@@ -1,5 +1,6 @@
 <script lang="ts">
   import { call } from '../stores/call.svelte';
+  import { news } from '../stores/news.svelte';
   import { session } from '../stores/session.svelte';
 </script>
 
@@ -10,6 +11,17 @@
   </div>
 
   <div class="pane-body">
+    <!-- Канал обновлений — у всех и всегда первым, заглушить его нельзя -->
+    <button
+      class="row"
+      aria-current={news.open ? 'true' : undefined}
+      onclick={() => news.show()}
+    >
+      <span class="k">~</span>
+      <span class="nm">обновления</span>
+      {#if news.unread > 0}<span class="n">{news.unread}</span>{/if}
+    </button>
+
     {#if session.directs.length > 0}
       <div class="group">личные</div>
       {#each session.directs as space (space.id)}
@@ -45,7 +57,7 @@
       {#each bucket.items as channel (channel.id)}
         <button
           class="row"
-          aria-current={channel.id === session.channelId ? 'true' : undefined}
+          aria-current={channel.id === session.channelId && !news.open ? 'true' : undefined}
           onclick={() =>
             channel.voice ? session.joinVoice(channel.id) : session.selectChannel(channel.id)}
           oncontextmenu={(event) => {

@@ -8,6 +8,7 @@
   import Avatar from './Avatar.svelte';
   import Icon from './Icon.svelte';
   import { call } from '../stores/call.svelte';
+  import { news } from '../stores/news.svelte';
   import { session } from '../stores/session.svelte';
 
   interface Props {
@@ -30,10 +31,23 @@
   </div>
 
   <div class="list">
+    <!-- Канал обновлений — у всех и всегда первым. Убрать или заглушить его
+         нельзя: о новой версии человек должен узнать в любом случае. -->
+    <button
+      class="row news"
+      class:on={news.open}
+      class:unread={news.unread > 0}
+      onclick={() => news.show()}
+    >
+      <span class="ico"><Icon name="bell" size={13} /></span>
+      <span class="nm">Обновления БРЕД</span>
+      {#if news.unread > 0}<span class="badge">{news.unread}</span>{/if}
+    </button>
+
     {#each text as channel (channel.id)}
       <button
         class="row"
-        class:on={channel.id === session.channelId}
+        class:on={channel.id === session.channelId && !news.open}
         class:unread={channel.unread > 0}
         onclick={() => session.selectChannel(channel.id)}
       >

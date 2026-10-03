@@ -30,6 +30,8 @@ import { forgetPreviews, previewUrl, shouldAutoFetch } from '../previews';
 import { forgetPrefetched, prefetchAll } from '../prefetch';
 import { chime } from '../chime';
 import { validEmojiName } from '../format';
+import { news } from './news.svelte';
+import { report } from './report.svelte';
 import { prefs } from './prefs.svelte';
 import { updates } from './updates.svelte';
 
@@ -354,6 +356,7 @@ export class Session {
   }
 
   async selectSpace(space: Id): Promise<void> {
+    news.hide();
     this.spaceId = space;
     this.channelId = null;
     this.messages = [];
@@ -370,6 +373,7 @@ export class Session {
   }
 
   async selectChannel(channel: Id): Promise<void> {
+    news.hide();
     this.channelId = channel;
     this.replyTo = null;
     this.closeThread();
@@ -386,6 +390,13 @@ export class Session {
     // способ завести первое. Ровно в эту дыру всё и упиралось.
     if (text.startsWith('/')) {
       await this.#runCommand(text);
+      return;
+    }
+
+    // Открыт канал обновлений — туда писать нельзя, а молча отправить текст в
+    // канал, которого не видно, хуже, чем отказать вслух.
+    if (news.open) {
+      this.#note('в канал «обновления» писать нельзя — это канал разработчика');
       return;
     }
 
@@ -745,11 +756,19 @@ export class Session {
           );
           break;
         }
+        case 'баг':
+        case 'bug':
+          await report.show();
+          break;
+        case 'обновления':
+        case 'news':
+          await news.show();
+          break;
         case 'помощь':
         case 'help':
           this.#note(
             'команды: /простор /канал /голос /звонок /войти /позвать [всех] /визитка ' +
-              '/лс /имя /аватар /файл /эмодзи /стикер /экран /покинуть /обновление',
+              '/лс /имя /аватар /файл /эмодзи /стикер /экран /покинуть /обновление /обновления /баг',
           );
           break;
         default:

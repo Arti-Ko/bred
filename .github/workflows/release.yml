@@ -65,19 +65,42 @@ jobs:
           cargo test --manifest-path src-tauri/Cargo.toml
           cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
+      # Заголовок и текст выпуска пишет разработчик в release-notes/<версия>.md:
+      # первая строка — заголовок («Обновление звонков 0.7»), остальное —
+      # описание. Это же становится постом в канале «Обновления БРЕД» внутри
+      # приложения, поэтому файл обязан быть: без него пост вышел бы пустым.
+      - name: Описание выпуска
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          FILE="release-notes/$VERSION.md"
+          if [ ! -f "$FILE" ]; then
+            echo "нет $FILE — опишите выпуск: первая строка заголовок, дальше текст" >&2
+            exit 1
+          fi
+          TITLE="$(head -n1 "$FILE" | sed 's/^#* *//')"
+          {
+            echo "title=$TITLE"
+            echo "body<<BRED_NOTES_EOF"
+            tail -n +2 "$FILE" | sed '/./,$!d'
+            echo "BRED_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Бот для «Сообщить о проблеме»: ключ и чат вшиваются в сборку под
+          # маской. В репозитории их нет и быть не должно — он публичный.
+          BRED_REPORT_TOKEN: ${{ secrets.BRED_REPORT_TOKEN }}
+          BRED_REPORT_CHAT: ${{ secrets.BRED_REPORT_CHAT }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: БРЕД ${{ github.ref_name }}
-          releaseBody: |
-            Мессенджер без сервера.
-
-            Скачайте файл под свою систему. Обновления дальше приезжают сами —
-            проверить вручную можно в настройках (^,).
+          releaseName: ${{ steps.notes.outputs.title }}
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: false
           prerelease: false
           args: --target ${{ matrix.target }}
@@ -106,10 +129,15 @@ jobs:
           sig() { cat "$(ls | grep -- "$1")"; }
           url() { echo "$BASE/$(ls | grep -- "$1" | sed 's/\.sig$//')"; }
 
+          # Описание выпуска — то же, что в канале обновлений: его показывает и
+          # окно «доступно обновление» в настройках.
+          NOTES="$(gh release view "$TAG" --repo "$REPO" --json name,body \
+            --jq '.name + "\n\n" + .body' | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read().strip())[1:-1])')"
+
           cat > latest.json <<JSON
           {
             "version": "$VERSION",
-            "notes": "Подробности — в описании релиза $TAG.",
+            "notes": "$NOTES",
             "pub_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
             "platforms": {
               "darwin-aarch64": {

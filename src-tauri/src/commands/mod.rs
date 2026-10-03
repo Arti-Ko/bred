@@ -279,6 +279,50 @@ pub async fn leave_call(app: State<'_, Arc<App>>) -> Answer<()> {
     app.inner().leave_call().await.map_err(fail)
 }
 
+/// Форма отчёта о проблеме: настроена ли отправка, номер человека, виды проблем.
+#[tauri::command]
+pub fn report_info(app: State<'_, Arc<App>>) -> Answer<crate::app::ReportInfo> {
+    Ok(app.report_info())
+}
+
+/// Как уйдут выбранные файлы — или почему не уйдут.
+#[tauri::command]
+pub fn report_files(paths: Vec<String>) -> Answer<Vec<crate::report::FileInfo>> {
+    Ok(paths
+        .iter()
+        .map(|path| crate::report::inspect(std::path::Path::new(path)))
+        .collect())
+}
+
+/// Отправить отчёт. `sent_at` — время по часам человека: часовой пояс знает он.
+#[tauri::command]
+pub async fn send_report(
+    app: State<'_, Arc<App>>,
+    draft: crate::report::Draft,
+    sent_at: String,
+) -> Answer<String> {
+    app.send_report(draft, sent_at).await.map_err(fail)
+}
+
+/// Канал «Обновления БРЕД»: посты, отметка прочитанного, установленная версия.
+#[tauri::command]
+pub fn news_feed(app: State<'_, Arc<App>>) -> Answer<crate::news::Feed> {
+    Ok(app.news.feed())
+}
+
+/// Канал открыли — всё в нём прочитано.
+#[tauri::command]
+pub fn news_read(app: State<'_, Arc<App>>) -> Answer<()> {
+    app.news.mark_read().map_err(fail)
+}
+
+/// Заглянуть в релизы прямо сейчас, не дожидаясь очередного круга.
+#[tauri::command]
+pub async fn news_refresh(app: State<'_, Arc<App>>) -> Answer<crate::news::Feed> {
+    app.news.refresh().await.map_err(fail)?;
+    Ok(app.news.feed())
+}
+
 /// Аккаунт и его устройства.
 #[tauri::command]
 pub fn account_info(app: State<'_, Arc<App>>) -> Answer<crate::app::AccountInfo> {
