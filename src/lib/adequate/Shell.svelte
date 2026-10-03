@@ -32,6 +32,20 @@
 
   let dialog = $state<Kind | null>(null);
   let query = $state('');
+  /**
+   * Выдвижная панель на узком экране — телефон или узкое окно.
+   *
+   * Раньше на такой ширине список каналов просто пропадал, и переключиться
+   * между ними было нечем. Теперь он выезжает по кнопке, как в любом
+   * мобильном мессенджере.
+   */
+  let drawer = $state<'nav' | 'people' | null>(null);
+
+  // Выбрали канал — панель своё дело сделала, закрываем.
+  $effect(() => {
+    void session.channelId;
+    drawer = null;
+  });
 
   const online = $derived(session.members.filter((m) => m.online));
   const empty = $derived(session.spaces.length === 0);
@@ -52,7 +66,10 @@
   {#if empty}
     <Welcome onnewspace={() => (dialog = 'пространство')} onjoin={() => (dialog = 'ссылка')} />
   {:else}
-    <div class="body">
+    <div class="body" class:nav-open={drawer === 'nav'} class:people-open={drawer === 'people'}>
+      {#if drawer}
+        <button class="scrim" aria-label="Закрыть панель" onclick={() => (drawer = null)}></button>
+      {/if}
       <Sidebar
         onnewchannel={() => (dialog = 'канал')}
         onprofile={() => (dialog = 'профиль')}
@@ -61,6 +78,9 @@
 
       <main class="middle" class:with-thread={!!session.threadRoot}>
         <div class="feed-head">
+          <button class="icon-btn narrow-only" onclick={() => (drawer = 'nav')} aria-label="Каналы">
+            <Icon name="menu" />
+          </button>
           <div class="title">
             {#if session.channel}
               <Icon name={session.channel.voice ? 'speaker' : 'hash'} size={14} />
@@ -77,6 +97,9 @@
             {/each}
             <span class="count">{online.length} в сети</span>
           </div>
+          <button class="icon-btn medium-only" onclick={() => (drawer = 'people')} aria-label="Участники">
+            <Icon name="people" />
+          </button>
         </div>
 
         <CallPanel />
@@ -209,6 +232,18 @@
     box-shadow: 0 20px 44px -30px #000;
   }
 
+  /* Кнопки панелей видны только там, где панели спрятаны. */
+  .narrow-only,
+  .medium-only {
+    display: none;
+  }
+  .scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 59;
+    background: rgba(0, 0, 0, 0.55);
+  }
+
   @media (max-width: 1180px) {
     .body {
       grid-template-columns: 17rem minmax(0, 1fr);
@@ -217,6 +252,19 @@
     .body :global(.thread-pane) {
       display: none;
     }
+    .medium-only {
+      display: inline-grid;
+    }
+    /* Участники — выдвижной панелью справа. */
+    .body.people-open :global(.people),
+    .body.people-open :global(.thread-pane) {
+      display: flex;
+      position: fixed;
+      inset: 0 0 0 auto;
+      z-index: 60;
+      width: min(20rem, 88vw);
+      background: var(--bg);
+    }
   }
   @media (max-width: 860px) {
     .body {
@@ -224,6 +272,18 @@
     }
     .body :global(.side) {
       display: none;
+    }
+    .narrow-only {
+      display: inline-grid;
+    }
+    /* Каналы — выдвижной панелью слева. */
+    .body.nav-open :global(.side) {
+      display: flex;
+      position: fixed;
+      inset: 0 auto 0 0;
+      z-index: 60;
+      width: min(20rem, 88vw);
+      background: var(--bg);
     }
   }
 </style>

@@ -6,10 +6,11 @@ use std::{path::Path, sync::Arc, time::Duration};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
+    audio::AudioEngine,
     domain::{
         now_ms, Attachment, Clock, Event, EventKind, Hello, Id, Invite, SignedEvent, Space, SpaceId,
     },
-    identity::{load_avatar, load_nick, save_avatar, save_nick, Identity},
+    identity::{device_label, load_avatar, load_nick, save_avatar, save_nick, Account, Identity},
     net::{
         ctx::Notice,
         wire::{PlayerCommand, PlayerState},
@@ -35,12 +36,37 @@ const PREVIEW_LIMIT: u64 = 16 * 1024 * 1024;
 /// десять секунд.
 const PLAYER_BEAT: Duration = Duration::from_secs(2);
 
-/// Сколько блоков звука ждут отправки в интерфейс.
+/// Сколько блоков захваченной музыки ждут кодировщика.
 ///
 /// Очередь короткая намеренно: музыка идёт в реальном времени, и блок, который
 /// не успел уехать за полсекунды, слушателю уже не нужен — а неограниченная
-/// очередь при задумавшемся вебвью съедает память.
+/// очередь при задумавшемся кодировщике съедает память.
 pub const MUSIC_QUEUE: usize = 32;
+
+/// Свой зов в комнату — чтобы дать ему отбой.
+struct OwnRing {
+    space: SpaceId,
+    channel: Id,
+    id: u64,
+    /// Кому зов ушёл — отбой нужен ровно им.
+    targets: Vec<Id>,
+}
+
+/// Аккаунт для интерфейса: кто я и какие у меня устройства.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccountInfo {
+    pub account: Id,
+    /// Это устройство.
+    pub device: Id,
+    pub devices: Vec<DeviceRow>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DeviceRow {
+    pub device: Id,
+    pub name: String,
+    pub issued: i64,
+}
 
 /// Живая трансляция звука приложения.
 struct Music {
@@ -62,8 +88,12 @@ pub struct App {
     /// Идёт ли уже цикл подтверждений. Иначе перезапуск трансляции оставлял бы
     /// второй такой цикл, и состояние уходило бы в рой дважды за такт.
     music_beating: std::sync::atomic::AtomicBool,
-    /// Куда уходят отсчёты захвата — в вебвью, кодировщику.
-    music_sink: parking_lot::Mutex<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
+    /// Звук звонка: кодирование, приём с восстановлением потерь, сведение.
+    pub audio: AudioEngine,
+    /// Последний свой зов в комнату — чтобы дать отбой, выходя из неё.
+    ring: parking_lot::Mutex<Option<OwnRing>>,
+    /// Аккаунт, к которому привязано это устройство. См. `domain::account`.
+    pub account: Account,
 }
 
 impl App {
@@ -72,6 +102,12 @@ impl App {
         let store = Arc::new(Store::open(db_path)?);
         let identity = Identity::load_or_create(&store)?;
         store.set_me(identity.id());
+        // Аккаунт заводится при первом запуске версии, где он появился: у
+        // прежних пользователей их единственное устройство становится первым
+        // устройством аккаунта, и ничего из привычного не меняется.
+        let account = Account::load_or_create(&store)?;
+        let cert = account.own_cert(&store, identity.id(), device_label())?;
+        store.remember_device(&cert)?;
 
         let spaces = store.spaces()?;
         let clock = Clock::new(store.max_lamport()?);
@@ -83,6 +119,7 @@ impl App {
             .unwrap_or_else(|| Path::new("."))
             .join("blobs");
         let dh = crate::identity::load_or_create_dh(&store)?;
+        let audio = AudioEngine::new(tx.clone());
         let ctx = Arc::new(Ctx::new(
             store.clone(),
             identity,
@@ -92,6 +129,21 @@ impl App {
             &blob_dir,
         ));
         let net = Net::spawn(ctx.clone()).await?;
+
+        // Звук идёт мимо вебвью: из сети прямо в джиттер-буферы движка, а
+        // закодированное движком — прямо в сеть. Ссылка на сеть слабая: иначе
+        // сеть и движок держали бы друг друга вечно.
+        let inbound = audio.clone();
+        net.media()
+            .set_audio(Arc::new(move |packet| inbound.push(packet)));
+        let media = Arc::downgrade(net.media());
+        audio.set_send(Arc::new(move |track, codec, ts, data: &[u8]| {
+            if let Some(media) = media.upgrade() {
+                if let Err(err) = media.broadcast(track, true, codec, ts, data) {
+                    tracing::trace!(%err, "звуковой кадр не ушёл");
+                }
+            }
+        }));
         tracing::info!(
             me = %ctx.identity.id().short(),
             endpoint = %net.endpoint_id(),
@@ -107,7 +159,9 @@ impl App {
                 net,
                 music: parking_lot::Mutex::new(None),
                 music_beating: std::sync::atomic::AtomicBool::new(false),
-                music_sink: parking_lot::Mutex::new(None),
+                audio,
+                ring: parking_lot::Mutex::new(None),
+                account,
             }),
             rx,
         ))
@@ -258,6 +312,24 @@ impl App {
 
     pub fn me(&self) -> Id {
         self.ctx.identity.id()
+    }
+
+    /// Аккаунт и его устройства — для экрана «мои устройства».
+    pub fn account_info(&self) -> Result<AccountInfo> {
+        Ok(AccountInfo {
+            account: self.account.id(),
+            device: self.me(),
+            devices: self
+                .store
+                .devices_of(self.account.id())?
+                .into_iter()
+                .map(|cert| DeviceRow {
+                    device: cert.device,
+                    name: cert.name,
+                    issued: cert.issued,
+                })
+                .collect(),
+        })
     }
 
     pub fn nick(&self) -> String {
@@ -549,13 +621,95 @@ impl App {
         self.net.announce_presence(space).await
     }
 
-    pub async fn leave_call(&self) -> Result<()> {
+    pub async fn leave_call(self: &Arc<Self>) -> Result<()> {
         let active = self.net.media().active();
+        // Ушли — звать в комнату больше некуда. Отбой, иначе у позванных
+        // ещё полминуты звонил бы звонок в пустую комнату.
+        self.cancel_ring();
         self.net.media().leave();
+        self.audio.stop();
         if let Some((space, _)) = active {
             self.net.announce_presence(space).await?;
         }
         Ok(())
+    }
+
+    /// Позвать людей в свою комнату. Пустой список — всех в пространстве.
+    ///
+    /// Зов идёт каждому прямым соединением (`net::ring`), параллельно.
+    /// Возвращает, скольким он действительно доставлен: до тех, кого нет в
+    /// сети, он не дойдёт — сервера, который придержал бы его, у нас нет.
+    pub async fn ring(self: &Arc<Self>, to: Vec<Id>) -> Result<usize> {
+        let Some((space, channel)) = self.net.media().active() else {
+            return Err(anyhow!("сначала надо войти в комнату"));
+        };
+        let me = self.me();
+        let inside: std::collections::HashSet<Id> =
+            self.net.media().participants().into_iter().collect();
+        let targets: Vec<Id> = self
+            .ctx
+            .presence_of(space)
+            .into_iter()
+            .map(|p| p.author)
+            .filter(|author| *author != me && !inside.contains(author))
+            .filter(|author| to.is_empty() || to.contains(author))
+            .collect();
+
+        // Прежний зов гасим: иначе у позванных первым он звенел бы до своего
+        // таймаута, хотя звонящий уже зовёт заново.
+        self.cancel_ring();
+
+        let id = rand::Rng::random::<u64>(&mut rand::rng());
+        *self.ring.lock() = Some(OwnRing {
+            space,
+            channel,
+            id,
+            targets: targets.clone(),
+        });
+        let frame = crate::net::ring::RingFrame {
+            space,
+            id,
+            channel,
+            cancel: false,
+        };
+        let mut sends = tokio::task::JoinSet::new();
+        for target in targets {
+            let net = self.net.clone();
+            let frame = frame.clone();
+            sends.spawn(async move { net.send_ring(target, &frame).await });
+        }
+        let mut delivered = 0;
+        while let Some(done) = sends.join_next().await {
+            match done {
+                Ok(Ok(())) => delivered += 1,
+                Ok(Err(err)) => tracing::debug!(%err, "зов не доставлен"),
+                Err(err) => tracing::debug!(%err, "доставка зова оборвалась"),
+            }
+        }
+        Ok(delivered)
+    }
+
+    /// Дать отбой своему последнему зову. Не ждёт доставки: выход из комнаты
+    /// не должен висеть на чужой сети.
+    fn cancel_ring(self: &Arc<Self>) {
+        let Some(own) = self.ring.lock().take() else {
+            return;
+        };
+        let frame = crate::net::ring::RingFrame {
+            space: own.space,
+            id: own.id,
+            channel: own.channel,
+            cancel: true,
+        };
+        for target in own.targets {
+            let net = self.net.clone();
+            let frame = frame.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(err) = net.send_ring(target, &frame).await {
+                    tracing::debug!(%err, "отбой не доставлен");
+                }
+            });
+        }
     }
 
     pub fn call_state(&self) -> Option<(SpaceId, Id)> {
@@ -570,6 +724,29 @@ impl App {
     pub fn send_media(&self, raw: &[u8]) -> Result<()> {
         let (track, keyframe, codec, ts, data) = crate::net::media::decode_from_ui(raw)?;
         self.net.media().broadcast(track, keyframe, codec, ts, data)
+    }
+
+    /// Отсчёты своего звука из вебвью — в кодировщик ядра.
+    ///
+    /// Формат: `[0]` дорожка, дальше int16 LE. Не в звонке — молча выбрасываем:
+    /// захват мог прислать последний блок уже после выхода.
+    pub fn send_pcm(&self, raw: &[u8]) -> Result<()> {
+        if self.net.media().active().is_none() {
+            return Ok(());
+        }
+        let Some((&code, body)) = raw.split_first() else {
+            return Err(anyhow!("пустой блок звука"));
+        };
+        let track = crate::net::Track::from_code(code)
+            .filter(|track| track.is_audio())
+            .ok_or_else(|| anyhow!("неизвестная звуковая дорожка {code}"))?;
+        let samples: Vec<f32> = body
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| i16::from_le_bytes(*pair) as f32 / 32768.0)
+            .collect();
+        self.audio.send_pcm(track, &samples)
     }
 
     // ── общий плеер ─────────────────────────────────────────────────────────
@@ -606,21 +783,20 @@ impl App {
             .map(|candidate| candidate.name)
             .unwrap_or_else(|| source.to_string());
 
-        // Слабая ссылка: захват живёт внутри самого приложения, и сильная
-        // замкнула бы кольцо, из которого приложение уже не освободится.
-        let weak = Arc::downgrade(self);
-        let sink: player::Sink = Arc::new(move |samples: &[f32]| {
-            let Some(app) = weak.upgrade() else { return };
-            let Some(tx) = app.music_sink.lock().clone() else {
-                return;
-            };
-            let mut bytes = Vec::with_capacity(samples.len() * 4);
-            for sample in samples {
-                bytes.extend_from_slice(&sample.to_le_bytes());
+        // Кодирует тот же движок, что и голос, — но не в потоке захвата: тот
+        // зовёт нас из аудиорендера системы, и ждать там нельзя ни
+        // миллисекунды. Блоки уезжают в очередь, кодировщик разбирает её сам.
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<f32>>(MUSIC_QUEUE);
+        let audio = self.audio.clone();
+        tauri::async_runtime::spawn(async move {
+            while let Some(block) = rx.recv().await {
+                if let Err(err) = audio.send_pcm(crate::net::Track::Music, &block) {
+                    tracing::debug!(%err, "блок музыки не закодирован");
+                }
             }
-            // Именно `try_send`: захват зовёт нас из потока аудиорендера,
-            // и ждать там нельзя ни миллисекунды.
-            let _ = tx.try_send(bytes);
+        });
+        let sink: player::Sink = Arc::new(move |samples: &[f32]| {
+            let _ = tx.try_send(samples.to_vec());
         });
 
         let tap = player::Tap::start(source, sink)?;
@@ -676,11 +852,6 @@ impl App {
         if let Err(err) = player::control(command.into()) {
             tracing::warn!(%err, "пульт не сработал");
         }
-    }
-
-    /// Куда складывать отсчёты захвата, чтобы их забрал кодировщик в вебвью.
-    pub fn set_music_sink(&self, sink: tokio::sync::mpsc::Sender<Vec<u8>>) {
-        *self.music_sink.lock() = Some(sink);
     }
 
     /// Подтверждать состояние плеера, пока трансляция жива.

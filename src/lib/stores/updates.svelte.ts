@@ -9,6 +9,7 @@ import { relaunch } from '@tauri-apps/plugin-process';
 import { getVersion } from '@tauri-apps/api/app';
 
 import { errorText } from '../ipc';
+import { platform } from '../platform';
 
 export type UpdateStage =
   | 'idle'
@@ -38,6 +39,11 @@ export class Updates {
   /** Ручная проверка. Молчаливой автопроверки нет: обновление — решение человека. */
   async check(): Promise<void> {
     if (this.stage === 'checking' || this.stage === 'downloading') return;
+    // На телефоне обновления ставит магазин: модуля обновлений там нет вовсе.
+    if (!platform.updater) {
+      this.stage = 'current';
+      return;
+    }
     this.stage = 'checking';
     this.error = '';
 

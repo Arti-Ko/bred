@@ -88,6 +88,89 @@ impl Store {
         Ok(())
     }
 
+    // ── устройства аккаунтов ────────────────────────────────────────────────
+
+    /// Запомнить удостоверение устройства. Проверять подпись — забота
+    /// вызывающего: хранилище не знает про криптографию.
+    ///
+    /// Погашено оно или нет, решает самый поздний отзыв: удостоверение,
+    /// выданное после него, живое — устройство привязали заново.
+    pub fn remember_device(&self, cert: &crate::domain::account::DeviceCert) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO devices(account, device, name, issued, cert) VALUES(?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(account, device) DO UPDATE SET
+                 name = excluded.name, issued = excluded.issued, cert = excluded.cert
+             WHERE excluded.issued > devices.issued",
+            params![
+                &cert.account.0[..],
+                &cert.device.0[..],
+                cert.name,
+                cert.issued,
+                postcard::to_stdvec(cert)?
+            ],
+        )?;
+        Self::settle_revocation(&conn, cert.account, cert.device)
+    }
+
+    /// Запомнить отзыв. Удостоверение, выданное позже отзыва, им не гасится.
+    pub fn revoke_device(&self, revoke: &crate::domain::account::DeviceRevoke) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO device_revocations(account, device, at) VALUES(?1, ?2, ?3)
+             ON CONFLICT(account, device) DO UPDATE SET at = MAX(at, excluded.at)",
+            params![&revoke.account.0[..], &revoke.device.0[..], revoke.at],
+        )?;
+        Self::settle_revocation(&conn, revoke.account, revoke.device)
+    }
+
+    /// Свести удостоверение с отзывом: гашение — только если отзыв не раньше выдачи.
+    fn settle_revocation(conn: &Connection, account: Id, device: Id) -> Result<()> {
+        conn.execute(
+            "UPDATE devices SET revoked = (
+                 SELECT r.at FROM device_revocations r
+                  WHERE r.account = devices.account AND r.device = devices.device
+                    AND r.at >= devices.issued)
+              WHERE account = ?1 AND device = ?2",
+            params![&account.0[..], &device.0[..]],
+        )?;
+        Ok(())
+    }
+
+    /// Чьё это устройство. Отозванное — уже ничьё.
+    pub fn account_of(&self, device: Id) -> Result<Option<Id>> {
+        let conn = self.conn.lock();
+        Ok(conn
+            .query_row(
+                "SELECT account FROM devices WHERE device = ?1 AND revoked IS NULL
+                  ORDER BY issued DESC LIMIT 1",
+                params![&device.0[..]],
+                |r| Ok(id_from_row(r.get::<_, Vec<u8>>(0)?)),
+            )
+            .optional()?)
+    }
+
+    /// Живые устройства аккаунта — для списка «мои устройства».
+    pub fn devices_of(&self, account: Id) -> Result<Vec<crate::domain::account::DeviceCert>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT cert FROM devices WHERE account = ?1 AND revoked IS NULL ORDER BY issued",
+        )?;
+        let rows = stmt
+            .query_map(params![&account.0[..]], |r| r.get::<_, Vec<u8>>(0))?
+            .filter_map(Result::ok)
+            .filter_map(|raw| postcard::from_bytes(&raw).ok())
+            .collect();
+        Ok(rows)
+    }
+
+    pub fn delete_setting(&self, key: &str) -> Result<()> {
+        self.conn
+            .lock()
+            .execute("DELETE FROM settings WHERE k = ?1", params![key])?;
+        Ok(())
+    }
+
     // ── пространства ────────────────────────────────────────────────────────
 
     pub fn save_space(&self, space: &Space) -> Result<()> {
@@ -482,6 +565,27 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Кого видели в сети не раньше `since` (миллисекунды по нашим часам).
+    ///
+    /// Почтальону нужны именно они, а не все знакомые: дозвон до того, кто
+    /// неделю не открывал приложение, — это поиск его адреса по справочникам и
+    /// распределённой таблице, пробивка NAT вслепую и таймаут. Каждые полминуты,
+    /// на каждого такого — и всё это на том же узле, по которому идёт звонок.
+    pub fn recent_peers(&self, space: SpaceId, since: i64) -> Result<Vec<Id>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id FROM peers WHERE space = ?1 AND last_seen >= ?2
+              ORDER BY last_seen DESC LIMIT 32",
+        )?;
+        let rows = stmt
+            .query_map(params![&space.0[..], since], |r| {
+                Ok(id_from_row(r.get::<_, Vec<u8>>(0)?))
+            })?
+            .filter_map(Result::ok)
+            .collect();
+        Ok(rows)
     }
 
     /// Соседи по пространству и их последние адреса — точки входа в рой.
@@ -951,6 +1055,83 @@ fn key_from_row(raw: Vec<u8>) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_belongs_to_account_until_revoked() {
+        use crate::domain::account::{DeviceCert, DeviceRevoke};
+        let store = Store::in_memory().unwrap();
+        let account = Id([1u8; 32]);
+        let phone = Id([2u8; 32]);
+        let cert = DeviceCert {
+            account,
+            device: phone,
+            name: "телефон".into(),
+            issued: 10,
+            sig: [0u8; 64],
+        };
+        store.remember_device(&cert).unwrap();
+        assert_eq!(store.account_of(phone).unwrap(), Some(account));
+        assert_eq!(store.devices_of(account).unwrap(), vec![cert.clone()]);
+
+        store
+            .revoke_device(&DeviceRevoke {
+                account,
+                device: phone,
+                at: 20,
+                sig: [0u8; 64],
+            })
+            .unwrap();
+        assert_eq!(
+            store.account_of(phone).unwrap(),
+            None,
+            "потерянный телефон больше ничей"
+        );
+        assert!(store.devices_of(account).unwrap().is_empty());
+
+        // Нашёлся и привязан заново — новое удостоверение живое.
+        store
+            .remember_device(&DeviceCert {
+                issued: 30,
+                ..cert.clone()
+            })
+            .unwrap();
+        assert_eq!(
+            store.account_of(phone).unwrap(),
+            Some(account),
+            "привязан заново"
+        );
+    }
+
+    #[test]
+    fn revocation_that_arrives_first_still_counts() {
+        use crate::domain::account::{DeviceCert, DeviceRevoke};
+        let store = Store::in_memory().unwrap();
+        let account = Id([1u8; 32]);
+        let phone = Id([2u8; 32]);
+        // Отзыв доехал раньше удостоверения, которое он гасит.
+        store
+            .revoke_device(&DeviceRevoke {
+                account,
+                device: phone,
+                at: 20,
+                sig: [0u8; 64],
+            })
+            .unwrap();
+        store
+            .remember_device(&DeviceCert {
+                account,
+                device: phone,
+                name: "телефон".into(),
+                issued: 10,
+                sig: [0u8; 64],
+            })
+            .unwrap();
+        assert_eq!(
+            store.account_of(phone).unwrap(),
+            None,
+            "порядок доставки не важен"
+        );
+    }
 
     const SPACE: SpaceId = Id([5u8; 32]);
     const PEER: Id = Id([7u8; 32]);

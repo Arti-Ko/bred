@@ -38,16 +38,32 @@ export interface Token {
 }
 
 /**
+ * Имя своего эмодзи или стикера: буквы любого алфавита, цифры, дефис и
+ * подчёркивание, до тридцати двух знаков — то же правило, что проверяет ядро.
+ *
+ * Раньше здесь стояла латиница. Ядро при этом принимало `/стикер котик`
+ * и записывало его в набор, а лента не узнавала `:котик:` и показывала голые
+ * двоеточия: стикеры с русскими именами не работали никогда.
+ */
+const NAME = String.raw`[\p{L}\p{N}_-]{1,32}`;
+const INLINE = new RegExp(`:(${NAME}):`, 'gu');
+const LONE = new RegExp(`^:(${NAME}):$`, 'u');
+
+/** Имя годится для своего эмодзи — то же правило, что в ядре. */
+export function validEmojiName(name: string): boolean {
+  return LONE.test(`:${name}:`);
+}
+
+/**
  * Разбор `:имя:` в тексте. Имена берём из набора пространства: всё, чего в
  * наборе нет, остаётся обычным текстом — иначе двоеточия в коде и во времени
  * превращались бы в дырки.
  */
 export function tokenize(text: string, known: Record<string, unknown>): Token[] {
   const out: Token[] = [];
-  const pattern = /:([a-zA-Z0-9_-]{1,32}):/g;
   let last = 0;
 
-  for (const match of text.matchAll(pattern)) {
+  for (const match of text.matchAll(INLINE)) {
     const name = match[1];
     if (!(name in known)) continue;
     if (match.index > last) out.push({ emoji: null, text: text.slice(last, match.index) });
@@ -61,7 +77,7 @@ export function tokenize(text: string, known: Record<string, unknown>): Token[] 
 /** Сообщение целиком из одного стикера показывается крупно. */
 export function loneSticker(body: string, known: Record<string, { sticker: boolean }>): string | null {
   const trimmed = body.trim();
-  const match = /^:([a-zA-Z0-9_-]{1,32}):$/.exec(trimmed);
+  const match = LONE.exec(trimmed);
   if (!match) return null;
   const found = known[match[1]];
   return found?.sticker ? match[1] : null;

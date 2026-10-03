@@ -61,18 +61,14 @@
   }
   const sticker = $derived(loneSticker(message.body, emojiMap));
 
-  /** Картинки своих эмодзи: те же превью, что и у вложений. */
-  let glyphs = $state<Record<string, string>>({});
+  /** Картинки своих эмодзи — общие на всё приложение, собирает их сессия. */
+  const glyphs = $derived(session.glyphs);
 
-  $effect(() => {
-    for (const emoji of session.emojis) {
-      if (!glyphs[emoji.name]) {
-        void previewUrl(emoji.hash, session.spaceId).then((url) => {
-          if (url) glyphs = { ...glyphs, [emoji.name]: url };
-        });
-      }
-    }
-  });
+  /** Своя реакция вида `:имя:` — картинкой, если она есть в наборе. */
+  function reactionGlyph(emoji: string): string | null {
+    const name = /^:(.+):$/.exec(emoji)?.[1];
+    return name ? (glyphs[name] ?? null) : null;
+  }
 
   $effect(() => {
     for (const file of message.attachments) {
@@ -113,8 +109,14 @@
 
   {#if message.deleted}
     <div class="deleted">· сообщение удалено ·</div>
-  {:else if sticker && glyphs[sticker]}
-    <img class="sticker" src={glyphs[sticker]} alt=":{sticker}:" />
+  {:else if sticker}
+    {#if glyphs[sticker]}
+      <img class="sticker" src={glyphs[sticker]} alt=":{sticker}:" />
+    {:else}
+      <!-- Картинка ещё едет от того, у кого она есть: место под стикер
+           держим сразу, иначе вместо него мелькали голые двоеточия. -->
+      <div class="sticker pending" title=":{sticker}:">:{sticker}:</div>
+    {/if}
   {:else}
     {#each parts as part (part.text)}
       {#if part.code}
@@ -178,7 +180,11 @@
           onreact(reaction.emoji);
         }}
       >
-        {reaction.emoji}
+        {#if reactionGlyph(reaction.emoji)}
+          <img class="rx-glyph" src={reactionGlyph(reaction.emoji)} alt={reaction.emoji} />
+        {:else}
+          {reaction.emoji}
+        {/if}
         {reaction.count}
       </button>
     {/each}
@@ -316,6 +322,33 @@
     margin: 6px 0 2px;
     max-width: 11rem;
     max-height: 11rem;
+    object-fit: contain;
+  }
+  .sticker.pending {
+    display: grid;
+    place-items: center;
+    width: 7rem;
+    height: 7rem;
+    border: 1px dashed var(--fg-faint);
+    color: var(--fg-faint);
+    font-size: var(--text-xs);
+    overflow: hidden;
+    animation: sticker-wait 1.4s ease-in-out infinite alternate;
+  }
+  @keyframes sticker-wait {
+    to {
+      opacity: 0.45;
+    }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .sticker.pending {
+      animation: none;
+    }
+  }
+  .rx-glyph {
+    width: 1.1em;
+    height: 1.1em;
+    vertical-align: -0.2em;
     object-fit: contain;
   }
 

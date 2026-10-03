@@ -7,6 +7,7 @@
   import EmojiPicker from './lib/components/EmojiPicker.svelte';
   import Settings from './lib/components/Settings.svelte';
   import ThreadPanel from './lib/components/ThreadPanel.svelte';
+  import IncomingCall from './lib/components/IncomingCall.svelte';
   import Shell from './lib/adequate/Shell.svelte';
   import { call } from './lib/stores/call.svelte';
   import { prefs } from './lib/stores/prefs.svelte';
@@ -170,6 +171,9 @@
 
 <svelte:window onkeydown={onGlobalKey} />
 
+<!-- Зов в комнату — поверх всего и в любом оформлении -->
+<IncomingCall />
+
 {#if settingsOpen && !prefs.adequate}
   <Settings onclose={() => (settingsOpen = false)} onarcade={openArcade} />
 {/if}
@@ -256,6 +260,10 @@
             draft += emoji;
             pickerOpen = false;
             input?.focus();
+          }}
+          onsticker={(name) => {
+            pickerOpen = false;
+            void session.sendSticker(name);
           }}
           onclose={() => (pickerOpen = false)}
         />

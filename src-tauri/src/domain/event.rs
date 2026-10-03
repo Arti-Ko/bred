@@ -167,7 +167,7 @@ pub fn now_ms() -> i64 {
 }
 
 /// Подпись — 64 байта, serde из коробки такие массивы не умеет.
-mod serde_sig {
+pub(crate) mod serde_sig {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(v: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {

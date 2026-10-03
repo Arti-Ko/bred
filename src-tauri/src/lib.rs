@@ -4,6 +4,7 @@
 //! подписанными событиями напрямую.
 
 pub mod app;
+pub mod audio;
 pub mod commands;
 pub mod domain;
 pub mod identity;
@@ -73,6 +74,22 @@ enum UiNotice {
     Player {
         space: Id,
     },
+    Speaking {
+        authors: Vec<Id>,
+    },
+    Ring {
+        space: Id,
+        channel: Id,
+        from: Id,
+        nick: String,
+        /// Строкой: в JavaScript u64 не помещается без потерь.
+        id: String,
+    },
+    RingCancel {
+        space: Id,
+        from: Id,
+        id: String,
+    },
 }
 
 impl From<Notice> for UiNotice {
@@ -109,6 +126,25 @@ impl From<Notice> for UiNotice {
             Notice::PlayerCommand { .. } => UiNotice::Net,
             Notice::Keyframe => UiNotice::Keyframe,
             Notice::Bitrate { track, bps } => UiNotice::Bitrate { track, bps },
+            Notice::Speaking { authors } => UiNotice::Speaking { authors },
+            Notice::Ring {
+                space,
+                channel,
+                from,
+                nick,
+                id,
+            } => UiNotice::Ring {
+                space,
+                channel,
+                from,
+                nick,
+                id: id.to_string(),
+            },
+            Notice::RingCancel { space, from, id } => UiNotice::RingCancel {
+                space,
+                from,
+                id: id.to_string(),
+            },
         }
     }
 }
@@ -168,11 +204,16 @@ pub fn run() {
         )
         .init();
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_notification::init());
+    // Обновления и перезапуск — дело десктопа: на телефоне сборку ставит магазин.
+    #[cfg(desktop)]
+    let builder = builder
         .plugin(tauri_plugin_updater::Builder::new().build())
-        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_process::init());
+
+    builder
         // Вложения отдаём собственной схемой, а не через мост команд: сырой
         // ответ на десятки мегабайт рвал IPC — в интерфейсе это выглядело как
         // «connection lost», после чего переставало работать вообще всё.
@@ -244,15 +285,20 @@ pub fn run() {
             commands::join_call,
             commands::leave_call,
             commands::call_state,
+            commands::ring,
+            commands::account_info,
             commands::voice_map,
             commands::send_media,
             commands::music_sources,
             commands::music_start,
             commands::music_stop,
             commands::music_control,
-            commands::music_stream,
             commands::player_state,
             commands::media_stream,
+            commands::voice_stream,
+            commands::send_pcm,
+            commands::set_voice_volume,
+            commands::set_music_volume,
         ])
         .run(tauri::generate_context!())
         .unwrap_or_else(|err| {

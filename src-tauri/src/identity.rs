@@ -7,9 +7,17 @@
 use anyhow::{Context, Result};
 use iroh::SecretKey;
 
-use crate::{domain::Id, store::Store};
+use crate::{
+    domain::{
+        account::{AccountId, DeviceCert, DeviceRevoke},
+        Id,
+    },
+    store::Store,
+};
 
 const SECRET_KEY_SETTING: &str = "identity.secret_key";
+const ACCOUNT_SETTING: &str = "account.secret_key";
+const CERT_SETTING: &str = "account.device_cert";
 const NICK_SETTING: &str = "identity.nick";
 const AVATAR_SETTING: &str = "identity.avatar";
 const DH_SETTING: &str = "identity.dh";
@@ -48,6 +56,120 @@ impl Identity {
 
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
         self.secret.sign(message).to_bytes()
+    }
+}
+
+/// Ключ аккаунта — общий для всех устройств человека.
+///
+/// Им подписывается ровно одно: «это устройство — моё». События по-прежнему
+/// подписывает ключ устройства: так потерянный телефон отзывается одной
+/// подписью, без смены ключей у всех остальных. См. `domain::account`.
+#[derive(Clone)]
+pub struct Account {
+    secret: SecretKey,
+}
+
+impl Account {
+    /// Загружает ключ аккаунта, а при первом запуске заводит новый.
+    ///
+    /// У тех, кто ставил БРЕД до аккаунтов, ключ появится при первом запуске
+    /// новой версии: их единственное устройство становится первым устройством
+    /// нового аккаунта, и ничего из прежнего не меняется.
+    pub fn load_or_create(store: &Store) -> Result<Self> {
+        if let Some(raw) = store.get_setting(ACCOUNT_SETTING)? {
+            let bytes: [u8; 32] = raw
+                .as_slice()
+                .try_into()
+                .context("сохранённый ключ аккаунта повреждён")?;
+            return Ok(Self {
+                secret: SecretKey::from_bytes(&bytes),
+            });
+        }
+        let secret = SecretKey::generate();
+        store.set_setting(ACCOUNT_SETTING, &secret.to_bytes())?;
+        Ok(Self { secret })
+    }
+
+    /// Ключ аккаунта, полученный при привязке нового устройства.
+    pub fn adopt(store: &Store, secret: [u8; 32]) -> Result<Self> {
+        store.set_setting(ACCOUNT_SETTING, &secret)?;
+        store.delete_setting(CERT_SETTING)?;
+        Ok(Self {
+            secret: SecretKey::from_bytes(&secret),
+        })
+    }
+
+    pub fn id(&self) -> AccountId {
+        Id(*self.secret.public().as_bytes())
+    }
+
+    /// Сырой ключ — только для передачи новому устройству при привязке.
+    pub fn secret_bytes(&self) -> [u8; 32] {
+        self.secret.to_bytes()
+    }
+
+    /// Удостоверить устройство: «оно моё».
+    pub fn certify(&self, device: Id, name: &str, issued: i64) -> DeviceCert {
+        let bytes = DeviceCert::signing_bytes(self.id(), device, name, issued);
+        DeviceCert {
+            account: self.id(),
+            device,
+            name: name.to_string(),
+            issued,
+            sig: self.secret.sign(&bytes).to_bytes(),
+        }
+    }
+
+    /// Отозвать устройство: «оно больше не моё».
+    pub fn revoke(&self, device: Id, at: i64) -> DeviceRevoke {
+        let bytes = DeviceRevoke::signing_bytes(self.id(), device, at);
+        DeviceRevoke {
+            account: self.id(),
+            device,
+            at,
+            sig: self.secret.sign(&bytes).to_bytes(),
+        }
+    }
+
+    /// Удостоверение этого устройства. Выдаётся один раз и хранится: имя
+    /// устройства в нём подписано, и переподписывать его на каждом запуске
+    /// незачем.
+    pub fn own_cert(&self, store: &Store, device: Id, name: &str) -> Result<DeviceCert> {
+        if let Some(raw) = store.get_setting(CERT_SETTING)? {
+            if let Ok(cert) = postcard::from_bytes::<DeviceCert>(&raw) {
+                if cert.account == self.id() && cert.device == device && verify_cert(&cert) {
+                    return Ok(cert);
+                }
+            }
+        }
+        let cert = self.certify(device, name, crate::domain::now_ms());
+        store.set_setting(CERT_SETTING, &postcard::to_stdvec(&cert)?)?;
+        Ok(cert)
+    }
+}
+
+/// Подлинно ли удостоверение: подписано ли оно тем аккаунтом, что в нём указан.
+pub fn verify_cert(cert: &DeviceCert) -> bool {
+    verify(cert.account, &cert.bytes(), &cert.sig)
+}
+
+/// Подлинен ли отзыв.
+pub fn verify_revoke(revoke: &DeviceRevoke) -> bool {
+    verify(revoke.account, &revoke.bytes(), &revoke.sig)
+}
+
+/// Как называть это устройство, пока человек не дал ему имя сам.
+pub fn device_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Mac"
+    } else if cfg!(target_os = "windows") {
+        "Windows"
+    } else if cfg!(target_os = "ios") {
+        "iPhone"
+    } else if cfg!(target_os = "android") {
+        "Android"
+    } else {
+        "Linux"
     }
 }
 
@@ -149,6 +271,71 @@ mod tests {
         let other = Identity::load_or_create(&other).unwrap();
         let sig = me.sign("привет".as_bytes());
         assert!(!verify(other.id(), "привет".as_bytes(), &sig));
+    }
+
+    #[test]
+    fn device_cert_verifies_and_resists_forgery() {
+        let store = Store::in_memory().unwrap();
+        let account = Account::load_or_create(&store).unwrap();
+        let device = Identity::load_or_create(&store).unwrap().id();
+        let cert = account.certify(device, "MacBook", 42);
+        assert!(verify_cert(&cert), "удостоверение своего аккаунта подлинно");
+
+        let mut renamed = cert.clone();
+        renamed.name = "чужой".into();
+        assert!(
+            !verify_cert(&renamed),
+            "имя подписано — переименовать нельзя"
+        );
+
+        let stranger = Account::load_or_create(&Store::in_memory().unwrap()).unwrap();
+        let mut stolen = cert.clone();
+        stolen.account = stranger.id();
+        assert!(
+            !verify_cert(&stolen),
+            "чужому аккаунту чужое устройство не присвоить"
+        );
+    }
+
+    #[test]
+    fn revoke_verifies() {
+        let store = Store::in_memory().unwrap();
+        let account = Account::load_or_create(&store).unwrap();
+        let revoke = account.revoke(Id([5u8; 32]), 7);
+        assert!(verify_revoke(&revoke));
+    }
+
+    #[test]
+    fn account_and_own_cert_persist() {
+        let store = Store::in_memory().unwrap();
+        let device = Identity::load_or_create(&store).unwrap().id();
+        let first = Account::load_or_create(&store).unwrap();
+        let cert = first.own_cert(&store, device, "Mac").unwrap();
+        let again = Account::load_or_create(&store).unwrap();
+        assert_eq!(first.id(), again.id(), "аккаунт переживает перезапуск");
+        assert_eq!(
+            again.own_cert(&store, device, "Mac").unwrap(),
+            cert,
+            "удостоверение не переподписывается"
+        );
+    }
+
+    #[test]
+    fn adopted_account_replaces_the_old_one() {
+        let store = Store::in_memory().unwrap();
+        let device = Identity::load_or_create(&store).unwrap().id();
+        let mine = Account::load_or_create(&store).unwrap();
+        mine.own_cert(&store, device, "Mac").unwrap();
+
+        let other = Account::load_or_create(&Store::in_memory().unwrap()).unwrap();
+        let adopted = Account::adopt(&store, other.secret_bytes()).unwrap();
+        assert_eq!(adopted.id(), other.id());
+        let cert = adopted.own_cert(&store, device, "Mac").unwrap();
+        assert_eq!(
+            cert.account,
+            other.id(),
+            "старое удостоверение не годится новому аккаунту"
+        );
     }
 
     #[test]

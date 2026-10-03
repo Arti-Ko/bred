@@ -124,6 +124,10 @@
             picker = false;
             input?.focus();
           }}
+          onsticker={(name) => {
+            picker = false;
+            void session.sendSticker(name);
+          }}
           onclose={() => (picker = false)}
         />
       {/if}

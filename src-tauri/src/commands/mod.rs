@@ -276,7 +276,20 @@ pub async fn join_call(app: State<'_, Arc<App>>, space: SpaceId, channel: Id) ->
 
 #[tauri::command]
 pub async fn leave_call(app: State<'_, Arc<App>>) -> Answer<()> {
-    app.leave_call().await.map_err(fail)
+    app.inner().leave_call().await.map_err(fail)
+}
+
+/// Аккаунт и его устройства.
+#[tauri::command]
+pub fn account_info(app: State<'_, Arc<App>>) -> Answer<crate::app::AccountInfo> {
+    app.account_info().map_err(fail)
+}
+
+/// Позвать в свою комнату: пустой список — всех в пространстве.
+/// Отвечает, скольких из позванных видно в сети.
+#[tauri::command]
+pub async fn ring(app: State<'_, Arc<App>>, to: Vec<Id>) -> Answer<usize> {
+    app.inner().ring(to).await.map_err(fail)
 }
 
 #[tauri::command]
@@ -342,17 +355,18 @@ pub fn player_state(
     Ok(app.player_state(space))
 }
 
-/// Отсчёты захваченного звука — в вебвью, кодировщику.
+/// Сведённый звук звонка — в вебвью, одним потоком.
 ///
-/// Сырыми байтами, как и кадры звонка: музыка в JSON стоила бы вчетверо
-/// дороже ровно там, где данных больше всего.
+/// Раньше сюда ехал каждый звуковой кадр каждого собеседника, и вебвью
+/// декодировал их сам. Теперь приём, восстановление потерь и сведение — в ядре,
+/// а вебвью получает готовые двадцать миллисекунд стерео и только играет их.
 #[tauri::command]
-pub fn music_stream(
+pub fn voice_stream(
     app: State<'_, Arc<App>>,
     channel: tauri::ipc::Channel<tauri::ipc::InvokeResponseBody>,
 ) -> Answer<()> {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::app::MUSIC_QUEUE);
-    app.set_music_sink(tx);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(crate::audio::PLAYOUT_QUEUE);
+    app.audio.set_sink(tx);
 
     tauri::async_runtime::spawn(async move {
         while let Some(block) = rx.recv().await {
@@ -367,16 +381,47 @@ pub fn music_stream(
     Ok(())
 }
 
+/// Свой звук: блок отсчётов из захвата вебвью. Кодирует ядро.
+///
+/// Асинхронная не для красоты: синхронная команда исполняется в главном потоке,
+/// а кодирование Opus — пусть миллисекунда, но полсотни раз в секунду рядом с
+/// отрисовкой окна.
+#[tauri::command]
+pub async fn send_pcm(app: State<'_, Arc<App>>, request: tauri::ipc::Request<'_>) -> Answer<()> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("ожидались сырые байты звука".to_string());
+    };
+    if let Err(err) = app.send_pcm(bytes) {
+        tracing::debug!(%err, "блок звука не ушёл");
+    }
+    Ok(())
+}
+
+/// Громкость собеседника у себя.
+#[tauri::command]
+pub fn set_voice_volume(app: State<'_, Arc<App>>, author: Id, gain: f32) -> Answer<()> {
+    app.audio.set_volume(author, gain);
+    Ok(())
+}
+
+/// Громкость общего плеера у себя.
+#[tauri::command]
+pub fn set_music_volume(app: State<'_, Arc<App>>, gain: f32) -> Answer<()> {
+    app.audio.set_music_volume(gain);
+    Ok(())
+}
+
 /// Кто в каком голосовом канале — чтобы рисовать состав комнат в списке каналов.
 #[tauri::command]
 pub fn voice_map(app: State<'_, Arc<App>>, space: SpaceId) -> Answer<Vec<(Id, Id)>> {
     Ok(app.voice_map(space))
 }
 
-/// Кадр от интерфейса. Команда синхронная и возвращает управление сразу:
-/// кодировщик не должен ждать сеть, иначе поплывёт задержка звука.
+/// Кадр картинки от интерфейса. Возвращает управление сразу: кодировщик не
+/// должен ждать сеть. Асинхронная — чтобы шифрование и раскладка по очередям
+/// шли не в главном потоке, где рисуется окно.
 #[tauri::command]
-pub fn send_media(app: State<'_, Arc<App>>, request: tauri::ipc::Request<'_>) -> Answer<()> {
+pub async fn send_media(app: State<'_, Arc<App>>, request: tauri::ipc::Request<'_>) -> Answer<()> {
     let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
         return Err("ожидались сырые байты кадра".to_string());
     };

@@ -1,6 +1,7 @@
 <script lang="ts">
   // Правая колонка: кто здесь, кто где и как написать любому из них.
   import Avatar from './Avatar.svelte';
+  import { call } from '../stores/call.svelte';
   import { session } from '../stores/session.svelte';
 
   interface Props {
@@ -44,6 +45,15 @@
           <span>{status(member.id)}</span>
         </span>
         {#if member.id !== session.me}
+          {#if call.active && call.space === session.spaceId && !call.participants.some((p) => p.id === member.id)}
+            <!-- Вы в комнате, а он нет — позвать его туда звонком -->
+            <button
+              class="btn small write"
+              onclick={async () => (session.status = await call.ring([member.id]))}
+            >
+              Позвать
+            </button>
+          {/if}
           <button class="btn small write" onclick={() => session.openDirect(member.id)}>
             Написать
           </button>

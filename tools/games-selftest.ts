@@ -96,13 +96,23 @@ console.log('шашки');
 
 console.log('судия гундир');
 {
-  // Столб посреди арены обязан умереть: босс бьёт и попадает.
+  // За завесой ничего не происходит, пока не шагнули вперёд.
+  const gate = g.newWorld();
+  for (let i = 0; i < 120; i++) g.step(gate, g.noInput, 1 / 60);
+  ok('завеса держит бой', gate.phase === 'завеса' && gate.boss.hp === g.bossMaxHp());
+
+  // Столб посреди арены обязан умереть: босс просыпается и бьёт.
   const idle = g.newWorld();
-  for (let i = 0; i < 60 * 90 && idle.phase === 'бой'; i++) g.step(idle, g.noInput, 1 / 60);
+  g.step(idle, { ...g.noInput, up: true }, 1 / 60);
+  for (let i = 0; i < 60 * 120 && idle.phase !== 'смерть' && idle.phase !== 'победа'; i++) {
+    // Подходим к спящему и дальше стоим столбом.
+    g.step(idle, idle.boss.state === 'спит' ? { ...g.noInput, up: true } : g.noInput, 1 / 60);
+  }
   ok('простоявший столбом погибает', idle.phase === 'смерть');
 
   // Перекат неуязвим: в нём же весь смысл.
   const rolling = g.newWorld();
+  g.step(rolling, { ...g.noInput, up: true }, 1 / 60);
   g.step(rolling, { ...g.noInput, roll: true }, 1 / 60);
   ok('в перекате есть неуязвимость', rolling.player.iframes > 0);
 
@@ -111,7 +121,9 @@ console.log('судия гундир');
   // Заходов до двадцати, но выходим на первой же победе: проверяется
   // проходимость, а не счёт. Требовать от ученика стабильного результата
   // нельзя — набор приёмов у босса случайный, и разброс честный.
-  const runs = 20;
+  // Ученик проигрывает четыре захода из пяти — это и есть нужная планка. Чтобы
+  // проверка «бой проходим» не мигала на такой редкости, заходов даётся больше.
+  const runs = 30;
   let wins = 0;
   let best = 0;
   let played = 0;
@@ -138,33 +150,45 @@ console.log('судия гундир');
 function student(world: g.World): g.Input {
   const p = world.player;
   const boss = world.boss;
+
+  // За завесой надо сделать шаг вперёд — иначе бой не начнётся.
+  if (world.phase === 'завеса') return { ...g.noInput, up: true };
+
   const away = Math.atan2(p.at.y - boss.at.y, p.at.x - boss.at.x);
-  const danger = world.tells.some(
-    (tell) => !tell.hot && tell.progress > 0.48 && insideShape(p.at, 18, tell.shape),
-  );
-  const direction = {
+  const distance = Math.hypot(p.at.x - boss.at.x, p.at.y - boss.at.y);
+  const outward = {
     up: Math.sin(away) < -0.3,
     down: Math.sin(away) > 0.3,
     left: Math.cos(away) < -0.3,
     right: Math.cos(away) > 0.3,
   };
-  if (danger && p.stamina > 26) return { ...g.noInput, ...direction, roll: true };
-  if (p.hp < 55 && p.estus > 0 && boss.stage === 'подход' && boss.cooldown > 0.5) {
+  const inward = {
+    up: Math.sin(away) > 0.3,
+    down: Math.sin(away) < -0.3,
+    left: Math.cos(away) > 0.3,
+    right: Math.cos(away) < -0.3,
+  };
+
+  const danger = world.tells.some(
+    (tell) => !tell.hot && tell.progress > 0.5 && insideShape(p.at, 18, tell.shape),
+  );
+  if (danger && p.stamina > 20) return { ...g.noInput, ...outward, roll: true };
+
+  // Открытого добивают: это самый дешёвый урон в бою.
+  if (boss.state === 'открыт') {
+    if (distance > 60) return { ...g.noInput, ...inward };
+    return { ...g.noInput, light: true };
+  }
+
+  if (p.hp < 200 && p.estus > 0 && boss.state === 'подход' && boss.cooldown > 0.55) {
     return { ...g.noInput, heal: true };
   }
-  const distance = Math.hypot(p.at.x - boss.at.x, p.at.y - boss.at.y);
-  if (distance > 60) {
-    return {
-      ...g.noInput,
-      up: Math.sin(away) > 0.3,
-      down: Math.sin(away) < -0.3,
-      left: Math.cos(away) > 0.3,
-      right: Math.cos(away) < -0.3,
-    };
-  }
-  // Бьют в отдых после связки — это и есть окно, которое босс отдаёт сам.
-  const window = boss.stage === 'отдых' || (boss.stage === 'подход' && boss.cooldown > 0.35);
-  if (window && p.stamina > 24) return { ...g.noInput, attack: true };
+
+  if (distance > 70) return { ...g.noInput, ...inward };
+
+  // Бьют в отдых после связки — это окно босс отдаёт сам.
+  const window = boss.state === 'отдых' || (boss.state === 'подход' && boss.cooldown > 0.4);
+  if (window && p.stamina > 24) return { ...g.noInput, light: true };
   return g.noInput;
 }
 

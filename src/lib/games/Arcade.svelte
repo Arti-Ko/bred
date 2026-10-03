@@ -6,6 +6,8 @@
 
   import { untrack } from 'svelte';
 
+  import { platform } from '../platform';
+
   import { prefs, type Trophy } from '../stores/prefs.svelte';
   import Tictactoe from './tictactoe/Tictactoe.svelte';
   import Checkers from './checkers/Checkers.svelte';
@@ -63,6 +65,11 @@
    * завести нельзя — там он открывается прямо в зале.
    */
   async function fight(): Promise<void> {
+    // На телефоне окон нет — бой идёт прямо в зале, как на стенде в браузере.
+    if (!platform.windows) {
+      screen = 'гундир';
+      return;
+    }
     try {
       const { WebviewWindow } = await import('@tauri-apps/api/webviewWindow');
       const existing = await WebviewWindow.getByLabel('gundyr');

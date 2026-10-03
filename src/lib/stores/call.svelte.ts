@@ -12,8 +12,9 @@ import {
   type PlayerCommand,
   type PlayerState,
 } from '../ipc';
-import { Capture, missingCapabilities, MusicCapture, Playback } from '../media';
+import { Capture, missingCapabilities, Playback, videoSupported, VoicePlayer } from '../media';
 import { prefs } from './prefs.svelte';
+import { platform } from '../platform';
 
 /**
  * Шкала индикатора громкости.
@@ -75,6 +76,8 @@ export class Call {
    * человек видел чёрный квадрат вместо себя.
    */
   stream = $state<MediaStream | null>(null);
+  /** Своя демонстрация — для маленького превью у себя. */
+  screenStream = $state<MediaStream | null>(null);
   status = $state('');
   /** Чего не хватает платформе. Непусто — звонки недоступны, и надо сказать честно. */
   gaps = $state<string[]>([]);
@@ -98,8 +101,8 @@ export class Call {
   musicPicker = $state(false);
 
   #capture: Capture | null = null;
-  #music: MusicCapture | null = null;
   #playback: Playback | null = null;
+  #voice: VoicePlayer | null = null;
   #poll: number | null = null;
   /**
    * Когда от кого последний раз приходил звук.
@@ -163,7 +166,7 @@ export class Call {
 
   setMusicVolume(value: number): void {
     prefs.setMusicVolume(value);
-    this.#playback?.setMusicVolume(value);
+    void api.setMusicVolume(value).catch(() => undefined);
   }
 
   /** Открыть или закрыть выбор источника. Список спрашиваем при открытии:
@@ -183,24 +186,16 @@ export class Call {
     }
   }
 
-  /** Включить звук приложения на всю комнату. */
+  /** Включить звук приложения на всю комнату. Захватывает и кодирует ядро. */
   async startMusic(source: string): Promise<void> {
     if (!this.active) return;
     try {
-      // Сначала подписка, потом захват: иначе первые блоки звука упадут в
-      // никуда, и трансляция начнётся с провала на четверть секунды.
-      const music = new MusicCapture();
-      await music.start((message) => (this.status = message));
-      this.#music = music;
-
       await api.musicStart(source);
       this.sharingMusic = true;
       this.musicPicker = false;
       this.status = '';
       await this.refreshPlayer();
     } catch (error) {
-      this.#music?.stop();
-      this.#music = null;
       this.sharingMusic = false;
       this.status = errorText(error);
     }
@@ -208,8 +203,6 @@ export class Call {
 
   /** Выключить свою трансляцию. */
   async stopMusic(): Promise<void> {
-    this.#music?.stop();
-    this.#music = null;
     this.sharingMusic = false;
     await api.musicStop().catch(() => undefined);
     this.player = null;
@@ -244,7 +237,40 @@ export class Call {
 
   setVolume(author: Id, value: number): void {
     prefs.setVolume(author, value);
-    this.#playback?.setVolume(author, value);
+    void api.setVoiceVolume(author, value).catch(() => undefined);
+  }
+
+  /**
+   * Позвать в свою комнату: у них зазвонит звонок с кнопкой «подключиться».
+   * Пустой список — всех в пространстве, кто не здесь.
+   */
+  async ring(to: Id[] = []): Promise<string> {
+    if (!this.active) return 'сначала зайдите в комнату';
+    try {
+      const reached = await api.ring(to);
+      if (reached === 0) {
+        return to.length === 0
+          ? 'позвать некого: в сети никого, кто не в комнате'
+          : 'зов не дошёл: человек не в сети или уже в комнате';
+      }
+      return to.length === 0 ? `позвали: зов дошёл до ${reached}` : 'позвали — зов дошёл';
+    } catch (error) {
+      return errorText(error);
+    }
+  }
+
+  /**
+   * Ядро сообщило, кто говорит прямо сейчас. Список — вся правда: кого в нём
+   * нет, тот замолчал, и рамка гаснет сразу, а не со следующим опросом.
+   */
+  noteSpeaking(authors: Id[]): void {
+    const now = Date.now();
+    this.#speakers = Object.fromEntries(authors.map((author) => [author, now]));
+  }
+
+  /** Есть ли у платформы картинка. Без неё звонок остаётся голосовым. */
+  get videoAvailable(): boolean {
+    return videoSupported();
   }
 
   attachCanvas(author: Id, canvas: HTMLCanvasElement | null, track: 'video' | 'screen' = 'video'): void {
@@ -271,6 +297,13 @@ export class Call {
 
   async enterFullscreen(): Promise<void> {
     if (this.fullscreen || this.screens.length === 0) return;
+    // На телефоне окно и так во весь экран: остаётся только убрать всё, кроме
+    // демонстрации.
+    if (!platform.fullscreen) {
+      this.expanded = true;
+      this.screenOnly = true;
+      return;
+    }
     if (!(await this.#setWindowFullscreen(true))) return;
 
     this.#beforeFullscreen = { expanded: this.expanded, screenOnly: this.screenOnly };
@@ -355,13 +388,14 @@ export class Call {
     try {
       if (this.screenOn) {
         this.#capture.stopScreen();
-        this.screenOn = false;
-        this.screenAudio = false;
-        this.screenAudioAvailable = false;
-        this.screenOnly = false;
+        this.#forgetScreen();
       } else {
-        await this.#capture.startScreen((message) => (this.status = message));
+        await this.#capture.startScreen(
+          (message) => (this.status = message),
+          () => this.#forgetScreen(),
+        );
         this.screenOn = this.#capture.sharingScreen;
+        this.screenStream = this.#capture.screenStream;
         // Системный звук отдаёт не каждая платформа: на macOS вебвью его не
         // даёт вовсе, поэтому проверяем дорожку, а не полагаемся на запрос.
         this.screenAudioAvailable = this.#capture.screenHasAudio;
@@ -378,6 +412,14 @@ export class Call {
     }
   }
 
+  /** Показ кончился — нашей кнопкой или системной. */
+  #forgetScreen(): void {
+    this.screenOn = false;
+    this.screenStream = null;
+    this.screenAudio = false;
+    this.screenAudioAvailable = false;
+  }
+
   async join(space: Id, channel: Id, withVideo: boolean): Promise<void> {
     const gaps = missingCapabilities();
     if (gaps.length > 0) {
@@ -387,24 +429,22 @@ export class Call {
     }
 
     try {
-      this.#playback = new Playback((author) => {
-        const now = Date.now();
-        // Обновляем не чаще, чем нужно глазу: звук идёт полсотни кадров
-        // в секунду, и дёргать перерисовку на каждый — расточительство.
-        if (now - (this.#speakers[author] ?? 0) > 200) {
-          this.#speakers = { ...this.#speakers, [author]: now };
-        }
-      });
-      await this.#playback.listen((message) => (this.status = message));
+      // Звук собеседников играет один плеер: сводит их ядро. Подписываемся до
+      // входа в комнату — иначе первые слова пришедших упали бы в никуда.
+      this.#voice = new VoicePlayer();
+      await this.#voice.start((message) => (this.status = message));
       // Возвращаем ранее настроенную громкость, чтобы не крутить её заново.
       for (const [author, value] of Object.entries(prefs.volumes)) {
-        this.#playback.setVolume(author, value);
+        void api.setVoiceVolume(author, value).catch(() => undefined);
       }
-      this.#playback.setMusicVolume(prefs.musicVolume);
+      void api.setMusicVolume(prefs.musicVolume).catch(() => undefined);
+
+      this.#playback = new Playback();
+      await this.#playback.listen((message) => (this.status = message));
 
       this.#capture = new Capture();
       await this.#capture.start({
-        video: withVideo,
+        video: withVideo && videoSupported(),
         onError: (message) => (this.status = message),
         onLevel: (rms) => this.#takeLevel(rms),
       });
@@ -448,8 +488,14 @@ export class Call {
     } catch {
       // всё равно выходим
     }
+    try {
+      this.#voice?.stop();
+    } catch {
+      // всё равно выходим
+    }
     this.#capture = null;
     this.#playback = null;
+    this.#voice = null;
     if (this.#poll !== null) {
       window.clearInterval(this.#poll);
       this.#poll = null;
@@ -464,6 +510,7 @@ export class Call {
     this.stream = null;
     this.screens = [];
     this.screenOn = false;
+    this.screenStream = null;
     this.screenAudio = false;
     this.screenAudioAvailable = false;
     this.expanded = false;
@@ -503,30 +550,23 @@ export class Call {
     this.#capture?.setBitrate(track, bps);
   }
 
-  /** Камеру включаем пересбором захвата: кодировщик настраивается один раз. */
+  /**
+   * Камера — отдельной дорожкой захвата.
+   *
+   * Раньше её включали пересбором всего захвата: на секунду пропадал голос, а
+   * идущая демонстрация экрана молча обрывалась.
+   */
   async toggleCamera(): Promise<void> {
-    if (!this.active || !this.space || !this.channel) return;
-    const space = this.space;
-    const channel = this.channel;
+    if (!this.active || !this.#capture) return;
     const next = !this.camOn;
-
-    try {
-      this.#capture?.stop();
-    } catch {
-      // Старый захват мог уже развалиться — это не повод не включать камеру.
+    if (next && !videoSupported()) {
+      this.status = 'эта платформа не умеет кодировать картинку — звонок остаётся голосовым';
+      return;
     }
-    this.#capture = new Capture();
     try {
-      await this.#capture.start({
-        video: next,
-        onError: (message) => (this.status = message),
-        onLevel: (rms) => this.#takeLevel(rms),
-      });
-      this.#capture.setMuted(this.micMuted);
+      await this.#capture.setCamera(next, (message) => (this.status = message));
       this.stream = this.#capture.stream;
       this.camOn = next;
-      this.space = space;
-      this.channel = channel;
     } catch (error) {
       this.status = errorText(error);
     }

@@ -14,6 +14,7 @@ pub mod ctx;
 pub mod dns;
 mod lan;
 pub mod media;
+pub mod ring;
 pub mod sync;
 pub mod wire;
 
@@ -87,6 +88,30 @@ const SYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// всегда есть кто-то, у кого нужное событие уже есть.
 const POSTMAN_EVERY: u32 = 6;
 
+/// Кого почтальон считает «недавно бывшим в сети».
+///
+/// Раньше он обходил всех знакомых подряд, включая тех, кто не открывал
+/// приложение неделями. Каждый такой дозвон — это поиск адреса по справочникам
+/// и распределённой таблице, пробивка NAT вслепую и таймаут, раз в полминуты на
+/// каждого. Всё это шло по тому же узлу, что и звонок, и звук от этого
+/// заикался. Присутствие пишется на диск раз в полминуты, так что десяти минут
+/// с запасом хватает, чтобы не потерять ушедшего ненадолго.
+const POSTMAN_RECENT_MS: i64 = 10 * 60 * 1000;
+
+/// Как часто маячок локалки может заводить сверку с одним и тем же соседом.
+///
+/// Маячок кричит раз в две секунды, и раньше каждый крик означал полный обмен
+/// историей и повторное приглашение в рой — с соседом, который и так на связи.
+const LAN_SYNC_EVERY: Duration = Duration::from_secs(15);
+
+/// Как часто может срабатывать реакция на смену сети.
+///
+/// Внешний адрес за NAT провайдера (а в России это почти всегда так) прыгает
+/// с порта на порт от проверки к проверке. Раньше каждый такой прыжок считался
+/// сменой сети: рвались соединения досинхронизации и шёл дозвон до всех
+/// знакомых сразу — каждые три секунды, посреди разговора.
+const NETWORK_CHANGE_COOLDOWN: Duration = Duration::from_secs(30);
+
 /// Как часто напоминаем о себе соседям по пространству.
 ///
 /// Раньше было десять секунд, и столько же человек смотрел на список, где
@@ -125,6 +150,8 @@ pub struct Net {
     /// маячку локальной сети. Без этого замка все три шли параллельно и втроём
     /// спрашивали у человека одно и то же.
     syncing: parking_lot::Mutex<std::collections::HashSet<(SpaceId, EndpointId)>>,
+    /// Когда маячок локалки в последний раз заводил сверку с соседом.
+    lan_synced: parking_lot::Mutex<HashMap<EndpointId, std::time::Instant>>,
     _router: Router,
 }
 
@@ -170,6 +197,10 @@ impl Net {
             .accept(sync::SYNC_ALPN, sync::SyncProtocol::new(ctx.clone()))
             .accept(blobs::BLOB_ALPN, blobs::BlobProtocol::new(ctx.clone()))
             .accept(media::MEDIA_ALPN, media::MediaProtocol::new(media.clone()))
+            .accept(
+                ring::RING_ALPN,
+                ring::RingProtocol::new(ctx.clone(), media.clone()),
+            )
             .spawn();
 
         // Свой адрес знаем сразу: маячок локальной сети пропускает такт, пока
@@ -189,6 +220,7 @@ impl Net {
             addr_bytes,
             sync_pool: parking_lot::Mutex::new(HashMap::new()),
             syncing: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            lan_synced: parking_lot::Mutex::new(HashMap::new()),
             _router: router,
         });
 
@@ -497,6 +529,17 @@ impl Net {
         .await
     }
 
+    /// Доставить зов или отбой одному человеку — прямым соединением.
+    pub async fn send_ring(&self, peer: crate::domain::Id, frame: &ring::RingFrame) -> Result<()> {
+        let key = self
+            .ctx
+            .space(frame.space)
+            .map(|s| s.key)
+            .ok_or_else(|| anyhow::anyhow!("пространство не найдено"))?;
+        let peer = EndpointId::from_bytes(&peer.0)?;
+        ring::deliver(&self.endpoint, &key, peer, frame).await
+    }
+
     pub async fn publish_typing(
         &self,
         space: SpaceId,
@@ -722,10 +765,16 @@ impl Net {
             }
         }
 
-        let connection = self
-            .endpoint
-            .connect(EndpointAddr::from(peer), sync::SYNC_ALPN)
-            .await?;
+        // Срок на дозвон обязателен: без него попытка до ушедшего соседа висела
+        // до таймаута самого QUIC, а замок `syncing` всё это время не пускал к
+        // нему следующую сверку — даже когда сосед уже вернулся.
+        let connection = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            self.endpoint
+                .connect(EndpointAddr::from(peer), sync::SYNC_ALPN),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("сосед не ответил вовремя"))??;
         self.sync_pool.lock().insert(peer, connection.clone());
 
         match sync::sync_over(&self.ctx, &connection, space).await {
@@ -775,36 +824,54 @@ impl Net {
     fn watch_own_addr(self: Arc<Self>) {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(3));
+            let mut network = network_fingerprint(&self.endpoint.addr());
+            let mut reacted: Option<std::time::Instant> = None;
+            let mut pending = false;
             loop {
                 ticker.tick().await;
-                if let Ok(raw) = postcard::to_stdvec(&self.endpoint.addr()) {
-                    let changed = *self.addr_bytes.read() != raw;
-                    if changed {
+                let addr = self.endpoint.addr();
+                if let Ok(raw) = postcard::to_stdvec(&addr) {
+                    // Сам адрес обновляем всегда: он нужен ссылке-приглашению и
+                    // маячку, и устаревший порт в нём хуже свежего.
+                    if *self.addr_bytes.read() != raw {
                         *self.addr_bytes.write() = raw;
                         let _ = self.ctx.notices.send(Notice::Net);
-                        // Адрес сменился — значит сменилась сеть: ноутбук
-                        // проснулся, переехали на другой Wi-Fi, поднялся или
-                        // упал туннель. Ждать очередного круга опроса здесь
-                        // нельзя: старые соединения уже мертвы, а новые сами
-                        // не заведутся.
-                        self.clone().after_network_change();
                     }
+                }
+
+                // А сменой сети считаем только то, что ею и является: другой
+                // ретранслятор или другой набор адресов. Прыгающий порт за
+                // NAT провайдера — это не новая сеть, а обычный вторник.
+                let now = network_fingerprint(&addr);
+                if now != network {
+                    network = now;
+                    pending = true;
+                }
+                let cooled = reacted.is_none_or(|at| at.elapsed() >= NETWORK_CHANGE_COOLDOWN);
+                if pending && cooled {
+                    pending = false;
+                    reacted = Some(std::time::Instant::now());
+                    // Ноутбук проснулся, переехали на другой Wi-Fi, поднялся
+                    // или упал туннель — ждать очередного круга опроса нельзя.
+                    self.clone().after_network_change();
                 }
             }
         });
     }
 
-    /// Сеть под ногами поменялась: бросаем мёртвые соединения и зовём соседей.
+    /// Сеть под ногами поменялась: зовём соседей и сверяем историю.
     ///
-    /// Соединения досинхронизации переживают смену сети только на бумаге: путь
-    /// до собеседника изменился, а они об этом узнают по таймауту — минутами.
-    /// Дешевле выбросить их сразу.
+    /// Соединения досинхронизации больше не рвём: iroh переносит их на новый
+    /// путь сам, а умершее выбросит первая же неудачная сверка. Раньше пул
+    /// очищался целиком — и при ложной тревоге каждый раз заново поднималось
+    /// по соединению на соседа.
     fn after_network_change(self: Arc<Self>) {
         tokio::spawn(async move {
-            for (_, connection) in self.sync_pool.lock().drain() {
-                connection.close(0u32.into(), "сменилась сеть".as_bytes());
-            }
+            tracing::info!("сменилась сеть — зовём соседей заново");
             self.rejoin_lonely_spaces().await;
+            // Смена сети — событие редкое (раз в полминуты от силы), и здесь
+            // спрашиваем всех знакомых, а не только недавно виденных: после
+            // сна ноутбука «недавно» не был никто.
             for space in self.ctx.space_list() {
                 for peer in self.known_ids(space.id) {
                     self.clone().catch_up(space.id, peer);
@@ -921,7 +988,7 @@ impl Net {
                         .map(|set| set.iter().copied().collect())
                         .unwrap_or_default();
                     if postman {
-                        for peer in self.known_ids(space.id) {
+                        for peer in self.reachable_ids(space.id) {
                             if !peers.contains(&peer) {
                                 peers.push(peer);
                             }
@@ -934,6 +1001,12 @@ impl Net {
                     // нужнее всего. Поэтому если рой молчит, спрашиваем тех, с
                     // кем уже разговаривали: они и есть участники пространства.
                     if peers.is_empty() {
+                        peers = self.reachable_ids(space.id);
+                    }
+                    // Никого и среди недавних — значит, мы сами долго были
+                    // офлайн, и «недавно» не был никто. Тогда раз в круг
+                    // почтальона стучимся ко всем знакомым: дорого, но редко.
+                    if peers.is_empty() && postman {
                         peers = self.known_ids(space.id);
                     }
                     // Сверка дешёвая: расходятся версии — приезжают только
@@ -970,6 +1043,27 @@ impl Net {
             .collect()
     }
 
+    /// Те, до кого есть смысл дозваниваться прямо сейчас: кто на связи по
+    /// присутствию или был в сети последние минуты.
+    ///
+    /// Адреса из базы при этом всё равно кладутся в справочник — через
+    /// `known_ids`, — чтобы дозвон не зависел от внешних служб имён.
+    fn reachable_ids(&self, space: SpaceId) -> Vec<EndpointId> {
+        let known = self.known_ids(space);
+        let mut recent: std::collections::HashSet<crate::domain::Id> = self
+            .ctx
+            .store
+            .recent_peers(space, now_ms() - POSTMAN_RECENT_MS)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        recent.extend(self.ctx.presence_of(space).into_iter().map(|p| p.author));
+        known
+            .into_iter()
+            .filter(|id| recent.contains(&crate::domain::Id(*id.as_bytes())))
+            .collect()
+    }
+
     /// Локальная сеть: слушаем маячки и подключаемся к найденным.
     fn serve_lan(self: Arc<Self>) {
         let mut found = lan::spawn(self.ctx.clone(), self.addr_bytes.clone());
@@ -984,18 +1078,68 @@ impl Net {
                 // Кладём адрес в справочник, чтобы gossip мог до него дозвониться.
                 self.lookup.add_endpoint_info(addr.clone());
 
+                // Маячок кричит раз в две секунды, а сосед, как правило, уже на
+                // связи. Звать его в рой и сверять историю на каждый крик —
+                // лишняя работа на том же узле, по которому идёт звонок.
+                let due = {
+                    let mut seen = self.lan_synced.lock();
+                    let due = seen
+                        .get(&addr.id)
+                        .is_none_or(|at| at.elapsed() >= LAN_SYNC_EVERY);
+                    if due {
+                        seen.insert(addr.id, std::time::Instant::now());
+                    }
+                    due
+                };
                 for space in spaces {
+                    let neighbour = self
+                        .neighbors
+                        .read()
+                        .get(&space)
+                        .is_some_and(|set| set.contains(&addr.id));
+                    if neighbour && !due {
+                        continue;
+                    }
                     // Клонируем отправителя и сразу отпускаем блокировку:
                     // держать её через .await нельзя — future перестаёт быть Send.
                     let sender = self.senders.read().get(&space).cloned();
-                    if let Some(sender) = sender {
+                    if let (Some(sender), false) = (sender, neighbour) {
                         let _ = sender.join_peers(vec![addr.id]).await;
                     }
-                    self.clone().catch_up(space, addr.id);
+                    // Сверка — по тому же расписанию и для тех, кто ещё не
+                    // сосед по рою: позвать его в рой дёшево, гонять историю
+                    // на каждый крик маячка — нет.
+                    if due {
+                        self.clone().catch_up(space, addr.id);
+                    }
                 }
             }
         });
     }
+}
+
+/// Чем сеть отличается от другой сети: ретранслятор и собственные адреса
+/// интерфейсов.
+///
+/// Внешний адрес сюда не входит намеренно. За NAT провайдера его порт меняется
+/// от проверки к проверке, а у части провайдеров — и сам адрес, из общего
+/// пула, и раньше каждый такой прыжок выглядел сменой сети. Настоящая смена —
+/// другой Wi-Fi, поднятый туннель — меняет адреса самих интерфейсов.
+fn network_fingerprint(addr: &EndpointAddr) -> Vec<String> {
+    let mut parts: Vec<String> = addr
+        .addrs
+        .iter()
+        .filter_map(|addr| match addr {
+            iroh::TransportAddr::Relay(url) => Some(format!("relay {url}")),
+            iroh::TransportAddr::Ip(socket) if is_local(&socket.ip()) => {
+                Some(format!("ip {}", socket.ip()))
+            }
+            _ => None,
+        })
+        .collect();
+    parts.sort();
+    parts.dedup();
+    parts
 }
 
 /// Адрес из домашней сети, по которому нас не найти из другого города.
@@ -1041,5 +1185,36 @@ impl Net {
     /// Сколько живых соседей во всех пространствах вместе.
     pub fn neighbor_count(&self) -> usize {
         self.neighbors.read().values().map(|set| set.len()).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(ips: &[&str]) -> EndpointAddr {
+        let id = iroh::SecretKey::from_bytes(&[7u8; 32]).public();
+        let mut addr = EndpointAddr::new(id)
+            .with_relay_url("https://euc1-1.relay.n0.iroh.link./".parse().unwrap());
+        for ip in ips {
+            addr = addr.with_ip_addr(ip.parse().unwrap());
+        }
+        addr
+    }
+
+    #[test]
+    fn hopping_external_port_is_not_a_new_network() {
+        // За NAT провайдера внешний порт меняется от проверки к проверке, а у
+        // части провайдеров — и сам адрес. Сменой сети это не считается.
+        let before = addr(&["192.168.1.5:50000", "95.24.1.1:41000"]);
+        let after = addr(&["192.168.1.5:50000", "95.24.7.9:52311"]);
+        assert_eq!(network_fingerprint(&before), network_fingerprint(&after));
+    }
+
+    #[test]
+    fn other_wifi_is_a_new_network() {
+        let home = addr(&["192.168.1.5:50000"]);
+        let cafe = addr(&["10.0.0.17:50000"]);
+        assert_ne!(network_fingerprint(&home), network_fingerprint(&cafe));
     }
 }

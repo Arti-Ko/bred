@@ -1,0 +1,22 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "desktop",
+  "description": "Только десктоп: обновления, перезапуск, полный экран для демонстрации и отдельное окно боя. На телефоне этого нет — и прав на это там не нужно.",
+  "platforms": [
+    "macOS",
+    "windows",
+    "linux"
+  ],
+  "windows": [
+    "main",
+    "gundyr"
+  ],
+  "permissions": [
+    "updater:default",
+    "process:allow-restart",
+    "core:window:allow-set-fullscreen",
+    "core:window:allow-is-fullscreen",
+    "core:webview:allow-create-webview-window",
+    "core:window:allow-close"
+  ]
+}

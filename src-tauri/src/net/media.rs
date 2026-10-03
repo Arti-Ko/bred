@@ -59,6 +59,29 @@ const RECONCILE: Duration = Duration::from_secs(1);
 /// NAT ровно с одной стороны), ждать его вечно нельзя: связи не будет вообще.
 /// Поэтому через несколько секунд право набирать получает и вторая сторона.
 const DIAL_FALLBACK: Duration = Duration::from_secs(3);
+/// Сколько ждём, пока собеседник возьмёт трубку.
+///
+/// Без срока недозвон висел до таймаута самого QUIC, а сверка тем временем
+/// каждую секунду заводила следующий: к одному человеку шло по пять попыток
+/// сразу, и они вытесняли друг друга по мере того, как доходили.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
+/// Как часто напоминаем собеседнику по медиа-соединению, что мы на связи.
+///
+/// Звук идёт непрерывно, но не всегда: микрофон может не отдать ни кадра, а
+/// старый собеседник — молчать по своим причинам. Отметка раз в секунду стоит
+/// сорок пять байт и отличает «молчит» от «пропал».
+const PING_EVERY: Duration = Duration::from_secs(1);
+/// Сколько тишины терпим от соединения, прежде чем считать его мёртвым.
+///
+/// Это и есть «протухшая комната». Собеседник перезапустил приложение, уснул
+/// вместе с ноутбуком или сменил сеть — а у нас в таблице оставалось его
+/// прежнее соединение. Пока оно там, набирать его заново было некому: сверка
+/// видела «уже на связи» и шла дальше, а QUIC узнаёт о смерти пути только по
+/// своему таймауту. Пришедший в комнату через полчаса попадал ровно сюда.
+const SILENT_AFTER: Duration = Duration::from_secs(6);
+/// Сколько тишины достаточно, чтобы новое соединение вытеснило старое,
+/// даже если старое «правильного» направления.
+const QUIET_FOR_REPLACE: Duration = Duration::from_secs(2);
 /// Сколько кадров держим в сборке, прежде чем признать их потерянными.
 const REASSEMBLY_WINDOW: usize = 24;
 /// Запас на служебные поля и шифрование внутри датаграммы.
@@ -242,6 +265,11 @@ pub enum Track {
     /// каждого слушателя, свой битрейт и два канала вместо одного. Музыка в
     /// моно на тридцати двух килобитах — это уже не музыка.
     Music,
+    /// «Я на связи» — пустой кадр раз в секунду, только для отметки живости.
+    ///
+    /// Старые версии такую дорожку не знают и молча отбрасывают кадр — им он и
+    /// не нужен, они шлют звук непрерывно.
+    Ping,
 }
 
 impl Track {
@@ -252,6 +280,11 @@ impl Track {
         matches!(self, Track::Video | Track::Screen)
     }
 
+    /// Звук разбирает собственный движок ядра, а не вебвью.
+    pub fn is_audio(self) -> bool {
+        matches!(self, Track::Audio | Track::ScreenAudio | Track::Music)
+    }
+
     fn code(self) -> u8 {
         match self {
             Track::Audio => 0,
@@ -259,16 +292,18 @@ impl Track {
             Track::Screen => 2,
             Track::ScreenAudio => 3,
             Track::Music => 4,
+            Track::Ping => 5,
         }
     }
 
-    fn from_code(code: u8) -> Option<Self> {
+    pub fn from_code(code: u8) -> Option<Self> {
         match code {
             0 => Some(Track::Audio),
             1 => Some(Track::Video),
             2 => Some(Track::Screen),
             3 => Some(Track::ScreenAudio),
             4 => Some(Track::Music),
+            5 => Some(Track::Ping),
             _ => None,
         }
     }
@@ -281,9 +316,24 @@ impl Track {
             Track::Screen => "screen",
             Track::ScreenAudio => "screen-audio",
             Track::Music => "music",
+            Track::Ping => "ping",
         }
     }
 }
+
+/// Звуковой кадр, пришедший от собеседника, — для движка звука в ядре.
+#[derive(Debug, Clone)]
+pub struct AudioPacket {
+    pub author: Id,
+    pub track: Track,
+    pub seq: u32,
+    /// У музыки — число каналов, у голоса не значит ничего.
+    pub codec: u8,
+    pub data: Vec<u8>,
+}
+
+/// Куда отдавать звук: движок звука живёт в своём модуле и про сеть не знает.
+pub type AudioTap = Arc<dyn Fn(AudioPacket) + Send + Sync>;
 
 /// Заголовок обмена с интерфейсом. Компактный бинарный формат: гонять кадры
 /// видео через JSON было бы вчетверо дороже.
@@ -435,6 +485,12 @@ struct Peer {
     connection: Connection,
     video: Arc<FrameQueue>,
     screen: Arc<FrameQueue>,
+    /// Мы ли набирали. По направлению обе стороны одинаково решают, какое из
+    /// двух встречных соединений оставить.
+    outgoing: bool,
+    /// Когда соединение поднялось: свежему даём время заговорить.
+    born: Instant,
+    state: Arc<Link>,
 }
 
 /// Всё, что нужно горячему пути приёма, — без единой блокировки.
@@ -442,6 +498,32 @@ struct Link {
     author: Id,
     cipher: ChaCha20Poly1305,
     channel_tag: [u8; 4],
+    /// Когда от собеседника последний раз пришёл годный кадр, в миллисекундах
+    /// от рождения `Media`. Атомик, а не замок: обновляется на каждом пакете.
+    heard: AtomicU64,
+}
+
+/// Попытка дозвониться до участника комнаты.
+struct Dial {
+    /// С какого момента его ждём — от этого зависит, звоним ли мы сами.
+    since: Instant,
+    /// Идёт ли попытка прямо сейчас: вторую поверх первой не заводим.
+    inflight: bool,
+}
+
+/// Кто из двух встречных соединений правильный.
+///
+/// Правило одинаковое на обеих сторонах: побеждает то, что набирал участник с
+/// меньшим идентификатором. Раньше каждая сторона оставляла последнее, что до
+/// неё дошло, и порядок прихода у двух машин различался — каждая закрывала
+/// ровно то соединение, которое оставила другая, и в итоге не оставалось ни
+/// одного.
+fn dialed_by_smaller(me: Id, remote: Id, outgoing: bool) -> bool {
+    if outgoing {
+        me.0 < remote.0
+    } else {
+        remote.0 < me.0
+    }
 }
 
 /// Активный звонок.
@@ -469,15 +551,19 @@ pub struct Media {
     /// Счётчик nonce общий на все соединения: кадр шифруется один раз и уходит
     /// всем, поэтому и номер у него должен быть один.
     nonce: AtomicU64,
-    /// Куда отдавать собранные кадры — интерфейсу.
+    /// Куда отдавать собранные кадры картинки — интерфейсу.
     sink: RwLock<Option<Sender<Vec<u8>>>>,
+    /// Куда отдавать звук — движку звука в ядре.
+    audio: RwLock<Option<AudioTap>>,
     /// Сколько кадров выброшено из-за переполнения — видно в логах.
     dropped: Mutex<u64>,
-    /// Кого уже пробуем набрать и с какого момента.
-    dialing: Mutex<HashMap<Id, Instant>>,
+    /// Кого уже пробуем набрать, с какого момента и идёт ли попытка сейчас.
+    dialing: Mutex<HashMap<Id, Dial>>,
     /// Подбор битрейта по дорожкам картинки.
     governors: Mutex<HashMap<Track, Governor>>,
     links: AtomicU64,
+    /// Отсчёт для отметок живости: `Instant` в атомик не положить.
+    epoch: Instant,
 }
 
 impl Media {
@@ -490,12 +576,18 @@ impl Media {
             outgoing: Mutex::new(HashMap::new()),
             reassembly: Mutex::new(Reassembly::default()),
             sending: RwLock::new(None),
-            nonce: AtomicU64::new(0),
+            // Со случайного места, а не с нуля: ключ дорожки от запуска к
+            // запуску один и тот же, и счёт с нуля повторял бы пары (ключ,
+            // nonce) прошлых сессий. Получатель берёт счётчик из кадра, так что
+            // старым версиям это не мешает.
+            nonce: AtomicU64::new(rand::random::<u64>() >> 1),
             sink: RwLock::new(None),
+            audio: RwLock::new(None),
             dropped: Mutex::new(0),
             dialing: Mutex::new(HashMap::new()),
             governors: Mutex::new(HashMap::new()),
             links: AtomicU64::new(0),
+            epoch: Instant::now(),
         });
         media.clone().reconcile_loop();
         media.clone().governor_loop();
@@ -504,6 +596,28 @@ impl Media {
 
     pub fn set_sink(&self, sink: Sender<Vec<u8>>) {
         *self.sink.write() = Some(sink);
+    }
+
+    pub fn set_audio(&self, tap: AudioTap) {
+        *self.audio.write() = Some(tap);
+    }
+
+    fn now_ms(&self) -> u64 {
+        self.epoch.elapsed().as_millis() as u64
+    }
+
+    /// Сколько собеседник молчит по этому соединению.
+    fn silence(&self, link: &Link) -> Duration {
+        Duration::from_millis(
+            self.now_ms()
+                .saturating_sub(link.heard.load(Ordering::Relaxed)),
+        )
+    }
+
+    /// Жив ли собеседник: недавно слышали — или соединение ещё слишком молодо,
+    /// чтобы судить.
+    fn alive(&self, peer: &Peer) -> bool {
+        peer.born.elapsed() < SILENT_AFTER || self.silence(&peer.state) < SILENT_AFTER
     }
 
     pub fn active(&self) -> Option<(SpaceId, ChannelId)> {
@@ -553,6 +667,17 @@ impl Media {
             peer.screen.close();
             peer.connection.close(0u32.into(), why.as_bytes());
         }
+    }
+
+    /// С кем медиа-соединение поднято прямо сейчас. Присутствие говорит, кто в
+    /// комнате, а это — кого мы на самом деле слышим.
+    pub fn connected(&self) -> Vec<Id> {
+        self.peers
+            .read()
+            .values()
+            .filter(|peer| self.alive(peer))
+            .map(|peer| peer.state.author)
+            .collect()
     }
 
     /// Кто сейчас в той же комнате — по присутствию.
@@ -668,7 +793,10 @@ impl Media {
     }
 
     /// Приём от одного собеседника: датаграммы со звуком и потоки с картинкой.
-    async fn pump(self: Arc<Self>, connection: Connection) {
+    ///
+    /// `outgoing` — набирали ли мы сами: по направлению обе стороны одинаково
+    /// решают, какое из встречных соединений оставить.
+    async fn pump(self: Arc<Self>, connection: Connection, outgoing: bool) {
         let remote = connection.remote_id();
         let author = Id(*remote.as_bytes());
 
@@ -684,29 +812,65 @@ impl Media {
             author,
             cipher: media_key(&key, author),
             channel_tag: channel_tag(call.channel),
+            heard: AtomicU64::new(self.now_ms()),
         });
 
         let id = self.links.fetch_add(1, Ordering::Relaxed);
         let video = FrameQueue::new();
         let screen = FrameQueue::new();
 
-        if let Some(old) = self.peers.write().insert(
-            remote,
-            Peer {
-                link: id,
-                connection: connection.clone(),
-                video: video.clone(),
-                screen: screen.clone(),
-            },
-        ) {
-            // Встречный дозвон: две стороны подняли связь одновременно. Лишнюю
-            // закрываем, иначе кадры пошли бы в оба ствола сразу.
+        let replaced = {
+            let mut peers = self.peers.write();
+            // Пока поднималась связь, мы могли выйти или перейти в другую
+            // комнату. Такое соединение — из прошлого: его кадры шли бы в
+            // движок, а сверка, видя «не в звонке», уже не закрыла бы его.
+            let still_here =
+                self.call.read().map(|c| (c.space, c.channel)) == Some((call.space, call.channel));
+            if !still_here {
+                drop(peers);
+                connection.close(0u32.into(), "уже не в этой комнате".as_bytes());
+                return;
+            }
+            // Встречный дозвон: две стороны подняли связь одновременно. Какое
+            // оставить — решает правило, одинаковое на обеих сторонах, а не
+            // порядок прихода, который у двух машин различается.
+            if let Some(old) = peers.get(&remote) {
+                let me = self.ctx.identity.id();
+                let old_quiet = self.silence(&old.state) >= QUIET_FOR_REPLACE;
+                let keep_old = !old_quiet
+                    && dialed_by_smaller(me, author, old.outgoing)
+                    && !dialed_by_smaller(me, author, outgoing);
+                if keep_old {
+                    drop(peers);
+                    connection.close(0u32.into(), "есть другое соединение".as_bytes());
+                    return;
+                }
+            }
+            peers.insert(
+                remote,
+                Peer {
+                    link: id,
+                    connection: connection.clone(),
+                    video: video.clone(),
+                    screen: screen.clone(),
+                    outgoing,
+                    born: Instant::now(),
+                    state: link.clone(),
+                },
+            )
+        };
+        if let Some(old) = replaced {
+            // Лишнее закрываем, иначе кадры пошли бы в оба ствола сразу.
             old.video.close();
             old.screen.close();
             old.connection
                 .close(0u32.into(), "есть другое соединение".as_bytes());
         }
         self.dialing.lock().remove(&author);
+        // Собеседник мог перезайти, и номера его кадров начались с нуля. Всё,
+        // что помнила о нём сборка, относится к прошлой жизни и только мешает.
+        self.reassembly.lock().forget(author);
+        tracing::debug!(peer = %remote.fmt_short(), outgoing, "медиа-соединение поднято");
 
         // Новый собеседник не увидит картинку до ближайшего ключевого кадра, а
         // тот приходит по расписанию — до нескольких секунд чёрного экрана.
@@ -750,8 +914,41 @@ impl Media {
         if head.channel_tag != link.channel_tag {
             return; // кадр из другой комнаты
         }
+        link.heard.store(self.now_ms(), Ordering::Relaxed);
+        if head.track == Track::Ping {
+            return; // своё дело он уже сделал — отметил, что собеседник на связи
+        }
 
-        if let Some(frame) = self.reassembly.lock().push(link.author, head, data) {
+        let Some(frame) = self.reassembly.lock().push(link.author, head, data) else {
+            return;
+        };
+
+        // Звук разбирает движок ядра: джиттер-буфер, восстановление потерь и
+        // сведение в один поток. В вебвью он больше не ходит по кадру.
+        if frame.track.is_audio() {
+            let tap = self.audio.read().clone();
+            if let Some(tap) = tap {
+                tap(AudioPacket {
+                    author: link.author,
+                    track: frame.track,
+                    seq: frame.seq,
+                    codec: frame.codec,
+                    data: frame.data,
+                });
+            }
+            return;
+        }
+
+        let frame = encode_for_ui(
+            link.author,
+            frame.track,
+            frame.keyframe,
+            frame.codec,
+            frame.ts,
+            frame.seq,
+            &frame.data,
+        );
+        {
             if let Some(sink) = self.sink.read().as_ref() {
                 // Очередь переполнена — значит интерфейс не успевает. Кадр
                 // выбрасываем: показать его с опозданием всё равно нельзя.
@@ -772,22 +969,31 @@ impl Media {
     /// Раз в секунду сверяем, кто в комнате, и держим сетку соединений.
     fn reconcile_loop(self: Arc<Self>) {
         tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(RECONCILE);
+            let mut ticker = tokio::time::interval(RECONCILE.min(PING_EVERY));
             loop {
                 ticker.tick().await;
                 self.reconcile();
+                // Отметка живости — тем же тиком: отдельный таймер ради
+                // сорока пяти байт в секунду не нужен.
+                if self.call.read().is_some() {
+                    let _ = self.broadcast(Track::Ping, false, 0, 0, &[]);
+                }
             }
         });
     }
 
-    /// Один проход сверки: дозвониться до всех, кого в сетке ещё нет.
+    /// Один проход сверки: убрать замолчавших и дозвониться до всех, кого в
+    /// сетке нет.
     fn reconcile(self: &Arc<Self>) {
         if self.call.read().is_none() {
             return;
         }
         let me = self.ctx.identity.id();
+        let participants = self.participants();
 
-        for participant in self.participants() {
+        self.drop_silent(&participants);
+
+        for participant in participants {
             if participant == me {
                 continue;
             }
@@ -803,29 +1009,80 @@ impl Media {
             // две встречные связи. Но если у него не выходит — а при
             // одностороннем недружелюбном NAT так и бывает, — через несколько
             // секунд пробуем и мы. Встречный дозвон разрулит `pump`: лишнее
-            // соединение он закроет.
-            let waiting = {
+            // соединение он закроет по правилу, одинаковому для обеих сторон.
+            {
                 let mut dialing = self.dialing.lock();
-                let since = dialing.entry(participant).or_insert_with(Instant::now);
-                since.elapsed()
-            };
-            if me.0 > participant.0 && waiting < DIAL_FALLBACK {
-                continue;
+                let dial = dialing.entry(participant).or_insert_with(|| Dial {
+                    since: Instant::now(),
+                    inflight: false,
+                });
+                if dial.inflight {
+                    continue; // прежняя попытка ещё идёт — вторая её только вытеснит
+                }
+                if me.0 > participant.0 && dial.since.elapsed() < DIAL_FALLBACK {
+                    continue;
+                }
+                dial.inflight = true;
             }
 
             let media = self.clone();
             tokio::spawn(async move {
-                match media
-                    .endpoint
-                    .connect(EndpointAddr::from(peer), MEDIA_ALPN)
-                    .await
-                {
-                    Ok(connection) => media.pump(connection).await,
-                    Err(err) => {
+                let attempt = tokio::time::timeout(
+                    DIAL_TIMEOUT,
+                    media.endpoint.connect(EndpointAddr::from(peer), MEDIA_ALPN),
+                )
+                .await;
+                if let Some(dial) = media.dialing.lock().get_mut(&participant) {
+                    dial.inflight = false;
+                }
+                match attempt {
+                    Ok(Ok(connection)) => media.pump(connection, true).await,
+                    Ok(Err(err)) => {
                         tracing::debug!(peer = %peer.fmt_short(), %err, "звонок не дозвонился")
+                    }
+                    Err(_) => {
+                        tracing::debug!(peer = %peer.fmt_short(), "звонок: собеседник не ответил вовремя")
                     }
                 }
             });
+        }
+    }
+
+    /// Закрыть соединения, по которым давно ничего не приходит.
+    ///
+    /// QUIC узнаёт о смерти пути только по собственному таймауту, и всё это время
+    /// мёртвое соединение занимало место живого: сверка видела «уже на связи» и
+    /// не набирала человека заново. Отсюда и «зашёл в комнату через полчаса — не
+    /// соединяет, помогает только перезайти».
+    ///
+    /// Того, кого в комнате больше нет, тоже отпускаем — но только когда он ещё
+    /// и замолчал: присутствие пропадает и на ровном месте, при перестройке роя,
+    /// а живой звонок из-за этого рвать нельзя.
+    fn drop_silent(&self, participants: &[Id]) {
+        let dead: Vec<EndpointId> = self
+            .peers
+            .read()
+            .iter()
+            .filter(|(_, peer)| !self.alive(peer))
+            .map(|(id, _)| *id)
+            .collect();
+        if dead.is_empty() {
+            return;
+        }
+        let mut peers = self.peers.write();
+        for id in dead {
+            let Some(peer) = peers.remove(&id) else {
+                continue;
+            };
+            let inside = participants.contains(&peer.state.author);
+            tracing::info!(
+                peer = %id.fmt_short(),
+                inside,
+                "собеседник замолчал — соединение закрыто, наберём заново"
+            );
+            peer.video.close();
+            peer.screen.close();
+            peer.connection.close(0u32.into(), "молчание".as_bytes());
         }
     }
 
@@ -983,23 +1240,34 @@ struct Partial {
     ts: i64,
 }
 
+/// Собранный кадр. Куда его дальше — в движок звука или в вебвью — решает
+/// `on_packet` по дорожке.
+#[derive(Debug)]
+struct Frame {
+    track: Track,
+    keyframe: bool,
+    codec: u8,
+    ts: i64,
+    seq: u32,
+    data: Vec<u8>,
+}
+
 impl Reassembly {
-    fn push(&mut self, author: Id, head: Head, data: Vec<u8>) -> Option<Vec<u8>> {
+    fn push(&mut self, author: Id, head: Head, data: Vec<u8>) -> Option<Frame> {
         if head.parts == 0 || head.part >= head.parts {
             return None;
         }
 
         // Однофрагментный кадр — самый частый случай для звука, не заводим запись.
         if head.parts == 1 {
-            return Some(encode_for_ui(
-                author,
-                head.track,
-                head.keyframe,
-                head.codec,
-                head.ts,
-                head.seq,
-                &data,
-            ));
+            return Some(Frame {
+                track: head.track,
+                keyframe: head.keyframe,
+                codec: head.codec,
+                ts: head.ts,
+                seq: head.seq,
+                data,
+            });
         }
 
         let key = (author, head.track, head.seq);
@@ -1026,15 +1294,14 @@ impl Reassembly {
                 whole.extend_from_slice(&part);
             }
             self.forget_older_than(author, head.track, head.seq);
-            return Some(encode_for_ui(
-                author,
-                head.track,
-                done.keyframe,
-                done.codec,
-                done.ts,
-                head.seq,
-                &whole,
-            ));
+            return Some(Frame {
+                track: head.track,
+                keyframe: done.keyframe,
+                codec: done.codec,
+                ts: done.ts,
+                seq: head.seq,
+                data: whole,
+            });
         }
 
         self.forget_older_than(author, head.track, head.seq);
@@ -1062,6 +1329,14 @@ impl Reassembly {
         self.pending.clear();
         self.newest.clear();
     }
+
+    /// Забыть всё об одном собеседнике — он перезашёл, и счёт кадров у него
+    /// начался заново. Без этого его новые кадры с маленькими номерами
+    /// считались бы безнадёжно устаревшими и выбрасывались из сборки.
+    fn forget(&mut self, author: Id) {
+        self.pending.retain(|(a, _, _), _| *a != author);
+        self.newest.retain(|(a, _), _| *a != author);
+    }
 }
 
 /// Приём входящих медиа-соединений.
@@ -1084,7 +1359,7 @@ impl std::fmt::Debug for MediaProtocol {
 
 impl ProtocolHandler for MediaProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
-        self.media.clone().pump(connection).await;
+        self.media.clone().pump(connection, false).await;
         Ok(())
     }
 }
@@ -1239,7 +1514,7 @@ mod tests {
         let out = r
             .push(author(1), head(1, 0, 1), b"audio".to_vec())
             .expect("кадр целиком");
-        assert_eq!(&out[UI_HEADER..], b"audio");
+        assert_eq!(out.data, b"audio");
         assert!(
             r.pending.is_empty(),
             "однофрагментный кадр не должен копиться"
@@ -1254,11 +1529,7 @@ mod tests {
         let out = r
             .push(author(1), head(7, 1, 3), b"bbb".to_vec())
             .expect("кадр собрался");
-        assert_eq!(
-            &out[UI_HEADER..],
-            b"aaabbbccc",
-            "порядок должен быть по индексу"
-        );
+        assert_eq!(out.data, b"aaabbbccc", "порядок должен быть по индексу");
     }
 
     #[test]
@@ -1272,7 +1543,7 @@ mod tests {
         let out = r
             .push(author(1), head(3, 1, 2), b"bb".to_vec())
             .expect("кадр собрался");
-        assert_eq!(&out[UI_HEADER..], b"aabb");
+        assert_eq!(out.data, b"aabb");
     }
 
     #[test]
@@ -1305,7 +1576,7 @@ mod tests {
             out.is_some(),
             "опоздавший пакет не должен ронять свежие кадры"
         );
-        assert_eq!(&out.unwrap()[UI_HEADER..], b"aabb");
+        assert_eq!(out.unwrap().data, b"aabb");
     }
 
     #[test]
@@ -1317,12 +1588,38 @@ mod tests {
         let first = r
             .push(author(1), head(5, 1, 2), b"bb".to_vec())
             .expect("кадр первого собрался");
-        assert_eq!(&first[UI_HEADER..], b"aabb", "куски не должны перепутаться");
+        assert_eq!(first.data, b"aabb", "куски не должны перепутаться");
+        assert_eq!(first.seq, 5);
+    }
+
+    #[test]
+    fn rejoined_author_starts_fresh() {
+        let mut r = Reassembly::default();
+        // Долгий звонок: номера кадров ушли далеко вперёд.
+        assert!(r
+            .push(author(1), head(90_000, 0, 2), b"aa".to_vec())
+            .is_none());
+        r.forget(author(1));
+        // Человек перезашёл, счёт начался с единицы.
+        assert!(r.push(author(1), head(1, 0, 2), b"xx".to_vec()).is_none());
+        let out = r.push(author(1), head(1, 1, 2), b"yy".to_vec());
         assert_eq!(
-            &first[3..35],
-            &author(1).0,
-            "автор берётся из соединения, а не из пакета"
+            out.map(|f| f.data),
+            Some(b"xxyy".to_vec()),
+            "новые кадры перезашедшего не должны считаться устаревшими"
         );
+    }
+
+    #[test]
+    fn connection_choice_is_the_same_on_both_sides() {
+        let small = Id([1u8; 32]);
+        let big = Id([2u8; 32]);
+        // Соединение, которое набирал меньший, «правильное» с обеих сторон.
+        assert!(dialed_by_smaller(small, big, true));
+        assert!(dialed_by_smaller(big, small, false));
+        // И наоборот — набранное большим неправильное у обоих.
+        assert!(!dialed_by_smaller(small, big, false));
+        assert!(!dialed_by_smaller(big, small, true));
     }
 
     #[test]

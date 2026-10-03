@@ -1,6 +1,6 @@
 [package]
 name = "bred"
-version = "0.6.9"
+version = "0.7.0"
 description = "БРЕД — Быстрая Ретрансляция Электронных Данных"
 edition = "2021"
 rust-version = "1.91"
@@ -24,6 +24,10 @@ iroh = "1"
 iroh-gossip = { version = "0.101", default-features = false, features = ["net"] }
 iroh-mainline-address-lookup = "0.5.0"
 n0-future = "0.3"
+# Opus 1.6 в ядре: восстановление потерь (FEC), нейросетевое маскирование
+# (deep PLC) и глубокая избыточность (DRED). В вебвью всего этого нет —
+# WebCodecs не умеет ни декодировать FEC, ни маскировать пропуски.
+opusic-c = { version = "1.6.1", features = ["dred"] }
 parking_lot = "0.12.5"
 postcard = { version = "1.1.3", features = ["use-std"] }
 rand = "0.9.5"
@@ -34,13 +38,18 @@ socket2 = "0.6.5"
 tauri = { version = "2" }
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-notification = "2.3.3"
-tauri-plugin-process = "2.3.1"
-tauri-plugin-updater = "2.10.1"
 thiserror = "2.0.19"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
+
+# Обновление и перезапуск — только на десктопе. На телефоне сборку ставит
+# магазин, и тащить туда собственный установщик бессмысленно: он там не
+# соберётся и не нужен.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-plugin-process = "2.3.1"
+tauri-plugin-updater = "2.10.1"
 
 # Захват звука чужого приложения и медиа-клавиши. Только на маке: на других
 # платформах модуль `player` собирается заглушкой, и тянуть Objective-C туда

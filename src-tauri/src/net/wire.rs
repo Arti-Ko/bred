@@ -162,12 +162,18 @@ pub fn wrap(key: &[u8; 32], message: &Broadcast) -> Result<Vec<u8>> {
 }
 
 /// Распаковать сообщение роя. `Err` с версией — собеседник на другой версии.
+///
+/// Тело той же версии, которое не разобралось, — это новый вид эфемерного
+/// сообщения от более свежего БРЕД. Раньше это превращалось в «у собеседника
+/// другая версия, формат 3 против 3» — неправда, которая пугала зря. Теперь
+/// такое сообщение просто пропускается: события лога так не теряются, их
+/// догонит досинхронизация.
 pub fn unwrap(key: &[u8; 32], raw: &[u8]) -> Result<Broadcast, Option<u16>> {
     let envelope: Envelope = open(key, raw).map_err(|_| None)?;
     if envelope.version != PROTOCOL {
         return Err(Some(envelope.version));
     }
-    postcard::from_bytes(&envelope.body).map_err(|_| Some(envelope.version))
+    postcard::from_bytes(&envelope.body).map_err(|_| None)
 }
 
 /// Зашифровать сообщение ключом пространства.
@@ -236,6 +242,22 @@ pub async fn read_frame<R: tokio::io::AsyncReadExt + Unpin>(r: &mut R) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_message_of_same_version_is_not_a_version_clash() {
+        let key = [6u8; 32];
+        // Так выглядит для старой версии новый вид сообщения: конверт тот же,
+        // а тело не разбирается.
+        let sealed = seal(
+            &key,
+            &Envelope {
+                version: PROTOCOL,
+                body: vec![250, 1, 2, 3],
+            },
+        )
+        .unwrap();
+        assert!(matches!(unwrap(&key, &sealed), Err(None)));
+    }
 
     #[test]
     fn sealed_message_opens_with_same_key() {

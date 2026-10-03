@@ -133,6 +133,30 @@ CREATE TABLE IF NOT EXISTS reads (
     channel       BLOB PRIMARY KEY,
     read_lamport  INTEGER NOT NULL DEFAULT 0
 );
+
+-- Устройства аккаунтов: кто чей. Строка — проверенное удостоверение,
+-- подписанное ключом аккаунта; отзыв помечает её, но не стирает: события,
+-- подписанные до отзыва, по-прежнему чьи-то.
+CREATE TABLE IF NOT EXISTS devices (
+    account  BLOB NOT NULL,
+    device   BLOB NOT NULL,
+    name     TEXT NOT NULL,
+    issued   INTEGER NOT NULL,
+    cert     BLOB NOT NULL,
+    revoked  INTEGER,
+    PRIMARY KEY (account, device)
+);
+CREATE INDEX IF NOT EXISTS devices_device ON devices(device);
+
+-- Отзывы — отдельно от удостоверений: они могут приехать в любом порядке.
+-- Отзыв, пришедший раньше удостоверения, иначе терялся бы, а удостоверение,
+-- выданное заново после отзыва, оставалось бы погашенным навсегда.
+CREATE TABLE IF NOT EXISTS device_revocations (
+    account  BLOB NOT NULL,
+    device   BLOB NOT NULL,
+    at       INTEGER NOT NULL,
+    PRIMARY KEY (account, device)
+);
 "#;
 
 /// Приведение базы к текущей схеме.

@@ -6,6 +6,7 @@
   import { previewUrl } from '../previews';
 
   let selfVideo: HTMLVideoElement | undefined = $state();
+  let selfScreen: HTMLVideoElement | undefined = $state();
   /** Чья громкость настраивается: открывается правым кликом по плитке. */
   let tuning = $state<string | null>(null);
   /** Картинки профилей — их показываем вместо инициалов. */
@@ -16,6 +17,13 @@
     if (selfVideo && call.stream) {
       selfVideo.srcObject = call.stream;
       void selfVideo.play().catch(() => undefined);
+    }
+  });
+
+  $effect(() => {
+    if (selfScreen && call.screenStream) {
+      selfScreen.srcObject = call.screenStream;
+      void selfScreen.play().catch(() => undefined);
     }
   });
 
@@ -43,6 +51,9 @@
 
   const others = $derived(call.participants.filter((p) => p.id !== session.me));
   const hasScreen = $derived(call.screens.length > 0);
+  /** Своя демонстрация идёт маленьким превью среди лиц: большой она не нужна,
+   *  а на весь экран превращалась бы в бесконечное зеркало самой себя. */
+  const showOwnScreen = $derived(call.screenOn && call.screenStream !== null);
 </script>
 
 <svelte:window
@@ -112,6 +123,12 @@
           {call.screenAudio ? 'звук экрана вкл' : 'звук экрана выкл'}
         </button>
       {/if}
+      <!-- Позвать друзей: у тех, кто в сети, зазвонит звонок с кнопкой
+           «подключиться». Сервера, который придержал бы зов для тех, кто не в
+           сети, у нас нет — поэтому и число позванных честное. -->
+      <button onclick={async () => (call.status = await call.ring())}>
+        {prefs.adequate ? 'Позвать всех' : 'позвать всех'}
+      </button>
       {#if SHARE_PLAYER}
         <button
           class:off={!call.sharingMusic}
@@ -120,8 +137,10 @@
           {call.sharingMusic ? 'плеер вкл' : 'слушать вместе'}
         </button>
       {/if}
-      {#if hasScreen}
-        <button class:off={!call.screenOnly} onclick={() => call.toggleScreenOnly()}>
+      {#if hasScreen && call.expanded}
+        <!-- В свёрнутом звонке эти кнопки живут на самой демонстрации: в шапке
+             они переносили её на две строки и терялись среди остальных. -->
+        <button aria-pressed={call.screenOnly} onclick={() => call.toggleScreenOnly()}>
           {prefs.adequate ? 'Только экран' : 'только экран'}
         </button>
         <button onclick={() => call.toggleFullscreen()}>
@@ -153,112 +172,129 @@
       class:with-screen={hasScreen}
       class:only-screen={call.screenOnly && hasScreen}
     >
-      <figure class="tile self" class:speaking={call.speakingSelf}>
-        <!-- svelte-ignore a11y_media_has_caption -->
-        <video bind:this={selfVideo} muted playsinline autoplay class:hidden={!call.camOn}></video>
-        {#if !call.camOn}
-          {#if face(session.me)}
-            <img class="face" src={face(session.me)} alt="" />
-          {:else}
-            <div class="placeholder">{session.nick.slice(0, 2)}</div>
-          {/if}
-        {/if}
-        <figcaption>
-          {session.nick} · вы{call.micMuted
-            ? ' · без звука'
-            : call.speakingSelf
-              ? ' · говорите'
-              : ''}
-        </figcaption>
-      </figure>
-
-      {#each others as participant (participant.id)}
-        <figure
-          class="tile"
-          class:speaking={call.speaking(participant.id)}
-          oncontextmenu={(event) => {
-            // Правый клик по человеку — его громкость. Общего регулятора мало:
-            // в одном звонке один шепчет, другой перекрикивает.
-            event.preventDefault();
-            tuning = tuning === participant.id ? null : participant.id;
-          }}
-        >
-          {#if face(participant.id)}
-            <img class="face" src={face(participant.id)} alt="" />
-          {:else}
-            <div class="placeholder">{nick(participant.id).slice(0, 2)}</div>
-          {/if}
-          <canvas
-            {@attach (node) => {
-              call.attachCanvas(participant.id, node as HTMLCanvasElement, 'video');
-              return () => call.attachCanvas(participant.id, null, 'video');
-            }}
-          ></canvas>
-          {#if tuning === participant.id}
-            <div class="volume">
-              <label>
-                громкость
-                <input
-                  type="range"
-                  min="0"
-                  max="4"
-                  step="0.05"
-                  value={call.volume(participant.id)}
-                  oninput={(event) =>
-                    call.setVolume(participant.id, Number(event.currentTarget.value))}
-                />
-              </label>
-              <div class="volume-row">
-                <span>{Math.round(call.volume(participant.id) * 100)}%</span>
-                <button onclick={() => call.setVolume(participant.id, 1)}>сбросить</button>
-                <button onclick={() => (tuning = null)}>закрыть</button>
+      {#if hasScreen}
+        <!-- Демонстрация — отдельной сценой, целиком и по центру. Раньше она
+             была плиткой в общей сетке с потолком по высоте и прокруткой
+             внутри: в свёрнутом звонке её низ уезжал под ленту, а сама она
+             прижималась к левому краю. -->
+        <div class="stage" class:split={call.screens.length > 1}>
+          {#each call.screens as sharer (sharer)}
+            <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+            <figure class="tile wide" ondblclick={() => call.toggleFullscreen()}>
+              <div class="placeholder">экран</div>
+              <canvas
+                {@attach (node) => {
+                  call.attachCanvas(sharer, node as HTMLCanvasElement, 'screen');
+                  return () => call.attachCanvas(sharer, null, 'screen');
+                }}
+              ></canvas>
+              <!-- Кнопки прямо на демонстрации: разворачивают чужой экран,
+                   глядя на сам экран. -->
+              <div class="tools">
+                <button onclick={() => call.toggleScreenOnly()}>
+                  {call.screenOnly ? 'показать всех' : 'только экран'}
+                </button>
+                <button onclick={() => call.toggleFullscreen()}>
+                  {#if prefs.adequate}
+                    {call.fullscreen ? 'Из полного экрана' : 'Во весь экран'}
+                  {:else}
+                    {call.fullscreen ? 'из полного экрана' : 'во весь экран'}
+                  {/if}
+                </button>
               </div>
-            </div>
-          {/if}
+              <figcaption>{nick(sharer)} · экран · двойной щелчок — во весь экран</figcaption>
+            </figure>
+          {/each}
+        </div>
+      {/if}
 
+      <div class="people">
+        <figure class="tile self" class:speaking={call.speakingSelf}>
+          <!-- svelte-ignore a11y_media_has_caption -->
+          <video bind:this={selfVideo} muted playsinline autoplay class:hidden={!call.camOn}></video>
+          {#if !call.camOn}
+            {#if face(session.me)}
+              <img class="face" src={face(session.me)} alt="" />
+            {:else}
+              <div class="placeholder">{session.nick.slice(0, 2)}</div>
+            {/if}
+          {/if}
           <figcaption>
-            {nick(participant.id)}{call.volume(participant.id) !== 1
-              ? ` · ${Math.round(call.volume(participant.id) * 100)}%`
-              : ''}
+            {session.nick} · вы{call.micMuted
+              ? ' · без звука'
+              : call.speakingSelf
+                ? ' · говорите'
+                : ''}
           </figcaption>
         </figure>
-      {/each}
 
-      <!-- Экран идёт отдельной плиткой и шире: на него, как правило, и смотрят -->
-      {#each call.screens as sharer (sharer)}
-        <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-        <figure class="tile wide" ondblclick={() => call.toggleFullscreen()}>
-          <div class="placeholder">экран</div>
-          <canvas
-            {@attach (node) => {
-              call.attachCanvas(sharer, node as HTMLCanvasElement, 'screen');
-              return () => call.attachCanvas(sharer, null, 'screen');
+        {#if showOwnScreen}
+          <figure class="tile own-screen">
+            <!-- svelte-ignore a11y_media_has_caption -->
+            <video bind:this={selfScreen} muted playsinline autoplay></video>
+            <figcaption>ваш экран · идёт показ</figcaption>
+          </figure>
+        {/if}
+
+        {#each others as participant (participant.id)}
+          <figure
+            class="tile"
+            class:speaking={call.speaking(participant.id)}
+            oncontextmenu={(event) => {
+              // Правый клик по человеку — его громкость. Общего регулятора мало:
+              // в одном звонке один шепчет, другой перекрикивает.
+              event.preventDefault();
+              tuning = tuning === participant.id ? null : participant.id;
             }}
-          ></canvas>
-          <!-- Кнопки прямо на демонстрации: в шапке они теряются среди восьми
-               других, а разворачивают чужой экран, глядя на сам экран. -->
-          <div class="tools">
-            <button onclick={() => call.toggleScreenOnly()}>
-              {call.screenOnly ? 'показать всех' : 'только экран'}
-            </button>
-            <button onclick={() => call.toggleFullscreen()}>
-              {#if prefs.adequate}
-                {call.fullscreen ? 'Из полного экрана' : 'Во весь экран'}
-              {:else}
-                {call.fullscreen ? 'из полного экрана' : 'во весь экран'}
-              {/if}
-            </button>
-          </div>
-          <figcaption>{nick(sharer)} · экран · двойной щелчок — во весь экран</figcaption>
-        </figure>
-      {/each}
+          >
+            {#if face(participant.id)}
+              <img class="face" src={face(participant.id)} alt="" />
+            {:else}
+              <div class="placeholder">{nick(participant.id).slice(0, 2)}</div>
+            {/if}
+            <canvas
+              {@attach (node) => {
+                call.attachCanvas(participant.id, node as HTMLCanvasElement, 'video');
+                return () => call.attachCanvas(participant.id, null, 'video');
+              }}
+            ></canvas>
+            {#if tuning === participant.id}
+              <div class="volume">
+                <label>
+                  громкость
+                  <input
+                    type="range"
+                    min="0"
+                    max="4"
+                    step="0.05"
+                    value={call.volume(participant.id)}
+                    oninput={(event) =>
+                      call.setVolume(participant.id, Number(event.currentTarget.value))}
+                  />
+                </label>
+                <div class="volume-row">
+                  <span>{Math.round(call.volume(participant.id) * 100)}%</span>
+                  <button onclick={() => call.setVolume(participant.id, 1)}>сбросить</button>
+                  <button onclick={() => (tuning = null)}>закрыть</button>
+                </div>
+              </div>
+            {/if}
 
-      {#if others.length === 0}
-        <p class="empty">
-          никого больше нет. позовите: <b>^I</b> — ссылка в пространство,
-          <b>/визитка</b> — ссылка для связи один на один
-        </p>
-      {/if}
+            <figcaption>
+              {nick(participant.id)}{call.volume(participant.id) !== 1
+                ? ` · ${Math.round(call.volume(participant.id) * 100)}%`
+                : ''}
+            </figcaption>
+          </figure>
+        {/each}
+
+        {#if others.length === 0 && !hasScreen}
+          <p class="empty">
+            никого больше нет. позовите: <b>^I</b> — ссылка в пространство,
+            <b>/визитка</b> — ссылка для связи один на один
+          </p>
+        {/if}
+      </div>
     </div>
 
     {#if call.fullscreen}
@@ -291,45 +327,31 @@
   }
   .call.expanded .grid {
     flex: 1;
-    max-height: none;
-    align-content: start;
+    min-height: 0;
+    padding: var(--gap-4);
   }
   /* Развёрнутый звонок без демонстрации — это лица во весь экран. */
-  .call.expanded .grid {
+  .call.expanded .grid:not(.with-screen) .people {
+    flex: 1;
     grid-template-columns: repeat(auto-fit, minmax(min(28rem, 46%), 1fr));
     align-content: center;
     gap: var(--gap-4);
-    padding: var(--gap-4);
-  }
-
-  /* А с демонстрацией — она и есть главное. Раньше здесь стоял `display: none`
-     на плитке экрана: развернуть можно было только камеры, а то единственное,
-     ради чего звонок разворачивают, из развёрнутого вида пропадало. */
-  .call.expanded .grid.with-screen {
-    grid-template-columns: repeat(auto-fit, minmax(min(11rem, 20%), 1fr));
-    align-content: start;
-    gap: var(--gap-3);
-  }
-  .call.expanded .grid.with-screen .tile.wide {
-    /* Первым в потоке, хотя в разметке экран идёт после камер: смотрят на него. */
-    order: -1;
-    grid-column: 1 / -1;
-    height: min(78vh, calc(100vh - 11rem));
-    /* Потолок из свёрнутой ленты здесь только мешает: он и держал бы экран
-       на трети окна ровно тогда, когда его развернули. */
     max-height: none;
-    aspect-ratio: auto;
   }
-  /* Лица под демонстрацией — полосой: они здесь для того, чтобы видеть, кто
-     кивает, а не чтобы разглядывать. */
-  .call.expanded .grid.with-screen .tile:not(.wide) {
-    aspect-ratio: 16 / 9;
-    max-height: 15vh;
+  /* А с демонстрацией — она и есть главное: сцена забирает всё место, лица
+     уходят полоской вниз. */
+  .call.expanded .grid.with-screen .stage {
+    flex: 1;
+    min-height: 0;
   }
-  .call.expanded .grid.only-screen .tile.wide {
-    height: 88vh;
+  .call.expanded .grid.with-screen .stage .tile.wide {
+    height: 100%;
+    max-height: none;
   }
-  .grid.only-screen .tile:not(.wide) {
+  .call.expanded .grid.with-screen .people .tile {
+    width: 176px;
+  }
+  .grid.only-screen .people {
     display: none;
   }
 
@@ -344,13 +366,17 @@
     background: #000;
   }
   .call.fullscreen .grid {
+    height: 100vh;
     padding: 0;
     gap: 0;
-    align-content: stretch;
+  }
+  .call.fullscreen .stage {
+    gap: 0;
   }
   .call.fullscreen .grid.only-screen .tile.wide {
     height: 100vh;
     border: none;
+    border-radius: 0;
     background: #000;
   }
   /* Панель не занимает место постоянно: всплывает, когда курсор подводят к
@@ -397,13 +423,19 @@
     }
   }
 
+  /* Кнопок много, а колонка звонка бывает узкой: пусть шапка переносится
+     целыми кнопками, а не рвёт подпись «микрофон вкл» пополам. */
   header {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: var(--gap-4);
+    gap: 6px var(--gap-4);
     padding: 5px var(--gap-4);
     font-size: var(--text-sm);
     border-bottom: 1px solid var(--line);
+  }
+  header > * {
+    white-space: nowrap;
   }
   header b {
     color: var(--fg-hi);
@@ -436,6 +468,13 @@
     color: var(--fg-faint);
     text-decoration: line-through;
   }
+  /* Режим, который включают и выключают, — инверсией, а не зачёркиванием:
+     зачёркнутое «только экран» читалось как сломанная кнопка. */
+  header button[aria-pressed='true'] {
+    background: var(--fg);
+    border-color: var(--fg);
+    color: var(--bg);
+  }
   header button.leave {
     background: var(--inv-bg);
     border-color: var(--inv-bg);
@@ -466,12 +505,54 @@
   }
 
   .grid {
+    display: flex;
+    flex-direction: column;
+    gap: var(--gap-3);
+    padding: var(--gap-3) var(--gap-4);
+  }
+
+  .people {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
     gap: var(--gap-3);
-    padding: var(--gap-3) var(--gap-4);
     max-height: 42vh;
     overflow-y: auto;
+  }
+
+  /* Сцена с демонстрацией: экран целиком и по центру. Высота задана явно, а
+     не выводится из пропорций: так плитка не прижимается к краю и не уезжает
+     под ленту, а картинка внутри вписывается без обрезки. */
+  .stage {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--gap-3);
+  }
+  .stage.split {
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));
+  }
+  .stage .tile.wide {
+    width: 100%;
+    height: clamp(200px, 40vh, 560px);
+    aspect-ratio: auto;
+    background: #000;
+  }
+
+  /* С демонстрацией лица уходят полоской под неё: они здесь затем, чтобы
+     видеть, кто говорит, а не чтобы их разглядывать. */
+  .grid.with-screen .people {
+    display: flex;
+    gap: var(--gap-3);
+    overflow-x: auto;
+    overflow-y: hidden;
+    max-height: none;
+  }
+  .grid.with-screen .people .tile {
+    flex: 0 0 auto;
+    width: 132px;
+    aspect-ratio: 16 / 10;
+  }
+  .grid.with-screen .people figcaption {
+    font-size: 10px;
   }
 
   .tile {
@@ -486,19 +567,26 @@
   .tile.speaking {
     border-color: var(--fg);
   }
-  /* Демонстрация экрана занимает всю строку: мелкий текст иначе не прочесть.
-     Даже в свёрнутом виде — это предпросмотр, но по нему решают, разворачивать
-     или нет, а по плитке в две колонки не решишь ничего. */
-  .tile.wide {
-    grid-column: 1 / -1;
-    aspect-ratio: 16 / 9;
-    max-height: 34vh;
-  }
   /* Чужой экран нельзя обрезать под пропорции плитки: смысл демонстрации в
      том, чтобы прочитать, что на ней, а `cover` срезает края — как раз там,
-     где панели и меню. */
-  .tile.wide canvas {
+     где панели и меню. Своё превью — так же. */
+  .tile.wide canvas,
+  .tile.own-screen video {
     object-fit: contain;
+  }
+  .tile.own-screen video {
+    filter: none;
+    background: #000;
+  }
+  /* Подпись поверх чужого экрана закрывала его нижнюю строку — ту самую, где
+     у редактора курсор, а у терминала приглашение. Появляется по наведению. */
+  .tile.wide figcaption {
+    opacity: 0;
+    transition: opacity var(--fast) var(--ease);
+  }
+  .tile.wide:hover figcaption,
+  .tile.wide:focus-within figcaption {
+    opacity: 1;
   }
 
   .tile video,

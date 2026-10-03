@@ -185,6 +185,9 @@ function fakeScreenshot(): string {
   return canvas.toDataURL('image/png');
 }
 
+// Стенд — не приложение: окон, обновлений и полного экрана здесь нет.
+(window as unknown as Record<string, unknown>).__BRED_DEMO__ = true;
+
 // Мост в ядро: те же имена команд, что и в настоящем приложении.
 (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__ = {
   invoke: async (cmd: string, args: Args = {}) => HANDLERS[cmd]?.(args) ?? null,

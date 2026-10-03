@@ -125,7 +125,13 @@ export type Notice =
   /** Ядро подобрало битрейт дорожки под реальный исходящий канал. */
   | { kind: 'bitrate'; track: string; bps: number }
   /** Изменилось состояние общего плеера: сменился ведущий, источник или пауза. */
-  | { kind: 'player'; space: Id };
+  | { kind: 'player'; space: Id }
+  /** Кто сейчас говорит в звонке — по громкости его звука у нас. */
+  | { kind: 'speaking'; authors: Id[] }
+  /** Нас зовут в голосовую комнату. Номер зова — строкой: u64 в JS не влезает. */
+  | { kind: 'ring'; space: Id; channel: Id; from: Id; nick: string; id: string }
+  /** Звонящий дал отбой. */
+  | { kind: 'ring-cancel'; space: Id; from: Id; id: string };
 
 /** Приложение, чей звук можно включить на комнату. */
 export interface MusicSource {
@@ -202,6 +208,12 @@ export const api = {
   musicSources: () => invoke<MusicSource[]>('music_sources'),
   musicStart: (source: string) => invoke<void>('music_start', { source }),
   musicStop: () => invoke<void>('music_stop'),
+  accountInfo: () => invoke<AccountInfo>('account_info'),
+  /** Позвать в свою комнату: пустой список — всех. Ответ — скольких видно в сети. */
+  ring: (to: Id[]) => invoke<number>('ring', { to }),
+  /** Громкость собеседника у себя: сводит звук ядро, оно и крутит регулятор. */
+  setVoiceVolume: (author: Id, gain: number) => invoke<void>('set_voice_volume', { author, gain }),
+  setMusicVolume: (gain: number) => invoke<void>('set_music_volume', { gain }),
   musicControl: (command: PlayerCommand) => invoke<void>('music_control', { command }),
   playerState: (space: Id) => invoke<PlayerState | null>('player_state', { space }),
 
@@ -215,6 +227,14 @@ export const api = {
   markRead: (channel: Id) => invoke<void>('mark_read', { channel }),
   typing: (space: Id, channel: Id) => invoke<void>('typing', { space, channel }),
 };
+
+/** Аккаунт: несколько устройств одного человека. См. domain/account.rs в ядре. */
+export interface AccountInfo {
+  account: Id;
+  /** Это устройство. */
+  device: Id;
+  devices: Array<{ device: Id; name: string; issued: number }>;
+}
 
 /** Подписка на уведомления ядра. */
 export function onNotice(handler: (notice: Notice) => void): Promise<UnlistenFn> {

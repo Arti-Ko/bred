@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Права окон БРЕД: выбор файлов, открытие полученных, полный экран для демонстрации и отдельное окно боя.",
+  "description": "Права окон БРЕД на любой платформе: выбор файлов, уведомления, диалоги.",
   "windows": [
     "main",
     "gundyr"
@@ -15,12 +15,6 @@
     "notification:allow-notify",
     "notification:allow-request-permission",
     "notification:allow-is-permission-granted",
-    "updater:default",
-    "process:allow-restart",
-    "dialog:allow-ask",
-    "core:window:allow-set-fullscreen",
-    "core:window:allow-is-fullscreen",
-    "core:webview:allow-create-webview-window",
-    "core:window:allow-close"
+    "dialog:allow-ask"
   ]
 }

@@ -26,9 +26,10 @@ import {
   type SpaceRow,
 } from '../ipc';
 import { call } from './call.svelte';
-import { forgetPreviews, shouldAutoFetch } from '../previews';
+import { forgetPreviews, previewUrl, shouldAutoFetch } from '../previews';
 import { forgetPrefetched, prefetchAll } from '../prefetch';
 import { chime } from '../chime';
+import { validEmojiName } from '../format';
 import { prefs } from './prefs.svelte';
 import { updates } from './updates.svelte';
 
@@ -69,6 +70,16 @@ export class Session {
   voice = $state<Array<[Id, Id]>>([]);
   /** Свои эмодзи и стикеры текущего пространства. */
   emojis = $state<EmojiRow[]>([]);
+  /**
+   * Картинки своих эмодзи по имени — одни на всё приложение.
+   *
+   * Раньше их собирал каждый компонент сам: каждое сообщение ленты и каждый
+   * выбор эмодзи заново просили адрес на всё содержимое набора, а картинка,
+   * не приехавшая с первых трёх попыток, не приезжала уже никогда.
+   */
+  glyphs = $state<Record<string, string>>({});
+  /** Для какой картинки получен адрес: сменили картинку под тем же именем — тянем заново. */
+  #glyphHash = new Map<string, Id>();
   /** Открытая ветка: корень и все ответы. */
   thread = $state<MessageRow[]>([]);
   threadRoot = $state<Id | null>(null);
@@ -124,8 +135,15 @@ export class Session {
       this.status = 'сначала выберите пространство';
       return;
     }
+    name = name.trim().replace(/^:+|:+$/g, '');
     if (!name) {
       this.status = sticker ? 'нужно имя: /стикер котик' : 'нужно имя: /эмодзи паррот';
+      return;
+    }
+    // Проверяем до выбора файла: отказ ядра после диалога выглядел бы как
+    // «выбрал картинку — ничего не произошло».
+    if (!validEmojiName(name)) {
+      this.status = 'в имени — только буквы, цифры, дефис и подчёркивание, до 32 знаков';
       return;
     }
     try {
@@ -137,7 +155,11 @@ export class Session {
       if (!picked) return;
       await api.addEmoji(this.spaceId, name, Array.isArray(picked) ? picked[0] : picked, sticker);
       await this.#loadEmojis();
-      this.#note(`добавлено :${name}: — вставляйте прямо в текст`);
+      this.#note(
+        sticker
+          ? `стикер :${name}: добавлен — он в выборе эмодзи, во вкладке «стикеры»`
+          : `добавлено :${name}: — вставляйте прямо в текст`,
+      );
     } catch (error) {
       this.status = errorText(error);
     }
@@ -145,15 +167,49 @@ export class Session {
 
   async #loadEmojis(): Promise<void> {
     if (!this.spaceId) return;
-    this.emojis = await api.listEmojis(this.spaceId).catch(() => []);
+    const space = this.spaceId;
+    this.emojis = await api.listEmojis(space).catch(() => []);
     // Картинки эмодзи нужны сразу: без них в тексте будут голые `:имена:`.
     // Но ждать их здесь нельзя — список уже готов, и рисовать можно прямо
     // сейчас. Раньше этот цикл ждал каждый файл по очереди и повторялся на
     // каждой пачке событий, из-за чего лента замирала на ровном месте.
     prefetchAll(
-      this.spaceId,
+      space,
       this.emojis.map((e) => e.hash),
     );
+    // Адреса — в общую карту. Не приехавшее спрашивается снова на следующей
+    // пачке событий: автор стикера мог быть не в сети именно в ту минуту.
+    for (const emoji of this.emojis) {
+      if (this.glyphs[emoji.name] && this.#glyphHash.get(emoji.name) === emoji.hash) continue;
+      void previewUrl(emoji.hash, space).then((url) => {
+        if (!url || this.spaceId !== space) return;
+        this.#glyphHash.set(emoji.name, emoji.hash);
+        this.glyphs = { ...this.glyphs, [emoji.name]: url };
+      });
+    }
+  }
+
+  /**
+   * Отправить стикер сразу, отдельным сообщением — как в любом мессенджере.
+   *
+   * Раньше выбор стикера только дописывал `:имя:` в черновик, и его надо было
+   * ещё отправить. Черновик и прикреплённые файлы стикер не трогает.
+   */
+  async sendSticker(name: string): Promise<void> {
+    if (!this.spaceId || !this.channelId) return;
+    try {
+      await api.sendMessage(
+        this.spaceId,
+        this.channelId,
+        `:${name}:`,
+        this.replyTo?.id ?? null,
+        this.threadRoot,
+        [],
+      );
+      this.replyTo = null;
+    } catch (error) {
+      this.status = errorText(error);
+    }
   }
 
   /** Ключи тех, кто сидит в голосовом канале. Имя по ключу найдёт тот, кому оно нужно. */
@@ -301,6 +357,9 @@ export class Session {
     this.spaceId = space;
     this.channelId = null;
     this.messages = [];
+    // У другого пространства другой набор: одноимённый эмодзи там — другая картинка.
+    this.glyphs = {};
+    this.#glyphHash.clear();
     await this.#loadChannels();
     await this.#loadMembers();
     await this.#loadVoice();
@@ -627,7 +686,13 @@ export class Session {
         }
         case 'позвать':
         case 'invite':
-          await this.invite();
+          // «/позвать всех» из комнаты — звонок друзьям; просто «/позвать» —
+          // по-прежнему ссылка-приглашение в пространство.
+          if (/^(всех|all)$/i.test(argument) && call.active) {
+            this.#note(await call.ring());
+          } else {
+            await this.invite();
+          }
           break;
         case 'визитка':
         case 'me':
@@ -683,7 +748,7 @@ export class Session {
         case 'помощь':
         case 'help':
           this.#note(
-            'команды: /простор /канал /голос /звонок /войти /позвать /визитка ' +
+            'команды: /простор /канал /голос /звонок /войти /позвать [всех] /визитка ' +
               '/лс /имя /аватар /файл /эмодзи /стикер /экран /покинуть /обновление',
           );
           break;
@@ -759,6 +824,9 @@ export class Session {
         // Величину считает ядро: только оно видит исходящий канал и то,
         // на скольких собеседников он делится.
         call.applyBitrate(notice.track, notice.bps);
+        break;
+      case 'speaking':
+        call.noteSpeaking(notice.authors);
         break;
     }
   }

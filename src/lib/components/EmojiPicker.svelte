@@ -1,34 +1,41 @@
 <script lang="ts">
   import { EMOJI } from '../emoji';
-  import { previewUrl } from '../previews';
   import { session } from '../stores/session.svelte';
 
   interface Props {
     onpick: (emoji: string) => void;
     onclose: () => void;
+    /**
+     * Стикер отправляется сразу, отдельным сообщением. Не задано — значит, стикер
+     * здесь не к месту (например, в выборе реакции), и вкладки стикеров нет.
+     */
+    onsticker?: (name: string) => void;
   }
 
-  const { onpick, onclose }: Props = $props();
+  const { onpick, onclose, onsticker }: Props = $props();
   let active = $state(0);
-
-  /** Картинки своих эмодзи. */
-  let glyphs = $state<Record<string, string>>({});
-
-  $effect(() => {
-    for (const emoji of session.emojis) {
-      if (!glyphs[emoji.name]) {
-        void previewUrl(emoji.hash, session.spaceId).then((url) => {
-          if (url) glyphs = { ...glyphs, [emoji.name]: url };
-        });
-      }
-    }
-  });
+  /** Открыта ли форма добавления своего эмодзи или стикера. */
+  let adding = $state(false);
+  let name = $state('');
 
   const custom = $derived(session.emojis.filter((e) => !e.sticker));
   const stickers = $derived(session.emojis.filter((e) => e.sticker));
   /** Свои наборы идут после стандартных, поэтому нумеруются со сдвигом. */
   const CUSTOM_TAB = EMOJI.length;
   const STICKER_TAB = EMOJI.length + 1;
+  const own = $derived(active === STICKER_TAB ? stickers : custom);
+
+  function pickOwn(emojiName: string): void {
+    if (active === STICKER_TAB && onsticker) onsticker(emojiName);
+    else onpick(`:${emojiName}:`);
+  }
+
+  async function add(): Promise<void> {
+    const sticker = active === STICKER_TAB;
+    await session.addEmoji(name, sticker);
+    name = '';
+    adding = false;
+  }
 </script>
 
 <svelte:window onkeydown={(event) => event.key === 'Escape' && onclose()} />
@@ -43,13 +50,13 @@
         {group.name}
       </button>
     {/each}
-    {#if custom.length > 0}
-      <button
-        aria-current={active === CUSTOM_TAB ? 'true' : undefined}
-        onclick={() => (active = CUSTOM_TAB)}>свои</button
-      >
-    {/if}
-    {#if stickers.length > 0}
+    <!-- Свои вкладки видны всегда: раньше пустые прятались, и узнать, что
+         стикеры вообще есть и как их добавить, было неоткуда. -->
+    <button
+      aria-current={active === CUSTOM_TAB ? 'true' : undefined}
+      onclick={() => (active = CUSTOM_TAB)}>свои</button
+    >
+    {#if onsticker}
       <button
         aria-current={active === STICKER_TAB ? 'true' : undefined}
         onclick={() => (active = STICKER_TAB)}>стикеры</button
@@ -57,26 +64,56 @@
     {/if}
   </nav>
 
-  <div class="grid" class:big={active >= CUSTOM_TAB}>
+  <div class="grid" class:big={active >= CUSTOM_TAB} class:stickers={active === STICKER_TAB}>
     {#if active < CUSTOM_TAB}
       {#each EMOJI[active].items as emoji (emoji)}
         <button class="cell" onclick={() => onpick(emoji)} title={emoji}>{emoji}</button>
       {/each}
     {:else}
-      {#each active === CUSTOM_TAB ? custom : stickers as emoji (emoji.name)}
-        <button class="cell own" onclick={() => onpick(`:${emoji.name}:`)} title=":{emoji.name}:">
-          {#if glyphs[emoji.name]}
-            <img src={glyphs[emoji.name]} alt=":{emoji.name}:" />
+      {#each own as emoji (emoji.name)}
+        <button
+          class="cell own"
+          onclick={() => pickOwn(emoji.name)}
+          title={active === STICKER_TAB ? `отправить :${emoji.name}:` : `:${emoji.name}:`}
+        >
+          {#if session.glyphs[emoji.name]}
+            <img src={session.glyphs[emoji.name]} alt=":{emoji.name}:" />
           {:else}
             <span class="pending">:{emoji.name}:</span>
           {/if}
         </button>
       {/each}
+      <button class="cell add" onclick={() => (adding = !adding)} title="Добавить свою картинку">＋</button>
     {/if}
   </div>
 
-  {#if active >= CUSTOM_TAB && (active === CUSTOM_TAB ? custom : stickers).length === 0}
-    <p class="hint">пусто. добавить: <b>/эмодзи имя</b> или <b>/стикер имя</b></p>
+  {#if active >= CUSTOM_TAB}
+    {#if adding}
+      <form
+        class="adder"
+        onsubmit={(event) => {
+          event.preventDefault();
+          void add();
+        }}
+      >
+        <!-- svelte-ignore a11y_autofocus -->
+        <input
+          bind:value={name}
+          placeholder={active === STICKER_TAB ? 'имя стикера, например котик' : 'имя, например паррот'}
+          maxlength="32"
+          autofocus
+        />
+        <button type="submit" disabled={!name.trim()}>выбрать картинку</button>
+      </form>
+    {:else if own.length === 0}
+      <p class="hint">
+        {active === STICKER_TAB
+          ? 'стикеров пока нет. ＋ — выбрать картинку, она станет стикером для всего пространства'
+          : 'своих эмодзи пока нет. ＋ — выбрать картинку и дать ей имя'}
+      </p>
+    {:else if active === STICKER_TAB}
+      <p class="hint">щелчок — отправить стикер сразу</p>
+    {/if}
   {/if}
 </div>
 
@@ -150,6 +187,10 @@
   .grid.big {
     grid-template-columns: repeat(auto-fill, minmax(2.6rem, 1fr));
   }
+  /* Стикер — картинка, а не значок: его надо разглядеть до отправки. */
+  .grid.stickers {
+    grid-template-columns: repeat(auto-fill, minmax(4.4rem, 1fr));
+  }
   .cell.own {
     filter: grayscale(1);
   }
@@ -163,6 +204,40 @@
     color: var(--fg-faint);
     word-break: break-all;
   }
+  .cell.add {
+    border: 1px dashed var(--fg-faint);
+    color: var(--fg-dimmer);
+    filter: none;
+  }
+  .cell.add:hover {
+    color: var(--fg-hi);
+  }
+
+  .adder {
+    display: flex;
+    gap: 6px;
+    padding: var(--gap-3);
+    border-top: 1px solid var(--line);
+  }
+  .adder input {
+    flex: 1;
+    min-width: 0;
+    padding: 3px 6px;
+    border: 1px solid var(--fg-faint);
+    background: var(--bg);
+    color: var(--fg);
+    font-size: var(--text-xs);
+  }
+  .adder button {
+    padding: 3px 8px;
+    background: var(--inv-bg);
+    color: var(--inv-fg);
+    font-size: var(--text-xs);
+    white-space: nowrap;
+  }
+  .adder button:disabled {
+    opacity: 0.4;
+  }
 
   .hint {
     margin: 0;
@@ -170,9 +245,5 @@
     border-top: 1px solid var(--line);
     color: var(--fg-dimmer);
     font-size: var(--text-xs);
-  }
-  .hint b {
-    color: var(--fg);
-    font-weight: 400;
   }
 </style>
