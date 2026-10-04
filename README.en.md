@@ -90,7 +90,9 @@ It immediately contains a `#общий-канал` channel. You can add more:
 
 ### Step 3. Invite someone
 
-Press `/позвать` (or `Ctrl+I`). A `bred://join/…` link lands in your clipboard.
+Press `/позвать` (or `Ctrl+I`). A `bred://invite/…` link lands in your clipboard — valid
+for a week with unlimited uses. In the adequate mode you pick the expiry and the number
+of uses, see every live link and can revoke any of them.
 
 **Send it to your friend any way you like** — Telegram, email, whatever. БРЕД has no
 delivery channel of its own and can't have one: until you are connected, you don't
@@ -99,7 +101,7 @@ exist for each other.
 Your friend pastes the link on their side with `/войти`:
 
 ```
-/войти bred://join/…
+/войти bred://invite/…
 ```
 
 A few seconds later they are in the space and receive the whole message history — it
@@ -184,6 +186,10 @@ too: a new version downloads and installs itself, you only have to confirm.
 | `/голос созвон` | create a voice channel |
 | `/звонок созвон` | join a call |
 | `/позвать` | copy an invitation link to the space |
+| `/приглашения [код]` | live invitations; with a code — revoke it |
+| `/исключить имя` | remove a member and rotate the key (admin) |
+| `/админ имя` · `/неадмин имя` | appoint or dismiss an admin (owner) |
+| `/ключ` | rotate the space key and hand it out again (admin) |
 | `/визитка` | copy your personal link for one-on-one contact |
 | `/войти ссылка` | connect using any of those links |
 | `/лс имя` | open a direct conversation |
@@ -212,17 +218,25 @@ too: a new version downloads and installs itself, you only have to confirm.
 
 Honestly, about what not to expect:
 
-- **The invitation link is the pass.** Whoever received it is a member. Access can't
-  be revoked without changing the space key, and key rotation doesn't exist yet.
-  Don't publish invitations where outsiders can see them.
+- **The invitation link is a pass, not a key.** It carries no space key: any member
+  who is online checks it against the history and lets the guest in. Links expire,
+  have a use limit and can be revoked (`/приглашения`). Nobody can let you in while
+  every member is offline.
 - **Every member holds the whole history.** That's fine for a circle of friends or a
   work team; for a ten-thousand-person community it isn't.
 - **A sent file cannot be deleted "for everyone".** It spreads directly, and anyone
   who has it can pass it on.
 - **One computer, one identity.** Reading the same conversation from a laptop and a
   home computer isn't possible yet.
-- **There is no moderation.** Bans, reports and administrators don't exist: with no
-  server, there is nobody to enforce a decision.
+- **Moderation without a server.** The space owner is provable, appoints admins, and
+  admins remove members. Removal rotates the space key right away: the removed person
+  can't read anything new, but keeps what they already received. Removal and key
+  rotation only work in spaces created in 0.8 or later: older ones have no provable owner.
+- **The database on disk is encrypted.** With a passcode it can't be opened even from
+  a disk copy; a forgotten passcode can't be bypassed. Attachments are not encrypted
+  yet.
+- **Peers see your IP** unless "Hide my IP" is on: then everything goes through the
+  relay — a little slower, and only with internet access.
 
 ## For developers
 

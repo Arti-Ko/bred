@@ -808,6 +808,10 @@ impl Media {
             connection.close(0u32.into(), "мы не в звонке".as_bytes());
             return;
         };
+        if self.ctx.is_removed(call.space, author) {
+            connection.close(0u32.into(), "исключён".as_bytes());
+            return;
+        }
         let link = Arc::new(Link {
             author,
             cipher: media_key(&key, author),

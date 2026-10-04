@@ -41,10 +41,49 @@ pub struct NetStatus {
     pub neighbors: usize,
 }
 
+/// Заперто ли приложение код-паролем. Интерфейс спрашивает это первым.
+#[tauri::command]
+pub fn lock_state() -> bool {
+    crate::locked()
+}
+
+#[tauri::command]
+pub async fn unlock(handle: tauri::AppHandle, passcode: String) -> Answer<()> {
+    crate::unlock(handle, &passcode).await.map_err(fail)
+}
+
+#[tauri::command]
+pub async fn wipe_locked(handle: tauri::AppHandle) -> Answer<()> {
+    crate::wipe_locked(handle).await.map_err(fail)
+}
+
+#[tauri::command]
+pub fn set_passcode(
+    app: State<'_, Arc<App>>,
+    current: Option<String>,
+    passcode: String,
+) -> Answer<crate::app::PrivacyView> {
+    app.set_passcode(current.as_deref(), &passcode)
+        .map_err(fail)?;
+    Ok(app.privacy())
+}
+
+#[tauri::command]
+pub fn clear_passcode(
+    app: State<'_, Arc<App>>,
+    current: String,
+) -> Answer<crate::app::PrivacyView> {
+    app.clear_passcode(&current).map_err(fail)?;
+    Ok(app.privacy())
+}
+
 #[tauri::command]
 pub fn bootstrap(handle: tauri::AppHandle) -> Answer<Bootstrap> {
     use tauri::Manager;
 
+    if crate::locked() {
+        return Err("приложение заперто код-паролем".to_string());
+    }
     // Ядро могло не подняться — тогда честно отдаём причину, а не молчим.
     let Some(app) = handle.try_state::<Arc<App>>() else {
         return Err(crate::startup_error().unwrap_or_else(|| "ядро не запустилось".to_string()));
@@ -195,8 +234,67 @@ pub async fn remove_emoji(app: State<'_, Arc<App>>, space: SpaceId, name: String
 }
 
 #[tauri::command]
-pub async fn space_invite(app: State<'_, Arc<App>>, space: SpaceId) -> Answer<String> {
-    app.invite(space).await.map_err(fail)
+pub async fn space_invite(
+    app: State<'_, Arc<App>>,
+    space: SpaceId,
+    options: Option<crate::app::InviteOptions>,
+) -> Answer<String> {
+    app.invite_with(space, options.unwrap_or_default())
+        .await
+        .map_err(fail)
+}
+
+// ── управление пространством ────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn space_governance(
+    app: State<'_, Arc<App>>,
+    space: SpaceId,
+) -> Answer<crate::app::GovernanceView> {
+    app.governance(space).map_err(fail)
+}
+
+#[tauri::command]
+pub fn list_invites(
+    app: State<'_, Arc<App>>,
+    space: SpaceId,
+) -> Answer<Vec<crate::app::InviteView>> {
+    app.invites(space).map_err(fail)
+}
+
+#[tauri::command]
+pub async fn revoke_invite(app: State<'_, Arc<App>>, space: SpaceId, invite: Id) -> Answer<()> {
+    app.revoke_invite(space, invite).await.map_err(fail)
+}
+
+#[tauri::command]
+pub async fn remove_member(app: State<'_, Arc<App>>, space: SpaceId, member: Id) -> Answer<()> {
+    app.remove_member(space, member).await.map_err(fail)
+}
+
+#[tauri::command]
+pub async fn rotate_space_key(app: State<'_, Arc<App>>, space: SpaceId) -> Answer<usize> {
+    app.rotate_key(space).await.map_err(fail)
+}
+
+#[tauri::command]
+pub async fn set_admin(
+    app: State<'_, Arc<App>>,
+    space: SpaceId,
+    member: Id,
+    admin: bool,
+) -> Answer<()> {
+    app.set_admin(space, member, admin).await.map_err(fail)
+}
+
+#[tauri::command]
+pub fn privacy_info(app: State<'_, Arc<App>>) -> Answer<crate::app::PrivacyView> {
+    Ok(app.privacy())
+}
+
+#[tauri::command]
+pub fn set_hide_ip(app: State<'_, Arc<App>>, hide: bool) -> Answer<crate::app::PrivacyView> {
+    app.set_hide_ip(hide).map_err(fail)
 }
 
 #[tauri::command]

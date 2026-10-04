@@ -89,4 +89,6 @@ pub struct MemberRow {
     /// иначе история распухнет на порядок от «зашёл/вышел».
     pub online: bool,
     pub last_seen: i64,
+    /// Владелец, администратор или обычный участник.
+    pub role: super::Role,
 }

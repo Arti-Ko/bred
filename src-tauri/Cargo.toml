@@ -1,6 +1,6 @@
 [package]
 name = "bred"
-version = "0.7.1"
+version = "0.8.0"
 description = "БРЕД — Быстрая Ретрансляция Электронных Данных"
 edition = "2021"
 rust-version = "1.91"
@@ -16,6 +16,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 anyhow = "1.0.104"
+argon2 = "0.5"
 blake3 = "1.8.5"
 bytes = "1.12.1"
 chacha20poly1305 = "0.10.1"
@@ -37,7 +38,9 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls-no-p
 # Криптография TLS для этого HTTP — та же ring, что у iroh: второй набор
 # шифров в сборку не тащим.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
-rusqlite = { version = "0.40", features = ["bundled"] }
+# SQLCipher вместо голого SQLite: база на диске зашифрована. Криптография —
+# системная на Apple (CommonCrypto), на Windows — встроенный OpenSSL (см. ниже).
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.151"
 socket2 = "0.6.5"
@@ -76,11 +79,16 @@ objc2-screen-capture-kit = "0.3.2"
 # в WASAPI плюс `SendInput`. Список возможностей узкий намеренно — привязки
 # генерируются по нему, и лишние заметно удлиняют сборку.
 [target.'cfg(target_os = "windows")'.dependencies]
+# Своей криптографии у SQLCipher на Windows нет — OpenSSL собирается вместе с ним.
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
+# Ключ базы — в диспетчере учётных данных: его защищает вход в Windows.
+keyring = { version = "3", features = ["windows-native"] }
 windows-core = "0.62.2"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Media_Audio",
     "Win32_Security",
+    "Win32_Security_Cryptography",
     "Win32_System_Com",
     "Win32_System_Com_StructuredStorage",
     "Win32_System_ProcessStatus",

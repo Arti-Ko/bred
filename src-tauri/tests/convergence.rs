@@ -434,7 +434,7 @@ async fn sync_over_wire(a: &Node, b: &Node, space: &Space) -> usize {
         let (server_read, server_write) = tokio::io::split(server);
         let (client_read, client_write) = tokio::io::split(client);
 
-        let serving = sync::serve_round(&a.ctx, server_write, server_read);
+        let serving = sync::serve_round(&a.ctx, server_write, server_read, None);
         let fetching = sync::sync_round(&b.ctx, client_write, client_read, space.id, &space.key);
 
         let (served, round) = tokio::join!(serving, fetching);

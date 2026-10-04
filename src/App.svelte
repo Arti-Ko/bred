@@ -16,6 +16,8 @@
   import { call } from './lib/stores/call.svelte';
   import { prefs } from './lib/stores/prefs.svelte';
   import { session } from './lib/stores/session.svelte';
+  import LockScreen from './lib/components/LockScreen.svelte';
+  import { api } from './lib/ipc';
   import type { Component } from 'svelte';
 
   let draft = $state('');
@@ -33,9 +35,23 @@
   let arcade = $state<Component<{ onclose: () => void }> | null>(null);
   let arcadeOpen = $state(false);
 
-  $effect(() => {
+  /**
+   * Заперто ли код-паролем. Пока не узнали — не рисуем ничего: иначе на миг
+   * мелькнул бы пустой интерфейс, который затем сменится замком.
+   */
+  let locked = $state<boolean | null>(null);
+
+  function start(): void {
+    locked = false;
     void session.init();
     void news.init();
+  }
+
+  $effect(() => {
+    void api
+      .lockState()
+      .catch(() => false)
+      .then((closed) => (closed ? (locked = true) : start()));
   });
 
   // Победа в отдельном окне боя. Трофей и оформление живут в главном окне,
@@ -174,7 +190,11 @@
   }
 </script>
 
-<svelte:window onkeydown={onGlobalKey} />
+<svelte:window onkeydown={(event) => locked === false && onGlobalKey(event)} />
+
+{#if locked}
+  <LockScreen onunlock={start} />
+{:else if locked === false}
 
 <!-- Зов в комнату, отчёт о проблеме и новость о выпуске — поверх всего и в
      любом оформлении -->
@@ -315,6 +335,8 @@
     {/if}
   </footer>
 </div>
+{/if}
+
 {/if}
 
 <style>

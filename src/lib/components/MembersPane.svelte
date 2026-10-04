@@ -1,5 +1,6 @@
 <script lang="ts">
   import { session } from '../stores/session.svelte';
+  import { governance } from '../stores/governance.svelte';
   import { ago } from '../format';
   import { previewUrl } from '../previews';
 
@@ -16,6 +17,9 @@
       }
     }
   });
+
+  /** Роль — коротко, как всё в этом оформлении. */
+  const TAG: Record<string, string> = { owner: 'влад', admin: 'адм', member: '' };
 
   const online = $derived(session.members.filter((m) => m.online));
   const offline = $derived(session.members.filter((m) => !m.online));
@@ -41,7 +45,7 @@
         {:else}
           <span class="i">●</span>
         {/if}
-        <span class="nm">{member.nick}</span>
+        <span class="nm">{member.nick}{#if TAG[member.role]}<i class="tag">{TAG[member.role]}</i>{/if}</span>
         <span class="st">{member.id === session.me ? 'вы' : 'on'}</span>
       </button>
     {/each}
@@ -60,10 +64,22 @@
           {:else}
             <span class="i">○</span>
           {/if}
-          <span class="nm">{member.nick}</span>
+          <span class="nm">{member.nick}{#if TAG[member.role]}<i class="tag">{TAG[member.role]}</i>{/if}</span>
           <span class="st">{ago(member.last_seen)}</span>
         </button>
       {/each}
+    {/if}
+
+    {#if governance.canRekey}
+      <p class="powers">
+        вы {governance.isOwner ? 'владелец' : 'администратор'}: /исключить ник ·
+        {governance.isOwner ? '/админ ник · /неадмин ник · ' : ''}/ключ · /приглашения
+      </p>
+    {:else if governance.legacy}
+      <p class="powers">
+        пространство из версии до 0.8: владелец {governance.info?.owner ? 'на слове' : 'не определён'},
+        исключать и менять ключ нельзя — только в новом пространстве
+      </p>
     {/if}
 
     <div class="rule"></div>
@@ -144,5 +160,18 @@
     font-size: var(--text-sm);
     margin-top: 2px;
     word-break: break-all;
+  }
+  .tag {
+    margin-left: 6px;
+    color: var(--fg-dim);
+    font-size: var(--text-xs);
+    font-style: normal;
+    letter-spacing: 0.08em;
+  }
+  .powers {
+    margin: 8px 6px 0;
+    color: var(--fg-dimmer);
+    font-size: var(--text-xs);
+    line-height: 1.5;
   }
 </style>

@@ -161,6 +161,9 @@ impl RingProtocol {
         if frame.space != space {
             return Err(anyhow!("пространство в зове не совпало с ключом"));
         }
+        if self.ctx.is_removed(space, from) {
+            return Err(anyhow!("зовёт исключённый участник"));
+        }
         self.on_frame(space, from, frame);
         // Подтверждение: звонящему важно знать, до кого зов дошёл.
         send.write_all(&[1]).await?;

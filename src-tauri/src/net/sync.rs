@@ -20,7 +20,7 @@ use super::{
         SYNC_BATCH,
     },
 };
-use crate::domain::SpaceId;
+use crate::domain::{Id, SpaceId};
 
 pub const SYNC_ALPN: &[u8] = b"bred/sync/1";
 
@@ -54,17 +54,20 @@ impl ProtocolHandler for SyncProtocol {
 }
 
 async fn serve(ctx: Arc<Ctx>, connection: Connection) -> Result<()> {
+    let peer = Id(*connection.remote_id().as_bytes());
     // Раундов может быть несколько: за один заход отдаём не больше пачки,
     // а история бывает длиннее. Цикл живёт, пока пир не закроет соединение.
     while let Ok((send, recv)) = connection.accept_bi().await {
-        serve_round(&ctx, send, recv).await?;
+        serve_round(&ctx, send, recv, Some(peer)).await?;
     }
     Ok(())
 }
 
 /// Один обмен «запрос — ответ — досылка» поверх пары потоков.
 /// Вынесено из соединения, чтобы протокол можно было прогнать в тесте трубой.
-pub async fn serve_round<W, R>(ctx: &Ctx, mut send: W, mut recv: R) -> Result<()>
+///
+/// `peer` — кто спрашивает, по соединению. Исключённым не отвечаем вовсе.
+pub async fn serve_round<W, R>(ctx: &Ctx, mut send: W, mut recv: R, peer: Option<Id>) -> Result<()>
 where
     W: tokio::io::AsyncWriteExt + Unpin,
     R: tokio::io::AsyncReadExt + Unpin,
@@ -72,7 +75,7 @@ where
     let raw = read_frame(&mut recv).await?;
     // Пространство в запросе не указано открытым текстом: перебираем свои ключи,
     // пока один не подойдёт. Заодно это отсекает чужаков без ключа.
-    let Some((space, frame)) = ctx.open_with_known_key::<SyncFrame>(&raw) else {
+    let Some((space, frame, key, current)) = ctx.open_with_any_key::<SyncFrame>(&raw) else {
         return Err(anyhow!("запрос не подошёл ни к одному известному ключу"));
     };
 
@@ -82,11 +85,26 @@ where
     if asked != space {
         return Err(anyhow!("пространство в запросе не совпало с ключом"));
     }
+    if peer.is_some_and(|peer| ctx.is_removed(space, peer)) {
+        return Err(anyhow!("спрашивает исключённый участник"));
+    }
 
-    let key = ctx
-        .space(space)
-        .ok_or_else(|| anyhow!("неизвестное пространство"))?
-        .key;
+    // Спрашивают прежним ключом — значит, человек пропустил смену. Отдаём ему
+    // одну раздачу нового ключа и то, что нужно её проверить, — и ничего
+    // больше: переписка эпохи, в которую его могли и не взять, ему не положена,
+    // пока он не докажет, что ключ получил.
+    if !current {
+        let events = ctx.store.governance_events(space)?;
+        tracing::debug!(space = %space.short(), count = events.len(), "отставшему — раздача нового ключа");
+        write_frame(
+            &mut send,
+            &seal(&key, &SyncFrame::Response { events, have })?,
+        )
+        .await?;
+        send.flush().await?;
+        send.shutdown().await?;
+        return Ok(());
+    }
 
     let peer_has = vector_from_wire(have);
     let events = ctx.store.events_missing_for(space, &peer_has, SYNC_BATCH)?;

@@ -4,6 +4,8 @@
   import { updates } from '../stores/updates.svelte';
   import { news } from '../stores/news.svelte';
   import { report } from '../stores/report.svelte';
+  import { governance } from '../stores/governance.svelte';
+  import { privacy } from '../stores/privacy.svelte';
   import { previewUrl } from '../previews';
 
   /** Своя картинка профиля: человек должен видеть, как его увидят другие. */
@@ -29,6 +31,7 @@
 
   $effect(() => {
     void updates.init();
+    void privacy.load();
   });
 
   const stageText: Record<string, string> = {
@@ -137,6 +140,80 @@
       <span class="v">{session.neighbors}</span>
     </div>
 
+    <div class="group">безопасность</div>
+    {#if privacy.info}
+      <div class="row">
+        <span class="k">скрывать ip</span>
+        <button class="act" class:primary={privacy.info.hide_ip} onclick={() => privacy.toggleHideIp()}>
+          {privacy.info.hide_ip ? 'вкл' : 'выкл'}
+        </button>
+        <span class="hint">
+          собеседники видят ретранслятор, а не ваш адрес · звук чуть дольше, без интернета связи нет
+        </span>
+      </div>
+      {#if privacy.pendingRestart}
+        <div class="notice">
+          <b>вступит в силу после перезапуска</b>
+          <button class="act primary" onclick={() => updates.restart()}>перезапустить</button>
+        </div>
+      {/if}
+      <div class="row">
+        <span class="k">код-пароль</span>
+        <span class="v">{privacy.info.passcode ? 'включён' : 'выключен'}</span>
+        <span>
+          {#if privacy.info.passcode}
+            <button class="act" onclick={() => privacy.open('change')}>сменить</button>
+            <button class="act" onclick={() => privacy.open('clear')}>убрать</button>
+            <button class="act" onclick={() => updates.restart()}>запереть</button>
+          {:else}
+            <button class="act" onclick={() => privacy.open('set')}>поставить</button>
+          {/if}
+        </span>
+      </div>
+      {#if privacy.form}
+        <form
+          class="notice code"
+          onsubmit={(event) => {
+            event.preventDefault();
+            void privacy.submit();
+          }}
+        >
+          {#if privacy.form !== 'set'}
+            <input type="password" bind:value={privacy.current} placeholder="нынешний код" autocomplete="current-password" />
+          {/if}
+          {#if privacy.form !== 'clear'}
+            <input type="password" bind:value={privacy.fresh} placeholder="новый код, от 6 знаков" autocomplete="new-password" />
+            <input type="password" bind:value={privacy.repeat} placeholder="ещё раз" autocomplete="new-password" />
+            <span>забудете код — переписку на этом устройстве не восстановить</span>
+          {/if}
+          {#if privacy.error}<b>{privacy.error}</b>{/if}
+          <span>
+            <button type="button" class="act" onclick={() => privacy.open('')}>отмена</button>
+            <button type="submit" class="act primary" disabled={privacy.busy}>
+              {privacy.form === 'clear' ? 'убрать код' : 'сохранить'}
+            </button>
+          </span>
+        </form>
+      {/if}
+      <div class="row">
+        <span class="k">база</span>
+        <span class="v">зашифрована · ключ {privacy.keyText}</span>
+      </div>
+      {#if governance.info && !governance.info.direct}
+        <div class="row">
+          <span class="k">ключ пространства</span>
+          <span class="v">№ {governance.info.epoch + 1}</span>
+          <span class="hint">
+            {governance.canRekey
+              ? 'сменить и разложить всем заново — /ключ'
+              : governance.legacy
+                ? 'в пространствах до 0.8 ключ не меняется'
+                : 'меняют администраторы, например когда кого-то исключили'}
+          </span>
+        </div>
+      {/if}
+    {/if}
+
     <div class="group">обновление</div>
     <div class="row">
       <span class="k">версия</span>
@@ -218,7 +295,9 @@
       <button class="act" onclick={() => session.invite()} disabled={!session.spaceId}>
         скопировать ссылку
       </button>
-      <span class="hint">зовёт в текущее пространство</span>
+      <span class="hint">
+        на 7 дней, без ключа внутри · список и отзыв — <b>/приглашения</b>
+      </span>
     </div>
     <div class="row">
       <span class="k">эмодзи</span>
@@ -354,6 +433,20 @@
     align-items: flex-start;
     font-size: var(--text-sm);
     color: var(--fg-dim);
+  }
+
+  .code input {
+    width: 100%;
+    padding: 3px 8px;
+    border: 1px solid var(--fg-faint);
+    background: var(--bg);
+    color: var(--fg);
+    font: inherit;
+    font-size: var(--text-sm);
+  }
+  .code input:focus {
+    outline: none;
+    border-color: var(--fg-dim);
   }
 
   .notes {

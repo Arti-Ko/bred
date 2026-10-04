@@ -25,11 +25,14 @@ const DH_SETTING: &str = "identity.dh";
 #[derive(Clone)]
 pub struct Identity {
     secret: SecretKey,
+    /// Ключ согласования: личные переписки и раздачи ключей пространств.
+    dh: x25519_dalek::StaticSecret,
 }
 
 impl Identity {
     /// Загружает ключ из базы, а при первом запуске создаёт новый.
     pub fn load_or_create(store: &Store) -> Result<Self> {
+        let dh = load_or_create_dh(store)?;
         if let Some(raw) = store.get_setting(SECRET_KEY_SETTING)? {
             let bytes: [u8; 32] = raw
                 .as_slice()
@@ -37,16 +40,21 @@ impl Identity {
                 .context("сохранённый ключ повреждён")?;
             return Ok(Self {
                 secret: SecretKey::from_bytes(&bytes),
+                dh,
             });
         }
 
         let secret = SecretKey::generate();
         store.set_setting(SECRET_KEY_SETTING, &secret.to_bytes())?;
-        Ok(Self { secret })
+        Ok(Self { secret, dh })
     }
 
     pub fn secret(&self) -> &SecretKey {
         &self.secret
+    }
+
+    pub fn dh(&self) -> &x25519_dalek::StaticSecret {
+        &self.dh
     }
 
     /// Публичный ключ как доменный идентификатор.

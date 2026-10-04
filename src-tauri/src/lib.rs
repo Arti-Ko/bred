@@ -15,6 +15,7 @@ pub mod news;
 pub mod player;
 pub mod report;
 pub mod store;
+pub mod vault;
 
 use serde::Serialize;
 use tauri::{Emitter, Manager};
@@ -99,6 +100,19 @@ enum UiNotice {
         title: String,
     },
     NewsFeed,
+    /// Ключ пространства сменили без нас.
+    KeyLost {
+        space: Id,
+    },
+    /// Нас исключили из пространства.
+    Removed {
+        space: Id,
+        name: String,
+    },
+    /// Ключ пространства сменился (у нас тоже).
+    Rekeyed {
+        space: Id,
+    },
 }
 
 impl From<Notice> for UiNotice {
@@ -156,6 +170,9 @@ impl From<Notice> for UiNotice {
             },
             Notice::News { version, title } => UiNotice::News { version, title },
             Notice::NewsFeed => UiNotice::NewsFeed,
+            Notice::KeyLost { space } => UiNotice::KeyLost { space },
+            Notice::Removed { space, name } => UiNotice::Removed { space, name },
+            Notice::Rekeyed { space } => UiNotice::Rekeyed { space },
         }
     }
 }
@@ -163,6 +180,14 @@ impl From<Notice> for UiNotice {
 /// Поднимает хранилище, личность и сеть. Ошибка здесь не должна ронять окно:
 /// приложение локальное, и показать историю оно обязано даже когда что-то
 /// пошло не так.
+/// База, которая ждёт кода: ядро не поднято, пока его не введут.
+static LOCKED: parking_lot::Mutex<Option<std::path::PathBuf>> = parking_lot::Mutex::new(None);
+
+/// Заперто ли приложение кодом.
+pub fn locked() -> bool {
+    LOCKED.lock().is_some()
+}
+
 fn start_core(handle: &tauri::AppHandle) -> anyhow::Result<()> {
     // BRED_DATA_DIR позволяет держать несколько независимых профилей:
     // без него два экземпляра на одной машине подхватили бы один ключ
@@ -174,38 +199,102 @@ fn start_core(handle: &tauri::AppHandle) -> anyhow::Result<()> {
     let db_path = data_dir.join("bred.sqlite");
     tracing::info!(dir = %data_dir.display(), "каталог данных");
 
-    let handle = handle.clone();
-    tauri::async_runtime::block_on(async move {
-        let (application, mut notices) = App::start(&db_path).await?;
+    let vault = vault::Vault::at(&data_dir);
+    if vault.lock()? == Some(vault::Lock::Passcode) {
+        tracing::info!("база закрыта код-паролем — ждём его");
+        *LOCKED.lock() = Some(db_path);
+        return Ok(());
+    }
+    let key = vault.open_key()?;
+    tauri::async_runtime::block_on(launch(handle.clone(), db_path, key, None))
+}
 
-        // Уборка при запуске: файлы могли осиротеть, пока приложение
-        // было закрыто (например, автор удалил сообщение).
-        let janitor = application.clone();
-        // Канал «Обновления БРЕД»: заглядываем в релизы, пока приложение открыто.
-        application.news.watch();
-        handle.manage(application);
-        tauri::async_runtime::spawn(async move {
-            if let Err(err) = janitor.collect_garbage().await {
-                tracing::debug!(%err, "уборка вложений не удалась");
-            }
-        });
+/// Разблокировка и стирание — по одному за раз: два одновременных верных
+/// кода подняли бы ядро дважды, а параллельный перебор обходил бы паузу.
+static UNLOCKING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-        let emitter = handle.clone();
-        tauri::async_runtime::spawn(async move {
-            while let Some(notice) = notices.recv().await {
-                // Пульт исполняется здесь и наверх не идёт: нажали у соседа —
-                // нажать надо в приложении-источнике, а не в интерфейсе.
-                if let Notice::PlayerCommand { command } = notice {
-                    if let Some(app) = emitter.try_state::<std::sync::Arc<App>>() {
-                        app.player_command(command);
-                    }
-                    continue;
+/// Открыть запертую базу кодом и поднять ядро.
+pub async fn unlock(handle: tauri::AppHandle, passcode: &str) -> anyhow::Result<()> {
+    let _one_at_a_time = UNLOCKING.lock().await;
+    let Some(db_path) = LOCKED.lock().clone() else {
+        return Ok(()); // уже открыто
+    };
+    let vault = vault::Vault::at(app::data_dir_of(&db_path));
+    let (key, previous) = match vault.unlock_with_previous(passcode) {
+        Ok(keys) => keys,
+        Err(err) => {
+            // Пауза на каждую неудачу: перебирать коды руками у открытого
+            // ноутбука становится бессмысленно.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            return Err(err);
+        }
+    };
+    launch(handle, db_path, key, previous).await?;
+    *LOCKED.lock() = None;
+    Ok(())
+}
+
+/// Код забыт: стереть данные этого устройства и начать заново.
+///
+/// Другого пути нет и быть не должно — если бы базу можно было открыть без
+/// кода, код ничего бы не защищал.
+pub async fn wipe_locked(handle: tauri::AppHandle) -> anyhow::Result<()> {
+    let _one_at_a_time = UNLOCKING.lock().await;
+    let Some(db_path) = LOCKED.lock().clone() else {
+        anyhow::bail!("приложение не заперто");
+    };
+    let dir = app::data_dir_of(&db_path).to_path_buf();
+    for name in [
+        "bred.sqlite",
+        "bred.sqlite-wal",
+        "bred.sqlite-shm",
+        "vault.bin",
+    ] {
+        let _ = std::fs::remove_file(dir.join(name));
+    }
+    let _ = std::fs::remove_dir_all(dir.join("blobs"));
+    tracing::warn!("код забыт — данные устройства стёрты");
+    let key = vault::Vault::at(&dir).open_key()?;
+    launch(handle, db_path, key, None).await?;
+    *LOCKED.lock() = None;
+    Ok(())
+}
+
+async fn launch(
+    handle: tauri::AppHandle,
+    db_path: std::path::PathBuf,
+    key: [u8; 32],
+    previous: Option<[u8; 32]>,
+) -> anyhow::Result<()> {
+    let (application, mut notices) = App::start_with_keys(&db_path, key, previous).await?;
+
+    // Уборка при запуске: файлы могли осиротеть, пока приложение
+    // было закрыто (например, автор удалил сообщение).
+    let janitor = application.clone();
+    // Канал «Обновления БРЕД»: заглядываем в релизы, пока приложение открыто.
+    application.news.watch();
+    handle.manage(application);
+    tauri::async_runtime::spawn(async move {
+        if let Err(err) = janitor.collect_garbage().await {
+            tracing::debug!(%err, "уборка вложений не удалась");
+        }
+    });
+
+    let emitter = handle.clone();
+    tauri::async_runtime::spawn(async move {
+        while let Some(notice) = notices.recv().await {
+            // Пульт исполняется здесь и наверх не идёт: нажали у соседа —
+            // нажать надо в приложении-источнике, а не в интерфейсе.
+            if let Notice::PlayerCommand { command } = notice {
+                if let Some(app) = emitter.try_state::<std::sync::Arc<App>>() {
+                    app.player_command(command);
                 }
-                let _ = emitter.emit(NOTICE_EVENT, UiNotice::from(notice));
+                continue;
             }
-        });
-        anyhow::Ok(())
-    })
+            let _ = emitter.emit(NOTICE_EVENT, UiNotice::from(notice));
+        }
+    });
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -265,6 +354,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::bootstrap,
+            commands::lock_state,
+            commands::unlock,
+            commands::wipe_locked,
+            commands::set_passcode,
+            commands::clear_passcode,
             commands::net_status,
             commands::list_spaces,
             commands::list_channels,
@@ -279,6 +373,14 @@ pub fn run() {
             commands::create_space,
             commands::join_space,
             commands::space_invite,
+            commands::space_governance,
+            commands::list_invites,
+            commands::revoke_invite,
+            commands::remove_member,
+            commands::rotate_space_key,
+            commands::set_admin,
+            commands::privacy_info,
+            commands::set_hide_ip,
             commands::open_direct,
             commands::personal_link,
             commands::open_direct_link,

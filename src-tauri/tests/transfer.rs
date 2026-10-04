@@ -67,7 +67,7 @@ async fn transfer(
     let (server_read, server_write) = tokio::io::split(server_side);
     let (client_read, client_write) = tokio::io::split(client_side);
 
-    let serving = blobs::serve_stream(server, server_write, server_read);
+    let serving = blobs::serve_stream(server, server_write, server_read, None);
     let fetching = blobs::fetch_stream(
         client,
         client_write,

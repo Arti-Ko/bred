@@ -3,6 +3,7 @@
 
 pub mod account;
 pub mod event;
+pub mod governance;
 pub mod ids;
 
 pub use event::{now_ms, Attachment, Clock, Event, EventKind, SignedEvent};
@@ -32,43 +33,19 @@ impl Space {
         derive(&self.key, "bred/topic")
     }
 
-    /// Метка для локального маячка: свои узнают, чужие видят случайные байты.
-    pub fn lan_tag(&self) -> [u8; 32] {
-        derive(&self.key, "bred/lan")
-    }
-}
-
-/// Приглашение в пространство. Ровно этого достаточно, чтобы подключиться:
-/// сервера нет, поэтому «ссылка-инвайт» переносит и ключ, и точки входа.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Invite {
-    pub space: SpaceId,
-    pub name: String,
-    pub key: [u8; 32],
-    /// Кого пробовать первым. Не обязательно живы — сеть переоткроет пиров сама.
-    pub bootstrap: Vec<Vec<u8>>,
-}
-
-impl Invite {
-    pub fn encode(&self) -> String {
-        let raw = postcard::to_stdvec(self).expect("приглашение сериализуемо");
-        format!(
-            "bred://join/{}",
-            data_encoding::BASE32_NOPAD
-                .encode(&raw)
-                .to_ascii_lowercase()
-        )
+    /// Метка для локального маячка на одно окно времени.
+    ///
+    /// Свои узнают своих, а чужой видит случайные байты — и, главное, другие
+    /// случайные байты через десять минут. Постоянная метка позволяла бы любому
+    /// в той же сети узнавать устройство при каждой новой встрече.
+    pub fn lan_tag(&self, window: u64) -> [u8; 32] {
+        let key = derive(&self.key, "bred/lan/v2");
+        *blake3::keyed_hash(&key, &window.to_le_bytes()).as_bytes()
     }
 
-    pub fn decode(text: &str) -> anyhow::Result<Self> {
-        let body = text
-            .trim()
-            .strip_prefix("bred://join/")
-            .ok_or_else(|| anyhow::anyhow!("ссылка должна начинаться с bred://join/"))?;
-        let raw = data_encoding::BASE32_NOPAD
-            .decode(body.to_ascii_uppercase().as_bytes())
-            .map_err(|_| anyhow::anyhow!("повреждённая ссылка-приглашение"))?;
-        Ok(postcard::from_bytes(&raw)?)
+    /// Ключ, которым в маячке закрыт адрес узла.
+    pub fn lan_key(&self) -> [u8; 32] {
+        derive(&self.key, "bred/lan/seal")
     }
 }
 
@@ -161,27 +138,9 @@ mod tests {
         let s = space();
         assert_ne!(s.topic(), s.id.0);
         assert_ne!(s.topic(), s.key);
-        assert_ne!(s.topic(), s.lan_tag());
-    }
-
-    #[test]
-    fn invite_round_trips() {
-        let inv = Invite {
-            space: Id([4u8; 32]),
-            name: "Орбита".into(),
-            key: [7u8; 32],
-            bootstrap: vec![vec![1, 2, 3]],
-        };
-        let restored = Invite::decode(&inv.encode()).unwrap();
-        assert_eq!(restored.space, inv.space);
-        assert_eq!(restored.key, inv.key);
-        assert_eq!(restored.name, "Орбита");
-    }
-
-    #[test]
-    fn invite_rejects_garbage() {
-        assert!(Invite::decode("https://example.com").is_err());
-        assert!(Invite::decode("bred://join/%%%").is_err());
+        assert_ne!(s.topic(), s.lan_tag(0));
+        assert_ne!(s.lan_key(), s.key);
+        assert_ne!(s.lan_tag(0), s.lan_tag(1));
     }
 }
 

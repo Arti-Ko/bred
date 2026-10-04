@@ -11,7 +11,7 @@ use std::{
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
-    domain::{Clock, Id, SignedEvent, Space, SpaceId},
+    domain::{governance, now_ms, Clock, Event, EventKind, Id, SignedEvent, Space, SpaceId},
     identity::{verify, Identity},
     store::{Applied, Store},
 };
@@ -103,6 +103,12 @@ pub enum Notice {
     News { version: String, title: String },
     /// Лента канала обновлений изменилась — перечитать.
     NewsFeed,
+    /// Ключ пространства сменили, а нам копию не оставили.
+    KeyLost { space: SpaceId },
+    /// Нас исключили, и пространство с этого устройства стёрто.
+    Removed { space: SpaceId, name: String },
+    /// Пространство перешло на новый ключ.
+    Rekeyed { space: SpaceId },
     /// Кто сейчас говорит в звонке — по громкости его звука у нас.
     Speaking { authors: Vec<Id> },
     /// Подобранный битрейт дорожки картинки.
@@ -112,6 +118,26 @@ pub enum Notice {
     /// отдельной копии кадра.
     Bitrate { track: &'static str, bps: u32 },
 }
+
+/// Перемена во власти, на которую должна ответить сеть.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Change {
+    /// Ключ пространства сменился — пора в новый рой.
+    Rekeyed(SpaceId),
+    /// Нас исключили — пространство надо оставить.
+    Removed(SpaceId),
+    /// Действующий ключ знает кто-то из исключённых, а мы вправе его сменить.
+    Compromised(SpaceId),
+}
+
+/// Насколько далеко вперёд чужое событие может перевести наши логические
+/// часы. Честный узел обгоняет остальных на число своих событий, не больше;
+/// событие с часами «на краю вселенной» сломало бы порядок у всех навсегда.
+const MAX_LAMPORT_JUMP: u64 = 1 << 32;
+/// Потолок для часов и номеров: в базе они лежат как знаковые 64 бита.
+const MAX_COUNTER: u64 = (i64::MAX as u64) / 2;
+
+type ChangeHook = Box<dyn Fn(Change) + Send + Sync>;
 
 pub struct Ctx {
     pub store: Arc<Store>,
@@ -128,6 +154,15 @@ pub struct Ctx {
     pub notices: UnboundedSender<Notice>,
     /// Куда складываются байты вложений.
     blob_dir: PathBuf,
+    /// Ключи прошлых эпох. Открывают только запросы отставших.
+    past_keys: RwLock<Vec<(SpaceId, [u8; 32])>>,
+    /// Кому сообщить о смене ключа или исключении. Ставит сеть.
+    on_change: std::sync::OnceLock<ChangeHook>,
+    /// Переход на новый ключ — по одному за раз: проверка «на каком мы» и
+    /// запись нового иначе перемежались бы, и ключ мог откатиться назад.
+    adopting: Mutex<()>,
+    /// О каких раздачах без нашей копии уже сказали — чтобы не повторять.
+    lost: Mutex<std::collections::HashSet<Id>>,
 }
 
 impl Ctx {
@@ -140,6 +175,7 @@ impl Ctx {
         blob_dir: impl AsRef<Path>,
     ) -> Self {
         let map = spaces.into_iter().map(|s| (s.id, s)).collect();
+        let past_keys = store.past_keys().unwrap_or_default();
         Self {
             store,
             identity,
@@ -149,6 +185,21 @@ impl Ctx {
             players: RwLock::new(HashMap::new()),
             notices,
             blob_dir: blob_dir.as_ref().to_path_buf(),
+            past_keys: RwLock::new(past_keys),
+            on_change: std::sync::OnceLock::new(),
+            adopting: Mutex::new(()),
+            lost: Mutex::new(std::collections::HashSet::new()),
+        }
+    }
+
+    /// Подписаться на перемены во власти. Один подписчик — сеть.
+    pub fn on_change(&self, hook: ChangeHook) {
+        let _ = self.on_change.set(hook);
+    }
+
+    fn changed(&self, change: Change) {
+        if let Some(hook) = self.on_change.get() {
+            hook(change);
         }
     }
 
@@ -170,6 +221,183 @@ impl Ctx {
             super::wire::open::<T>(&space.key, raw)
                 .ok()
                 .map(|v| (space.id, v))
+        })
+    }
+
+    /// То же, но и ключами прошлых эпох. Последнее в ответе — подошёл ли
+    /// нынешний ключ: отставшему отвечают одной раздачей нового.
+    pub fn open_with_any_key<T: for<'de> serde::Deserialize<'de>>(
+        &self,
+        raw: &[u8],
+    ) -> Option<(SpaceId, T, [u8; 32], bool)> {
+        if let Some(found) = self.space_list().into_iter().find_map(|space| {
+            super::wire::open::<T>(&space.key, raw)
+                .ok()
+                .map(|v| (space.id, v, space.key, true))
+        }) {
+            return Some(found);
+        }
+        let past = self.past_keys.read().clone();
+        past.into_iter().find_map(|(space, key)| {
+            self.space(space)?;
+            super::wire::open::<T>(&key, raw)
+                .ok()
+                .map(|v| (space, v, key, false))
+        })
+    }
+
+    /// Исключён ли человек из пространства.
+    pub fn is_removed(&self, space: SpaceId, who: Id) -> bool {
+        self.store.is_removed(space, who).unwrap_or(false)
+    }
+
+    /// Подписать и записать своё событие. В сеть его отправляет вызывающий:
+    /// раздачу нового ключа, например, надо успеть разослать старым.
+    pub fn commit(&self, space: SpaceId, kind: EventKind) -> Result<SignedEvent> {
+        let author = self.identity.id();
+        let event = Event {
+            space,
+            author,
+            seq: self.store.next_seq(space, author)?,
+            lamport: self.clock.lock().tick(),
+            ts: now_ms(),
+            kind,
+        };
+        let sig = self.identity.sign(&event.canonical_bytes());
+        let signed = SignedEvent { event, sig };
+        self.store.apply(&signed)?;
+        let _ = self.notices.send(Notice::Applied {
+            space,
+            event: signed.id(),
+        });
+        Ok(signed)
+    }
+
+    /// Довести последствия события о власти: перейти на новый ключ, понять,
+    /// что нас исключили, или что ключ пора сменить.
+    pub fn settle(&self, event: &Event) {
+        if !matches!(
+            event.kind,
+            EventKind::KeyRotate { .. }
+                | EventKind::MemberRemove { .. }
+                | EventKind::RoleSet { .. }
+                | EventKind::Founded { .. }
+                | EventKind::SpaceCreate { .. }
+        ) {
+            return;
+        }
+        let space = event.space;
+        if self.space(space).is_none() {
+            return;
+        }
+        let me = self.identity.id();
+        if self.is_removed(space, me) {
+            tracing::warn!(space = %space.short(), "нас исключили из пространства");
+            self.changed(Change::Removed(space));
+            return;
+        }
+        if let Err(err) = self.adopt_latest_key(space) {
+            tracing::warn!(%err, "не удалось перейти на новый ключ");
+        }
+        let can_rotate = self
+            .store
+            .role(space, me)
+            .is_ok_and(|role| role != crate::store::Role::Member);
+        if can_rotate && self.store.key_compromised(space).unwrap_or(false) {
+            self.changed(Change::Compromised(space));
+        }
+    }
+
+    /// Перейти на ключ из головы цепочки смен, если мы не на нём.
+    pub fn adopt_latest_key(&self, space: SpaceId) -> Result<bool> {
+        let _one_at_a_time = self.adopting.lock();
+        let Some(head) = self.store.rotation_head(space)? else {
+            return Ok(false);
+        };
+        let (_, current) = self.store.key_epoch(space)?;
+        if current == Some(head.id) {
+            return Ok(false);
+        }
+        // Гость, впущенный по приглашению, получил ключ из рук и в раздаче его
+        // нет. Если отпечаток совпал — это тот самый ключ, просто отмечаем.
+        let held = self.space(space).map(|s| s.key);
+        if let Some(key) = held.filter(|key| governance::key_check(key) == head.check) {
+            self.store
+                .adopt_key(space, &key, head.epoch, Some(head.id))?;
+            return Ok(false);
+        }
+        let key = governance::unwrap(
+            space,
+            head.epoch,
+            head.ephemeral,
+            &head.wraps,
+            self.identity.id(),
+            self.identity.dh(),
+        )
+        // Экземпляр не сходится с отпечатком — значит, нам раздали не тот
+        // ключ, что остальным. Такой брать нельзя: он отрезал бы нас от своих.
+        .filter(|key| governance::key_check(key) == head.check);
+        let Some(key) = key else {
+            if self.lost.lock().insert(head.id) {
+                tracing::warn!(space = %space.short(), epoch = head.epoch, "ключ сменили, а нашей копии в раздаче нет");
+                let _ = self.notices.send(Notice::KeyLost { space });
+            }
+            return Ok(false);
+        };
+
+        self.store
+            .adopt_key(space, &key, head.epoch, Some(head.id))?;
+        if let Some(old) = held {
+            self.past_keys.write().push((space, old));
+        }
+        if let Some(entry) = self.spaces.write().get_mut(&space) {
+            entry.key = key;
+        }
+        tracing::info!(space = %space.short(), epoch = head.epoch, "перешли на новый ключ пространства");
+        self.changed(Change::Rekeyed(space));
+        Ok(true)
+    }
+
+    /// Собрать смену ключа: новый ключ, разложенный всем, кто остался.
+    ///
+    /// Смена продолжает голову цепочки, а не тот ключ, на котором мы сами:
+    /// если мы взяли ключ из ветки, которая проиграла, продолжать её незачем.
+    pub fn prepare_rotation(&self, space: SpaceId) -> Result<EventKind> {
+        let me = self.identity.id();
+        let mut recipients = vec![governance::Recipient {
+            member: me,
+            dh: crate::identity::dh_public(self.identity.dh()),
+        }];
+        for member in self.store.members(space)? {
+            if member.id == me {
+                continue;
+            }
+            match member.dh {
+                Some(dh) => recipients.push(governance::Recipient {
+                    member: member.id,
+                    dh,
+                }),
+                None => {
+                    tracing::warn!(member = %member.id.short(), "у участника нет ключа согласования — ключ ему не достанется")
+                }
+            }
+        }
+        let owner = self.store.owner(space)?;
+        if owner.is_some_and(|owner| recipients.iter().all(|r| r.member != owner)) {
+            anyhow::bail!(
+                "ключ владельца ещё не доехал — сменить ключ без него нельзя, попробуйте, когда он появится в сети"
+            );
+        }
+        let head = self.store.rotation_head(space)?;
+        let epoch = head.as_ref().map_or(1, |h| h.epoch + 1);
+        let key: [u8; 32] = rand::random();
+        let (ephemeral, wraps) = governance::wrap(space, epoch, &key, &recipients);
+        Ok(EventKind::KeyRotate {
+            epoch,
+            prev: head.map(|h| h.id),
+            ephemeral,
+            wraps,
+            check: governance::key_check(&key),
         })
     }
 
@@ -200,6 +428,12 @@ impl Ctx {
             // Событие из пространства, в котором мы не состоим.
             return Ok(false);
         }
+        let lamport = signed.event.lamport;
+        let horizon = self.clock.lock().current().saturating_add(MAX_LAMPORT_JUMP);
+        if lamport > MAX_COUNTER || lamport > horizon || signed.event.seq > MAX_COUNTER {
+            tracing::warn!(author = %signed.event.author.short(), lamport, "часы события за горизонтом — отброшено");
+            return Ok(false);
+        }
 
         self.clock.lock().observe(signed.event.lamport);
         match self.store.apply(signed)? {
@@ -208,6 +442,7 @@ impl Ctx {
                     space: signed.event.space,
                     event: signed.id(),
                 });
+                self.settle(&signed.event);
                 Ok(true)
             }
             Applied::Duplicate => Ok(false),
@@ -247,6 +482,16 @@ impl Ctx {
             let mut all = self.presence.write();
             let per_space = all.entry(space).or_default();
             let previous = per_space.get(&author);
+
+            // Присутствие подписано, но подписанное можно переслать повторно:
+            // старый удар сердца показал бы человека «в сети» и в звонке, где
+            // его уже нет. Поэтому принимаем только более свежие, чем уже
+            // виденный, — пока тот не протух.
+            if previous.is_some_and(|old| {
+                old.at >= now - PRESENCE_TTL_MS && presence.ts <= old.presence.ts
+            }) {
+                return;
+            }
 
             // Протухшую запись считаем за отсутствие: человек уже пропал из
             // списка, и его возвращение — новость, даже если имя и голосовой
@@ -556,6 +801,52 @@ mod tests {
         assert!(
             rx.try_recv().is_ok(),
             "вернувшийся участник обязан перерисовать список, даже если имя и канал те же"
+        );
+    }
+
+    fn signed(identity: &Identity, lamport: u64, seq: u64) -> SignedEvent {
+        let event = Event {
+            space: Id([3u8; 32]),
+            author: identity.id(),
+            seq,
+            lamport,
+            ts: now_ms(),
+            kind: EventKind::Profile {
+                nick: "кто-то".into(),
+                avatar: None,
+                dh: None,
+            },
+        };
+        let sig = identity.sign(&event.canonical_bytes());
+        SignedEvent { event, sig }
+    }
+
+    #[test]
+    fn clocks_beyond_the_horizon_are_refused() {
+        let ctx = ctx();
+        let stranger = Identity::load_or_create(&Store::in_memory().unwrap()).unwrap();
+        assert!(!ctx.apply(&signed(&stranger, u64::MAX, 1)).unwrap());
+        assert!(!ctx
+            .apply(&signed(&stranger, MAX_LAMPORT_JUMP + 10, 1))
+            .unwrap());
+        assert_eq!(ctx.clock.lock().current(), 0, "часы не сдвинулись");
+        assert!(ctx.apply(&signed(&stranger, 40, 1)).unwrap());
+        assert_eq!(ctx.clock.lock().current(), 40);
+    }
+
+    #[test]
+    fn replayed_old_presence_is_ignored() {
+        let ctx = ctx();
+        let space = Id([3u8; 32]);
+        let mut fresh = presence(1, 2_000);
+        fresh.voice = None;
+        ctx.note_presence(space, fresh);
+        // Кто-то переслал старый удар сердца — тот, где человек ещё был в звонке.
+        ctx.note_presence(space, presence(1, 1_000));
+        assert_eq!(
+            ctx.presence_of(space)[0].voice,
+            None,
+            "старое подписанное присутствие не перекрывает свежее"
         );
     }
 

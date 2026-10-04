@@ -2,6 +2,7 @@
   import type { MessageRow } from '../ipc';
   import { chunks, loneSticker, timecode, tokenize } from '../format';
   import { session } from '../stores/session.svelte';
+  import { governance } from '../stores/governance.svelte';
   import { isViewable, previewUrl } from '../previews';
   import EmojiPicker from './EmojiPicker.svelte';
 
@@ -216,7 +217,8 @@
           onreply();
         }}>ответить</button
       >
-      {#if mine && !message.deleted}
+      <!-- Чужое удаляет модератор; сообщения владельца не трогает никто, кроме него -->
+      {#if !message.deleted && (mine || (governance.canModerate && message.author !== governance.info?.owner))}
         <button
           class="rx"
           onclick={(event) => {

@@ -6,6 +6,7 @@
 
   import Avatar from './Avatar.svelte';
   import Dialog from './Dialog.svelte';
+  import InviteDialog from './InviteDialog.svelte';
   import { api, errorText } from '../ipc';
   import { session } from '../stores/session.svelte';
 
@@ -21,7 +22,6 @@
   let link = $state('');
   let voice = $state(false);
   let category = $state('общее');
-  let ticket = $state('');
   let personal = $state('');
   let nick = $state(session.nick);
   let busy = $state(false);
@@ -29,12 +29,6 @@
   let copied = $state('');
 
   $effect(() => {
-    if (kind === 'приглашение' && session.spaceId && !ticket) {
-      void api
-        .spaceInvite(session.spaceId)
-        .then((value) => (ticket = value))
-        .catch((issue) => (error = errorText(issue)));
-    }
     if (kind === 'профиль' && !personal) {
       void api
         .personalLink()
@@ -69,23 +63,7 @@
 </script>
 
 {#if kind === 'приглашение'}
-  <Dialog title={`Пригласить в «${session.space?.name ?? ''}»`} {onclose}>
-    <p class="hint-text">
-      Отправьте эту ссылку любым способом — мессенджером, почтой, как угодно. Кто её получил,
-      тот участник: ни регистрации, ни почты, ни пароля не потребуется.
-    </p>
-    <div>
-      <span class="field-label">Ссылка-приглашение</span>
-      <div class="input mono">{ticket || 'готовим ссылку…'}</div>
-    </div>
-    {#if error}<p class="error">{error}</p>{/if}
-    {#snippet footer()}
-      <button class="btn quiet" onclick={onclose}>Закрыть</button>
-      <button class="btn primary" disabled={!ticket} onclick={() => copy(ticket, 'ссылка')}>
-        {copied === 'ссылка' ? 'Скопировано' : 'Скопировать'}
-      </button>
-    {/snippet}
-  </Dialog>
+  <InviteDialog {onclose} />
 {:else if kind === 'канал'}
   <Dialog title="Новый канал" {onclose}>
     <div>
@@ -153,7 +131,7 @@
     <div>
       <span class="field-label">Ссылка</span>
       <!-- svelte-ignore a11y_autofocus -->
-      <input class="input mono" bind:value={link} placeholder="bred://join/…" autofocus />
+      <input class="input mono" bind:value={link} placeholder="bred://invite/…" autofocus />
     </div>
     {#if error}<p class="error">{error}</p>{/if}
     {#snippet footer()}

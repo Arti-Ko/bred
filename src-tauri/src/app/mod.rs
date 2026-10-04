@@ -1,15 +1,17 @@
 //! Прикладной слой: собирает хранилище, личность и сеть в одно целое
 //! и предоставляет операции, которыми пользуется UI.
 
+mod governance;
+
+pub use governance::{GovernanceView, InviteOptions, InviteView, PrivacyView};
+
 use anyhow::{anyhow, Context, Result};
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::{
     audio::AudioEngine,
-    domain::{
-        now_ms, Attachment, Clock, Event, EventKind, Hello, Id, Invite, SignedEvent, Space, SpaceId,
-    },
+    domain::{now_ms, Attachment, Clock, EventKind, Hello, Id, SignedEvent, SpaceId},
     identity::{device_label, load_avatar, load_nick, save_avatar, save_nick, Account, Identity},
     net::{
         ctx::Notice,
@@ -89,8 +91,6 @@ struct Music {
 
 pub struct App {
     pub store: Arc<Store>,
-    /// Ключ согласования для личных переписок.
-    dh: x25519_dalek::StaticSecret,
     pub ctx: Arc<Ctx>,
     pub net: Arc<Net>,
     /// Что мы сами сейчас транслируем. Пусто — ведущий не мы.
@@ -108,12 +108,48 @@ pub struct App {
     reporter: crate::report::Reporter,
     /// Канал «Обновления БРЕД» — посты из релизов GitHub.
     pub news: Arc<crate::news::News>,
+    /// Сейф с ключом базы — чтобы поставить или снять код-пароль.
+    vault: crate::vault::Vault,
+    db_key: parking_lot::Mutex<[u8; 32]>,
 }
 
 impl App {
-    /// Полная инициализация. Возвращает приложение и поток уведомлений для UI.
+    /// Полная инициализация без кода: ключ базы — из сейфа устройства.
     pub async fn start(db_path: &Path) -> Result<(Arc<Self>, UnboundedReceiver<Notice>)> {
-        let store = Arc::new(Store::open(db_path)?);
+        let vault = crate::vault::Vault::at(data_dir_of(db_path));
+        let key = vault.open_key()?;
+        Self::start_with_key(db_path, key).await
+    }
+
+    /// Полная инициализация известным ключом базы — после ввода кода.
+    /// Возвращает приложение и поток уведомлений для UI.
+    pub async fn start_with_key(
+        db_path: &Path,
+        db_key: [u8; 32],
+    ) -> Result<(Arc<Self>, UnboundedReceiver<Notice>)> {
+        Self::start_with_keys(db_path, db_key, None).await
+    }
+
+    /// То же, но с запасным ключом: смена кода могла оборваться посреди
+    /// перешифровки, и база осталась на прежнем. Тогда открываем прежним и
+    /// доводим переход до конца.
+    pub async fn start_with_keys(
+        db_path: &Path,
+        db_key: [u8; 32],
+        previous: Option<[u8; 32]>,
+    ) -> Result<(Arc<Self>, UnboundedReceiver<Notice>)> {
+        let vault = crate::vault::Vault::at(data_dir_of(db_path));
+        let store = match (Store::open(db_path, &db_key), previous) {
+            (Ok(store), _) => store,
+            (Err(err), None) => return Err(err),
+            (Err(err), Some(old)) => {
+                let store = Store::open(db_path, &old).map_err(|_| err)?;
+                store.rekey(&db_key)?;
+                tracing::info!("перешифровка базы на новый ключ доведена до конца");
+                store
+            }
+        };
+        let store = Arc::new(store);
         let identity = Identity::load_or_create(&store)?;
         store.set_me(identity.id());
         // Аккаунт заводится при первом запуске версии, где он появился: у
@@ -132,7 +168,6 @@ impl App {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("blobs");
-        let dh = crate::identity::load_or_create_dh(&store)?;
         let audio = AudioEngine::new(tx.clone());
         let news = crate::news::News::new(store.clone(), tx.clone());
         let ctx = Arc::new(Ctx::new(
@@ -169,7 +204,6 @@ impl App {
         Ok((
             Arc::new(Self {
                 store,
-                dh,
                 ctx,
                 net,
                 music: parking_lot::Mutex::new(None),
@@ -179,6 +213,8 @@ impl App {
                 account,
                 reporter: crate::report::Reporter::new(),
                 news,
+                vault,
+                db_key: parking_lot::Mutex::new(db_key),
             }),
             rx,
         ))
@@ -186,7 +222,7 @@ impl App {
 
     /// Публичная половина ключа согласования — её видят собеседники.
     pub fn dh_public(&self) -> Id {
-        crate::identity::dh_public(&self.dh)
+        crate::identity::dh_public(self.ctx.identity.dh())
     }
 
     /// Личная визитка: ссылка, по которой с тобой можно связаться напрямую,
@@ -211,7 +247,7 @@ impl App {
             return Err(anyhow!("это ваша собственная ссылка"));
         }
 
-        let shared = crate::identity::shared_secret(&self.dh, hello.dh);
+        let shared = crate::identity::shared_secret(self.ctx.identity.dh(), hello.dh);
         let mut space = crate::domain::direct_space(self.me(), hello.id, shared);
         space.name = hello.nick.clone();
 
@@ -250,7 +286,7 @@ impl App {
             .peer_dh(peer)?
             .ok_or_else(|| anyhow!("у собеседника ещё нет ключа для личной переписки"))?;
 
-        let shared = crate::identity::shared_secret(&self.dh, peer_dh);
+        let shared = crate::identity::shared_secret(self.ctx.identity.dh(), peer_dh);
         let mut space = crate::domain::direct_space(self.me(), peer, shared);
         space.name = self.store.peer_nick(peer)?.unwrap_or_else(|| peer.short());
 
@@ -404,77 +440,6 @@ impl App {
 
     /// Создаёт новое пространство. Ключ генерируется здесь и дальше живёт
     /// только у тех, кому дали ссылку-приглашение.
-    pub async fn create_space(&self, name: &str) -> Result<SpaceId> {
-        let name = validate_name(name, "название пространства")?;
-
-        let mut key = [0u8; 32];
-        rand::Rng::fill(&mut rand::rng(), &mut key[..]);
-        let mut id_bytes = [0u8; 32];
-        rand::Rng::fill(&mut rand::rng(), &mut id_bytes[..]);
-
-        let space = Space {
-            id: Id(id_bytes),
-            name: name.clone(),
-            key,
-            direct: None,
-        };
-        self.store.save_space(&space)?;
-        self.ctx.add_space(space.clone());
-        self.net.join(space.clone()).await?;
-
-        self.commit_and_publish(space.id, EventKind::SpaceCreate { name })
-            .await?;
-        // Пространство без каналов бесполезно — сразу заводим общий.
-        self.create_channel(space.id, "общий-канал", "общее", false)
-            .await?;
-        self.announce_profile(space.id).await?;
-        Ok(space.id)
-    }
-
-    /// Присоединение по ссылке-приглашению.
-    pub async fn join_space(&self, ticket: &str) -> Result<SpaceId> {
-        let invite = Invite::decode(ticket)?;
-        if self.ctx.space(invite.space).is_some() {
-            return Ok(invite.space); // уже состоим — не считаем это ошибкой
-        }
-
-        let space = Space {
-            id: invite.space,
-            name: invite.name,
-            key: invite.key,
-            direct: None,
-        };
-        self.store.save_space(&space)?;
-        self.ctx.add_space(space.clone());
-        // Адреса из ссылки — единственная зацепка при входе через интернет.
-        self.net.join_via(space.clone(), &invite.bootstrap).await?;
-        self.announce_profile(space.id).await?;
-        Ok(space.id)
-    }
-
-    /// Ссылка-приглашение: несёт ключ пространства и наш адрес как точку входа.
-    pub async fn invite(&self, space: SpaceId) -> Result<String> {
-        self.net.wait_reachable(LINK_WAIT).await;
-        let space = self
-            .ctx
-            .space(space)
-            .ok_or_else(|| anyhow!("пространство не найдено"))?;
-        let addr = self.net.addr_now();
-        let bootstrap = if addr.is_empty() {
-            Vec::new()
-        } else {
-            vec![addr]
-        };
-
-        Ok(Invite {
-            space: space.id,
-            name: space.name,
-            key: space.key,
-            bootstrap,
-        }
-        .encode())
-    }
-
     /// Выйти из пространства и стереть его историю с этого устройства.
     pub async fn leave_space(&self, space: SpaceId) -> Result<()> {
         if self.ctx.space(space).is_none() {
@@ -1048,6 +1013,10 @@ impl App {
                 dh: Some(self.dh_public()),
                 online: true,
                 last_seen: now_ms(),
+                role: self
+                    .store
+                    .role(space, self.me())
+                    .unwrap_or(crate::store::Role::Member),
             });
         }
         rows.sort_by(|a, b| b.online.cmp(&a.online).then(a.nick.cmp(&b.nick)));
@@ -1117,33 +1086,21 @@ impl App {
     /// сообщение обязано появиться в своей ленте мгновенно, даже если сейчас
     /// нет ни одного соседа — соседи получат его при первой же встрече.
     async fn commit_and_publish(&self, space: SpaceId, kind: EventKind) -> Result<SignedEvent> {
-        let author = self.me();
-        let seq = self.store.next_seq(space, author)?;
-        let lamport = self.ctx.clock.lock().tick();
-
-        let event = Event {
-            space,
-            author,
-            seq,
-            lamport,
-            ts: now_ms(),
-            kind,
-        };
-        let sig = self.ctx.identity.sign(&event.canonical_bytes());
-        let signed = SignedEvent { event, sig };
-
-        self.store.apply(&signed)?;
-        let _ = self.ctx.notices.send(Notice::Applied {
-            space,
-            event: signed.id(),
-        });
-
+        let signed = self.ctx.commit(space, kind)?;
         if let Err(err) = self.net.publish_event(space, &signed).await {
             // Не откатываем: событие уже в логе и уедет при досинхронизации.
             tracing::warn!(%err, "событие не ушло в сеть, разойдётся позже");
         }
+        // Последствия — после рассылки: раздачу нового ключа надо успеть
+        // отправить в старый рой, пока мы сами в нём.
+        self.ctx.settle(&signed.event);
         Ok(signed)
     }
+}
+
+/// Каталог данных — тот, где лежит база.
+pub fn data_dir_of(db_path: &Path) -> &Path {
+    db_path.parent().unwrap_or_else(|| Path::new("."))
 }
 
 /// Тип картинки по её первым байтам.

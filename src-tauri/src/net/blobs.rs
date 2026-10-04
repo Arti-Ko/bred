@@ -79,8 +79,9 @@ impl ProtocolHandler for BlobProtocol {
 }
 
 async fn serve(ctx: Arc<Ctx>, connection: Connection) -> Result<()> {
+    let peer = Id(*connection.remote_id().as_bytes());
     let (send, recv) = connection.accept_bi().await?;
-    serve_stream(&ctx, send, recv).await?;
+    serve_stream(&ctx, send, recv, Some(peer)).await?;
 
     // Ждём, пока получатель закроет соединение сам.
     //
@@ -95,7 +96,7 @@ async fn serve(ctx: Arc<Ctx>, connection: Connection) -> Result<()> {
 
 /// Раздача поверх пары потоков. Отделена от QUIC-соединения, чтобы протокол
 /// можно было прогнать в тесте через обычную трубу, а не поднимать сеть.
-pub async fn serve_stream<W, R>(ctx: &Ctx, mut send: W, mut recv: R) -> Result<()>
+pub async fn serve_stream<W, R>(ctx: &Ctx, mut send: W, mut recv: R, peer: Option<Id>) -> Result<()>
 where
     W: AsyncWriteExt + Unpin,
     R: AsyncReadExt + Unpin,
@@ -108,6 +109,9 @@ where
     };
     if request.space != space {
         return Err(anyhow!("пространство в запросе не совпало с ключом"));
+    }
+    if peer.is_some_and(|peer| ctx.is_removed(space, peer)) {
+        return Err(anyhow!("файл просит исключённый участник"));
     }
     let key = ctx
         .space(space)

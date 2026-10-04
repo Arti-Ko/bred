@@ -27,7 +27,13 @@ pub const SYNC_BATCH: usize = 512;
 /// «подставляется по умолчанию», а сдвигает весь поток. Поэтому узлы разных
 /// версий не могут читать события друг друга в принципе — и об этом надо
 /// говорить вслух, а не молча отбрасывать чужие сообщения.
-pub const PROTOCOL: u16 = 3;
+///
+/// Четвёртая — подписанные сообщения роя, роли, смена ключа пространства и
+/// приглашения без ключа внутри (0.8).
+pub const PROTOCOL: u16 = 4;
+
+/// Метка подписи сообщения роя: подпись этого рода нельзя выдать за другую.
+const BROADCAST_DOMAIN: &[u8] = b"bred broadcast v4";
 
 /// Конверт: версия снаружи, чтобы её можно было прочитать всегда.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,22 +142,84 @@ pub enum SyncFrame {
     Push { events: Vec<SignedEvent> },
 }
 
-/// Маячок локальной сети. Уходит открытым текстом по мультикасту, поэтому
-/// внутри нет ни имён, ни идентификаторов пространств — только метки-производные,
-/// по которым свои узнают своих, а чужие видят случайные байты.
+/// Маячок локальной сети. Уходит по мультикасту всем в той же сети, поэтому
+/// открытого в нём нет ничего.
+///
+/// Раньше адрес узла — а в нём его постоянный идентификатор — ехал как есть, и
+/// любой в том же Wi-Fi видел, что здесь работает БРЕД, и узнавал то же
+/// устройство в другой сети. Теперь адрес закрыт одноразовым ключом, а ключ —
+/// ключом каждого пространства; метки пространств меняются раз в десять минут.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Beacon {
-    /// Сериализованный `EndpointAddr` отправителя.
-    pub addr: Vec<u8>,
-    /// `Space::lan_tag()` для каждого пространства, в котором мы состоим.
-    pub tags: Vec<[u8; 32]>,
+    /// Сериализованный `EndpointAddr`, закрытый одноразовым ключом маячка.
+    pub sealed: Vec<u8>,
+    /// Соль маски: одинаковые ключи в разных маячках выглядят по-разному.
+    pub salt: [u8; 16],
+    /// По месту на каждое наше пространство: метка окна и одноразовый ключ,
+    /// закрытый маской из ключа этого пространства.
+    pub slots: Vec<BeaconSlot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BeaconSlot {
+    pub tag: [u8; 32],
+    /// Одноразовый ключ XOR маска. Подлинность проверяет сам адрес: с
+    /// неверным ключом AEAD его не откроет.
+    pub key: [u8; 32],
 }
 
 // ── шифрование ──────────────────────────────────────────────────────────────
 
-/// Упаковать сообщение роя вместе с версией формата.
-pub fn wrap(key: &[u8; 32], message: &Broadcast) -> Result<Vec<u8>> {
-    let body = postcard::to_stdvec(message)?;
+/// Сообщение роя с подписью отправителя.
+///
+/// Раньше подписаны были только события лога, а присутствие, «печатает» и
+/// пульт плеера ехали как есть. Ключ пространства общий, и любой участник мог
+/// разослать «присутствие» от чужого имени — с чужим ником, в чужом звонке.
+/// Теперь каждое сообщение подписано ключом устройства, а получатель сверяет
+/// подпись с тем, кем сообщение себя называет.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct Signed {
+    author: Id,
+    /// Когда подписано, мс. Без метки перехваченное «нажал паузу» можно было
+    /// бы повторять в рой бесконечно.
+    at: i64,
+    message: Broadcast,
+    #[serde(with = "crate::domain::event::serde_sig")]
+    sig: [u8; 64],
+}
+
+/// Сколько живёт подписанное сообщение роя. С запасом на часы, которые у
+/// людей расходятся, но не настолько, чтобы старое можно было крутить по кругу.
+const BROADCAST_TTL_MS: i64 = 10 * 60 * 1000;
+
+/// Что подписывается: метка, пространство, автор, время и само сообщение.
+/// Пространство в подписи — чтобы сообщение из одного пространства нельзя было
+/// переслать в другое, где отправитель тоже состоит.
+fn signing_bytes(space: SpaceId, author: Id, at: i64, message: &Broadcast) -> Result<Vec<u8>> {
+    let mut out = BROADCAST_DOMAIN.to_vec();
+    out.extend_from_slice(&space.0);
+    out.extend_from_slice(&author.0);
+    out.extend_from_slice(&at.to_le_bytes());
+    out.extend_from_slice(&postcard::to_stdvec(message)?);
+    Ok(out)
+}
+
+/// Упаковать сообщение роя: подпись, версия формата, шифр пространства.
+pub fn wrap(
+    key: &[u8; 32],
+    space: SpaceId,
+    identity: &crate::identity::Identity,
+    message: &Broadcast,
+) -> Result<Vec<u8>> {
+    let author = identity.id();
+    let at = crate::domain::now_ms();
+    let sig = identity.sign(&signing_bytes(space, author, at, message)?);
+    let body = postcard::to_stdvec(&Signed {
+        author,
+        at,
+        message: message.clone(),
+        sig,
+    })?;
     seal(
         key,
         &Envelope {
@@ -168,12 +236,24 @@ pub fn wrap(key: &[u8; 32], message: &Broadcast) -> Result<Vec<u8>> {
 /// другая версия, формат 3 против 3» — неправда, которая пугала зря. Теперь
 /// такое сообщение просто пропускается: события лога так не теряются, их
 /// догонит досинхронизация.
-pub fn unwrap(key: &[u8; 32], raw: &[u8]) -> Result<Broadcast, Option<u16>> {
+///
+/// Возвращает подтверждённого подписью отправителя и сообщение. Неподписанное
+/// или подписанное не тем — молча отбрасывается, как чужой шум.
+pub fn unwrap(key: &[u8; 32], space: SpaceId, raw: &[u8]) -> Result<(Id, Broadcast), Option<u16>> {
     let envelope: Envelope = open(key, raw).map_err(|_| None)?;
     if envelope.version != PROTOCOL {
         return Err(Some(envelope.version));
     }
-    postcard::from_bytes(&envelope.body).map_err(|_| None)
+    let signed: Signed = postcard::from_bytes(&envelope.body).map_err(|_| None)?;
+    if (crate::domain::now_ms() - signed.at).abs() > BROADCAST_TTL_MS {
+        return Err(None);
+    }
+    let bytes =
+        signing_bytes(space, signed.author, signed.at, &signed.message).map_err(|_| None)?;
+    if !crate::identity::verify(signed.author, &bytes, &signed.sig) {
+        return Err(None);
+    }
+    Ok((signed.author, signed.message))
 }
 
 /// Зашифровать сообщение ключом пространства.
@@ -243,6 +323,13 @@ pub async fn read_frame<R: tokio::io::AsyncReadExt + Unpin>(r: &mut R) -> Result
 mod tests {
     use super::*;
 
+    const SPACE: SpaceId = Id([6u8; 32]);
+
+    fn me() -> crate::identity::Identity {
+        crate::identity::Identity::load_or_create(&crate::store::Store::in_memory().unwrap())
+            .unwrap()
+    }
+
     #[test]
     fn unknown_message_of_same_version_is_not_a_version_clash() {
         let key = [6u8; 32];
@@ -256,7 +343,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(matches!(unwrap(&key, &sealed), Err(None)));
+        assert!(matches!(unwrap(&key, SPACE, &sealed), Err(None)));
     }
 
     #[test]
@@ -279,6 +366,8 @@ mod tests {
         let key = [5u8; 32];
         let sealed = wrap(
             &key,
+            SPACE,
+            &me(),
             &Broadcast::Player(Some(PlayerState {
                 host: Id([7u8; 32]),
                 channel: Id([8u8; 32]),
@@ -289,7 +378,10 @@ mod tests {
         )
         .unwrap();
 
-        match unwrap(&key, &sealed).expect("своё сообщение читается") {
+        match unwrap(&key, SPACE, &sealed)
+            .expect("своё сообщение читается")
+            .1
+        {
             Broadcast::Player(Some(state)) => {
                 assert_eq!(state.source, "Яндекс Музыка");
                 assert!(state.playing);
@@ -304,6 +396,8 @@ mod tests {
         let key = [5u8; 32];
         let sealed = wrap(
             &key,
+            SPACE,
+            &me(),
             &Broadcast::PlayerCommand {
                 to: Id([1u8; 32]),
                 from: Id([2u8; 32]),
@@ -313,7 +407,10 @@ mod tests {
         )
         .unwrap();
 
-        match unwrap(&key, &sealed).expect("своё сообщение читается") {
+        match unwrap(&key, SPACE, &sealed)
+            .expect("своё сообщение читается")
+            .1
+        {
             Broadcast::PlayerCommand { to, command, .. } => {
                 assert_eq!(to, Id([1u8; 32]));
                 assert_eq!(command, PlayerCommand::Next);
@@ -370,8 +467,40 @@ mod tests {
             channel: Id([2u8; 32]),
             author: Id([3u8; 32]),
         };
-        let raw = wrap(&key, &message).unwrap();
-        assert!(matches!(unwrap(&key, &raw), Ok(Broadcast::Typing { .. })));
+        let identity = me();
+        let raw = wrap(&key, SPACE, &identity, &message).unwrap();
+        let (author, back) = unwrap(&key, SPACE, &raw).unwrap();
+        assert!(matches!(back, Broadcast::Typing { .. }));
+        assert_eq!(author, identity.id(), "отправитель подтверждён подписью");
+    }
+
+    #[test]
+    fn forged_or_replayed_elsewhere_is_rejected() {
+        let key = [5u8; 32];
+        let message = Broadcast::Typing {
+            channel: Id([2u8; 32]),
+            author: Id([3u8; 32]),
+        };
+        let raw = wrap(&key, SPACE, &me(), &message).unwrap();
+        assert_eq!(
+            unwrap(&key, Id([9u8; 32]), &raw).err(),
+            Some(None),
+            "сообщение одного пространства не годится в другом"
+        );
+
+        // Подпись чужого ключа под своим именем — не пройдёт.
+        let envelope: Envelope = open(&key, &raw).unwrap();
+        let mut signed: Signed = postcard::from_bytes(&envelope.body).unwrap();
+        signed.author = me().id();
+        let forged = seal(
+            &key,
+            &Envelope {
+                version: PROTOCOL,
+                body: postcard::to_stdvec(&signed).unwrap(),
+            },
+        )
+        .unwrap();
+        assert_eq!(unwrap(&key, SPACE, &forged).err(), Some(None));
     }
 
     #[test]
@@ -387,7 +516,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(unwrap(&key, &alien).err(), Some(Some(PROTOCOL + 7)));
+        assert_eq!(unwrap(&key, SPACE, &alien).err(), Some(Some(PROTOCOL + 7)));
     }
 
     #[test]
@@ -395,13 +524,15 @@ mod tests {
         // А вот чужой ключ — обычное дело в открытом рое, шуметь не о чем.
         let raw = wrap(
             &[1u8; 32],
+            SPACE,
+            &me(),
             &Broadcast::Typing {
                 channel: Id([2u8; 32]),
                 author: Id([3u8; 32]),
             },
         )
         .unwrap();
-        assert_eq!(unwrap(&[9u8; 32], &raw).err(), Some(None));
+        assert_eq!(unwrap(&[9u8; 32], SPACE, &raw).err(), Some(None));
     }
 
     #[test]

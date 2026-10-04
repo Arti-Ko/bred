@@ -15,13 +15,42 @@ const SPACE = id('orbita');
 const CHANNEL = id('obshiy');
 
 const MEMBERS = [
-  { id: id('marina'), nick: 'марина ковач', avatar: null, dh: id('dhm'), online: true, last_seen: 0 },
-  { id: id('timur'), nick: 'тимур лаас', avatar: null, dh: id('dht'), online: true, last_seen: 0 },
-  { id: id('anya'), nick: 'аня со', avatar: null, dh: id('dha'), online: true, last_seen: 0 },
-  { id: ME, nick: 'kaneu', avatar: null, dh: id('dhk'), online: true, last_seen: 0 },
-  { id: id('vlad'), nick: 'влад пе', avatar: null, dh: null, online: false, last_seen: Date.now() - 7_200_000 },
-  { id: id('yulia'), nick: 'юля ким', avatar: null, dh: null, online: false, last_seen: Date.now() - 86_400_000 },
+  { id: id('marina'), nick: 'марина ковач', avatar: null, dh: id('dhm'), online: true, last_seen: 0, role: 'admin' },
+  { id: id('timur'), nick: 'тимур лаас', avatar: null, dh: id('dht'), online: true, last_seen: 0, role: 'member' },
+  { id: id('anya'), nick: 'аня со', avatar: null, dh: id('dha'), online: true, last_seen: 0, role: 'member' },
+  { id: ME, nick: 'kaneu', avatar: null, dh: id('dhk'), online: true, last_seen: 0, role: 'owner' },
+  { id: id('vlad'), nick: 'влад пе', avatar: null, dh: null, online: false, last_seen: Date.now() - 7_200_000, role: 'member' },
+  { id: id('yulia'), nick: 'юля ким', avatar: null, dh: null, online: false, last_seen: Date.now() - 86_400_000, role: 'member' },
 ];
+
+const INVITES = [
+  {
+    id: id('inv1'),
+    author: ME,
+    author_nick: 'kaneu',
+    created: Date.now() - 3_600_000,
+    expires: Date.now() + 6 * 86_400_000,
+    uses: 0,
+    used: 3,
+    revoked: false,
+    live: true,
+    mine: true,
+  },
+  {
+    id: id('inv2'),
+    author: id('marina'),
+    author_nick: 'марина ковач',
+    created: Date.now() - 2 * 86_400_000,
+    expires: Date.now() + 3_600_000 * 5,
+    uses: 1,
+    used: 0,
+    revoked: false,
+    live: true,
+    mine: false,
+  },
+];
+
+let privacy = { hide_ip: false, active: false, passcode: false, key_storage: 'file' };
 
 const CHANNELS = [
   { id: CHANNEL, space: SPACE, name: 'общий-канал', category: 'общее', voice: false, unread: 0 },
@@ -174,7 +203,20 @@ const HANDLERS: Record<string, (args: Args) => unknown> = {
   collect_garbage: () => 0,
   attachment_url: () => fakeScreenshotUrl(),
   personal_link: () => 'bred://hello/nfxwc3tjnzxxg5dbmvsa…',
-  space_invite: () => 'bred://join/nfxwc3tjnzxxg5dbmvsa…',
+  space_invite: () => 'bred://invite/nfxwc3tjnzxxg5dbmvsa4ycqmrsgu3tmnzzga…',
+  space_governance: () => ({ role: 'owner', owner: ME, founded: true, direct: false, epoch: 2, can_moderate: true }),
+  list_invites: () => INVITES,
+  revoke_invite: () => null,
+  remove_member: () => null,
+  rotate_space_key: () => 4,
+  set_admin: () => null,
+  lock_state: () => new URLSearchParams(location.search).has('locked'),
+  unlock: () => null,
+  wipe_locked: () => null,
+  privacy_info: () => privacy,
+  set_hide_ip: (args) => (privacy = { ...privacy, hide_ip: Boolean(args.hide) }),
+  set_passcode: () => (privacy = { ...privacy, passcode: true }),
+  clear_passcode: () => (privacy = { ...privacy, passcode: false }),
   'plugin:app|version': () => '0.1.5',
   'plugin:event|listen': () => 1,
   'plugin:event|unlisten': () => null,

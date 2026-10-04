@@ -7,6 +7,8 @@
   import Dialog from './Dialog.svelte';
   import Icon from './Icon.svelte';
   import { api, errorText } from '../ipc';
+  import { governance } from '../stores/governance.svelte';
+  import { privacy } from '../stores/privacy.svelte';
   import { news } from '../stores/news.svelte';
   import { prefs } from '../stores/prefs.svelte';
   import { report } from '../stores/report.svelte';
@@ -24,6 +26,10 @@
   let copied = $state('');
   let error = $state('');
   let busy = $state(false);
+
+  $effect(() => {
+    void privacy.load();
+  });
 
   $effect(() => {
     void updates.init();
@@ -180,6 +186,102 @@
       </span>
       <Icon name="bell" size={14} />
     </button>
+  </section>
+
+  <section>
+    <h3>Безопасность</h3>
+    {#if privacy.info}
+      <div class="switch">
+        <span class="label">
+          <b>Скрывать мой IP</b>
+          <span>
+            собеседники видят адрес ретранслятора, а не ваш; звук идёт чуть дольше, без
+            интернета связи нет — даже в одной сети
+          </span>
+        </span>
+        <button
+          class="toggle"
+          class:on={privacy.info.hide_ip}
+          role="switch"
+          aria-checked={privacy.info.hide_ip}
+          aria-label="Скрывать мой IP"
+          onclick={() => privacy.toggleHideIp()}
+        ></button>
+      </div>
+      {#if privacy.pendingRestart}
+        <div class="notice">
+          <b>Вступит в силу после перезапуска</b>
+          <button class="btn primary small" onclick={() => updates.restart()}>Перезапустить</button>
+        </div>
+      {/if}
+
+      <div class="switch">
+        <span class="label">
+          <b>Код-пароль {privacy.info.passcode ? '· включён' : ''}</b>
+          <span>
+            {privacy.info.passcode
+              ? 'без кода база не откроется ни здесь, ни с копии диска'
+              : privacy.info.key_storage === 'system'
+                ? 'сейчас ключ базы защищает вход в Windows; с кодом — ещё и ваш код'
+                : 'сейчас ключ базы лежит рядом с ней; с кодом прочитать базу без вас нельзя'}
+          </span>
+        </span>
+        {#if privacy.info.passcode}
+          <button class="btn small" onclick={() => privacy.open('change')}>Сменить</button>
+          <button class="btn small quiet" onclick={() => privacy.open('clear')}>Убрать</button>
+        {:else}
+          <button class="btn small" onclick={() => privacy.open('set')}>Поставить</button>
+        {/if}
+      </div>
+      {#if privacy.form}
+        <form
+          class="code"
+          onsubmit={(event) => {
+            event.preventDefault();
+            void privacy.submit();
+          }}
+        >
+          {#if privacy.form !== 'set'}
+            <input class="input" type="password" bind:value={privacy.current} placeholder="нынешний код" autocomplete="current-password" />
+          {/if}
+          {#if privacy.form !== 'clear'}
+            <input class="input" type="password" bind:value={privacy.fresh} placeholder="новый код — от 6 знаков" autocomplete="new-password" />
+            <input class="input" type="password" bind:value={privacy.repeat} placeholder="ещё раз" autocomplete="new-password" />
+            <p class="hint-text">
+              Забудете код — переписку на этом устройстве не восстановить: обойти его нельзя,
+              иначе он ничего бы не защищал. Четыре цифры подбираются за час, фраза из слов — никогда.
+            </p>
+          {/if}
+          {#if privacy.error}<p class="error">{privacy.error}</p>{/if}
+          <div class="code-acts">
+            <button type="button" class="btn quiet small" onclick={() => privacy.open('')}>Отмена</button>
+            <button type="submit" class="btn primary small" disabled={privacy.busy}>
+              {privacy.form === 'clear' ? 'Убрать код' : 'Сохранить код'}
+            </button>
+          </div>
+        </form>
+      {/if}
+      {#if privacy.info.passcode}
+        <button class="row-btn" onclick={() => updates.restart()}>
+          <span class="label">
+            <b>Запереть сейчас</b>
+            <span>приложение перезапустится и спросит код</span>
+          </span>
+          <Icon name="door" size={14} />
+        </button>
+      {/if}
+
+      <div class="facts">
+        <div><span>база на диске</span><b>зашифрована (SQLCipher)</b></div>
+        <div>
+          <span>ключ базы</span>
+<b>{privacy.keyText}</b>
+        </div>
+        {#if governance.info && !governance.info.direct}
+          <div><span>ключ пространства</span><b>№ {governance.info.epoch + 1}</b></div>
+        {/if}
+      </div>
+    {/if}
   </section>
 
   <section>
@@ -348,6 +450,20 @@
   .toggle.on::after {
     transform: translateX(18px);
     background: var(--inv-fg);
+  }
+
+  .code {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+  }
+  .code-acts {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
   }
 
   .facts {

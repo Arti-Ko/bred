@@ -12,6 +12,7 @@
 pub mod blobs;
 pub mod ctx;
 pub mod dns;
+pub mod invite;
 mod lan;
 pub mod media;
 pub mod ring;
@@ -19,7 +20,7 @@ pub mod sync;
 pub mod wire;
 
 pub use blobs::import as import_blob;
-pub use ctx::{Ctx, Notice};
+pub use ctx::{Change, Ctx, Notice};
 pub use media::{Media, Track};
 
 use anyhow::Result;
@@ -37,6 +38,17 @@ use parking_lot::RwLock;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use crate::domain::{now_ms, SignedEvent, Space, SpaceId};
+
+/// Настройка «Скрывать мой IP». Читается при запуске сети.
+pub const HIDE_IP_SETTING: &str = "privacy.hide_ip";
+
+pub fn hide_ip_enabled(store: &crate::store::Store) -> bool {
+    store
+        .get_setting(HIDE_IP_SETTING)
+        .ok()
+        .flatten()
+        .is_some_and(|v| v == [1])
+}
 use wire::{Broadcast, Presence};
 
 /// Сколько ждём, пока узел вообще возьмёт трубку.
@@ -104,6 +116,16 @@ const POSTMAN_RECENT_MS: i64 = 10 * 60 * 1000;
 /// историей и повторное приглашение в рой — с соседом, который и так на связи.
 const LAN_SYNC_EVERY: Duration = Duration::from_secs(15);
 
+/// Сколько сообщений роя от одного человека пропускаем за раз и с какой
+/// скоростью запас восстанавливается.
+///
+/// Удар сердца — раз в три секунды, «печатает» — раз в пару, событие — когда
+/// человек что-то пишет. Восемь в секунду с запасом в сорок — это далеко за
+/// пределами живого человека и далеко до потопа, которым один участник мог
+/// бы завалить всех остальных.
+const FLOOD_BURST: f64 = 40.0;
+const FLOOD_RATE: f64 = 8.0;
+
 /// Как часто может срабатывать реакция на смену сети.
 ///
 /// Внешний адрес за NAT провайдера (а в России это почти всегда так) прыгает
@@ -152,6 +174,15 @@ pub struct Net {
     syncing: parking_lot::Mutex<std::collections::HashSet<(SpaceId, EndpointId)>>,
     /// Когда маячок локалки в последний раз заводил сверку с соседом.
     lan_synced: parking_lot::Mutex<HashMap<EndpointId, std::time::Instant>>,
+    /// Запас сообщений роя у каждого отправителя — защита от потопа.
+    flood: parking_lot::Mutex<HashMap<(SpaceId, crate::domain::Id), (f64, std::time::Instant)>>,
+    /// Поколение подписки на рой. После смены ключа рой другой, и циклы
+    /// прежней подписки должны замолчать, а не жить рядом с новыми.
+    generation: parking_lot::Mutex<HashMap<SpaceId, u64>>,
+    /// Скрываем ли свой IP: связь только через ретранслятор, маячок молчит.
+    hide_ip: bool,
+    /// Где мы прямо сейчас меняем ключ, известный исключённому.
+    rotating: parking_lot::Mutex<std::collections::HashSet<SpaceId>>,
     _router: Router,
 }
 
@@ -180,10 +211,12 @@ impl Net {
             Err(err) => tracing::warn!(%err, "распределённый каталог адресов недоступен"),
         }
 
-        // Режим «как будто мы в разных сетях»: прямые пути отключены, всё идёт
-        // через ретранслятор. Нужен для проверок: на одной машине прямой путь
-        // есть всегда, и поломка интернет-пути в тестах остаётся невидимой.
-        if std::env::var("BRED_RELAY_ONLY").is_ok() {
+        // Только через ретранслятор: прямые пути отключены, и собеседники видят
+        // адрес ретранслятора, а не наш. Включается в настройках («Скрывать мой
+        // IP») или переменной окружения — для проверок: на одной машине прямой
+        // путь есть всегда, и поломка интернет-пути в тестах остаётся невидимой.
+        let hide_ip = std::env::var("BRED_RELAY_ONLY").is_ok() || hide_ip_enabled(&ctx.store);
+        if hide_ip {
             tracing::info!("прямые соединения отключены, работаем только через ретранслятор");
             builder = builder.clear_ip_transports();
         }
@@ -191,6 +224,9 @@ impl Net {
         let endpoint = builder.bind().await?;
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
+        // Приёму гостей нужна сама сеть — разослать запись о входе. Сети ещё
+        // нет, поэтому ссылку на неё кладём после запуска.
+        let host: Arc<std::sync::OnceLock<std::sync::Weak<Net>>> = Arc::default();
         let media = Media::new(ctx.clone(), endpoint.clone());
         let router = Router::builder(endpoint.clone())
             .accept(GOSSIP_ALPN, gossip.clone())
@@ -200,6 +236,10 @@ impl Net {
             .accept(
                 ring::RING_ALPN,
                 ring::RingProtocol::new(ctx.clone(), media.clone()),
+            )
+            .accept(
+                invite::INVITE_ALPN,
+                invite::InviteProtocol::new(ctx.clone(), host.clone()),
             )
             .spawn();
 
@@ -221,12 +261,28 @@ impl Net {
             sync_pool: parking_lot::Mutex::new(HashMap::new()),
             syncing: parking_lot::Mutex::new(std::collections::HashSet::new()),
             lan_synced: parking_lot::Mutex::new(HashMap::new()),
+            flood: parking_lot::Mutex::new(HashMap::new()),
+            generation: parking_lot::Mutex::new(HashMap::new()),
+            hide_ip,
+            rotating: parking_lot::Mutex::new(std::collections::HashSet::new()),
             _router: router,
         });
 
+        let _ = host.set(Arc::downgrade(&net));
+        let weak = Arc::downgrade(&net);
+        net.ctx.on_change(Box::new(move |change| {
+            let Some(net) = weak.upgrade() else {
+                return;
+            };
+            tokio::spawn(async move { net.respond(change).await });
+        }));
+
         net.clone().sweep_presence();
         net.clone().watch_own_addr();
-        net.clone().serve_lan();
+        // Маячок локалки — это тоже «я здесь»: в режиме скрытого IP он молчит.
+        if !hide_ip {
+            net.clone().serve_lan();
+        }
         net.clone().keep_swarm_alive();
         net.clone().keep_history_in_sync();
 
@@ -424,6 +480,7 @@ impl Net {
         let subscription = self.gossip.subscribe(topic, entry_points.clone()).await?;
         let (sender, mut receiver) = subscription.split();
 
+        let generation = self.next_generation(space.id);
         self.senders.write().insert(space.id, sender);
 
         let me = self.clone();
@@ -431,6 +488,9 @@ impl Net {
         let key = space.key;
         tokio::spawn(async move {
             while let Some(event) = receiver.next().await {
+                if !me.is_current(space_id, generation) {
+                    break; // ключ сменился: этот рой больше не наш
+                }
                 match event {
                     Ok(GossipEvent::Received(message)) => {
                         me.on_message(space_id, &key, &message.content);
@@ -479,12 +539,110 @@ impl Net {
             self.clone().catch_up(space.id, peer);
         }
 
-        self.clone().heartbeat(space);
+        self.clone().heartbeat(space, generation);
         Ok(())
+    }
+
+    fn next_generation(&self, space: SpaceId) -> u64 {
+        let mut all = self.generation.lock();
+        let entry = all.entry(space).or_default();
+        *entry += 1;
+        *entry
+    }
+
+    fn is_current(&self, space: SpaceId, generation: u64) -> bool {
+        self.generation.lock().get(&space).copied() == Some(generation)
+    }
+
+    /// Ответ на перемены во власти.
+    async fn respond(self: Arc<Self>, change: Change) {
+        match change {
+            Change::Rekeyed(space) => {
+                if let Err(err) = self.rekey(space).await {
+                    tracing::warn!(%err, "не удалось перейти в рой нового ключа");
+                }
+                let _ = self.ctx.notices.send(Notice::Rekeyed { space });
+            }
+            Change::Compromised(space) => self.rotate_compromised(space).await,
+            Change::Removed(space) => {
+                let name = self.ctx.space(space).map(|s| s.name).unwrap_or_default();
+                self.leave(space);
+                if let Err(err) = self.ctx.store.forget_space(space) {
+                    tracing::warn!(%err, "не удалось стереть пространство после исключения");
+                }
+                let _ = self.ctx.notices.send(Notice::Removed { space, name });
+            }
+        }
+    }
+
+    /// Ключ знает исключённый — сменить его, если это всё ещё так.
+    ///
+    /// Пауза со случайной длиной: администраторов может быть несколько, и
+    /// сменить ключ одновременно попытались бы все. Первый успевший разошлёт
+    /// раздачу, остальные после паузы увидят, что менять уже нечего.
+    async fn rotate_compromised(self: &Arc<Self>, space: SpaceId) {
+        if !self.rotating.lock().insert(space) {
+            return;
+        }
+        let pause = std::time::Duration::from_millis(2_000 + rand::random::<u64>() % 6_000);
+        tokio::time::sleep(pause).await;
+        let result = async {
+            if !self.ctx.store.key_compromised(space)? {
+                return Ok(());
+            }
+            let kind = self.ctx.prepare_rotation(space)?;
+            let signed = self.ctx.commit(space, kind)?;
+            tracing::info!(space = %space.short(), "ключ знал исключённый — сменили");
+            let _ = self.publish_event(space, &signed).await;
+            self.ctx.settle(&signed.event);
+            anyhow::Ok(())
+        }
+        .await;
+        if let Err(err) = result {
+            tracing::warn!(%err, "не удалось сменить ключ, известный исключённому");
+        }
+        self.rotating.lock().remove(&space);
+    }
+
+    /// Переход в рой нового ключа: топик выводится из ключа, значит и рой
+    /// теперь другой. Старый оставляем — там остались только те, кто ключ
+    /// не получил.
+    async fn rekey(self: &Arc<Self>, space: SpaceId) -> Result<()> {
+        let Some(fresh) = self.ctx.space(space) else {
+            return Ok(());
+        };
+        self.next_generation(space);
+        self.senders.write().remove(&space);
+        self.neighbors.write().remove(&space);
+        self.join(fresh).await?;
+        // Ключи звука выводятся из ключа пространства: звонок, начатый на
+        // старом, перезаходим — иначе нас перестанут слышать.
+        if let Some((active, channel)) = self.media.active() {
+            if active == space {
+                self.media.leave();
+                self.media.join(space, channel);
+                let _ = self.announce_presence(space).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Скрываем ли сейчас свой IP.
+    pub fn hides_ip(&self) -> bool {
+        self.hide_ip
+    }
+
+    /// Постучаться по приглашению к участникам из ссылки.
+    pub async fn knock(
+        &self,
+        ticket: &crate::domain::governance::Ticket,
+    ) -> Result<invite::Admission> {
+        invite::knock(&self.endpoint, ticket).await
     }
 
     /// Выйти из пространства: перестать слушать рой и забыть ключ.
     pub fn leave(&self, space: SpaceId) {
+        self.next_generation(space);
         self.senders.write().remove(&space);
         self.ctx.spaces.write().remove(&space);
         self.ctx.presence.write().remove(&space);
@@ -562,15 +720,32 @@ impl Net {
         let Some(sender) = self.senders.read().get(&space).cloned() else {
             return Ok(());
         };
-        let sealed = wire::wrap(&key, message)?;
+        let sealed = wire::wrap(&key, space, &self.ctx.identity, message)?;
         sender.broadcast(sealed.into()).await?;
         Ok(())
     }
 
+    /// Пропустить ли ещё одно сообщение от этого отправителя.
+    fn admit(&self, space: SpaceId, author: crate::domain::Id) -> bool {
+        let now = std::time::Instant::now();
+        let mut flood = self.flood.lock();
+        if flood.len() > 4096 {
+            flood.retain(|_, (_, at)| now.duration_since(*at).as_secs() < 60);
+        }
+        let (tokens, at) = flood.entry((space, author)).or_insert((FLOOD_BURST, now));
+        *tokens = (*tokens + now.duration_since(*at).as_secs_f64() * FLOOD_RATE).min(FLOOD_BURST);
+        *at = now;
+        if *tokens < 1.0 {
+            return false;
+        }
+        *tokens -= 1.0;
+        true
+    }
+
     /// Разбор входящего сообщения роя.
     fn on_message(&self, space: SpaceId, key: &[u8; 32], raw: &[u8]) {
-        let message = match wire::unwrap(key, raw) {
-            Ok(message) => message,
+        let (sender, message) = match wire::unwrap(key, space, raw) {
+            Ok(opened) => opened,
             Err(None) => return, // чужой ключ или мусор — в открытом рое это норма
             Err(Some(their)) => {
                 // Версии разошлись. Молчать нельзя: со стороны это выглядит как
@@ -583,21 +758,54 @@ impl Net {
                 return;
             }
         };
+        if !self.admit(space, sender) {
+            tracing::debug!(sender = %sender.short(), "слишком много сообщений — лишнее отброшено");
+            return;
+        }
+        // Исключённый ещё помнит прежний ключ, пока его не сменили. Говорить
+        // в пространстве он больше не может — даже на этом коротком отрезке.
+        if self.ctx.is_removed(space, sender) {
+            return;
+        }
+        // Подпись подтвердила, кто отправил. Дальше — что сообщение не выдаёт
+        // себя за кого-то другого: присутствие, «печатает» и пульт обязаны
+        // говорить от имени того, кто их подписал.
+        let honest = match &message {
+            Broadcast::Event(_) => true, // у события своя подпись автора
+            Broadcast::Presence(presence) => presence.author == sender,
+            Broadcast::Typing { author, .. } => *author == sender,
+            Broadcast::Player(Some(state)) => state.host == sender,
+            Broadcast::Player(None) => self
+                .ctx
+                .player_of(space)
+                .is_none_or(|state| state.host == sender),
+            Broadcast::PlayerCommand { from, .. } => *from == sender,
+        };
+        if !honest {
+            tracing::warn!(sender = %sender.short(), "сообщение от чужого имени — отброшено");
+            return;
+        }
         match message {
             Broadcast::Event(signed) => {
                 if let Err(err) = self.ctx.apply(&signed) {
                     tracing::warn!(%err, "не удалось применить событие");
                 }
             }
-            Broadcast::Presence(presence) => {
+            Broadcast::Presence(mut presence) => {
                 // Запоминаем адрес — именно он позволяет дозвониться до человека,
-                // не полагаясь на внешние службы имён.
-                if !presence.addr.is_empty() {
-                    if let Ok(addr) = postcard::from_bytes::<EndpointAddr>(&presence.addr) {
-                        if addr.id != self.endpoint.id() {
-                            self.lookup.add_endpoint_info(addr);
-                        }
+                // не полагаясь на внешние службы имён. Но только его собственный:
+                // чужой адрес с ретранслятором подсказчика увёл бы наш звонок
+                // через этот ретранслятор — и показал бы ему наш IP, даже когда
+                // мы его скрываем.
+                let own = postcard::from_bytes::<EndpointAddr>(&presence.addr)
+                    .ok()
+                    .filter(|addr| addr.id.as_bytes() == &presence.author.0);
+                match own {
+                    Some(addr) if addr.id != self.endpoint.id() => {
+                        self.lookup.add_endpoint_info(addr);
                     }
+                    Some(_) => {}
+                    None => presence.addr.clear(),
                 }
                 // Запись на диск — внутри `note_presence`: там видно, изменилось
                 // ли что-нибудь с прошлого удара сердца, и большинство их до
@@ -623,9 +831,8 @@ impl Net {
                 if to != self.ctx.identity.id() {
                     return;
                 }
-                // Пульт работает только изнутри комнаты. Подписи под сообщением
-                // нет — ключ пространства общий, — поэтому единственная разумная
-                // проверка: человек и правда сидит в этом голосовом канале.
+                // Пульт работает только изнутри комнаты: подпись говорит, кто
+                // нажал, а присутствие — что он и правда сидит в этом канале.
                 let inside = self
                     .ctx
                     .presence_of(space)
@@ -787,12 +994,14 @@ impl Net {
     }
 
     /// Периодически сообщаем соседям, что мы здесь.
-    fn heartbeat(self: Arc<Self>, space: Space) {
+    fn heartbeat(self: Arc<Self>, space: Space, generation: u64) {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(PRESENCE_INTERVAL);
             loop {
                 ticker.tick().await;
-                if !self.senders.read().contains_key(&space.id) {
+                if !self.senders.read().contains_key(&space.id)
+                    || !self.is_current(space.id, generation)
+                {
                     break;
                 }
                 let presence = self.presence_for(space.id);

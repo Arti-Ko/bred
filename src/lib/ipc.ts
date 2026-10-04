@@ -92,6 +92,58 @@ export interface MemberRow {
   dh: Id | null;
   online: boolean;
   last_seen: number;
+  role: Role;
+}
+
+/** Кто в пространстве главный. Владелец доказуем, администраторов назначает он. */
+export type Role = 'owner' | 'admin' | 'member';
+
+/** Что мне можно в пространстве. */
+export interface Governance {
+  role: Role;
+  /** `null` — владелец не установлен: пространство создано до 0.8 без записи о создании. */
+  owner: Id | null;
+  /** Владелец доказуем (пространство из 0.8 и новее): только тогда можно исключать и менять ключ. */
+  founded: boolean;
+  direct: boolean;
+  /** Номер ключа: растёт с каждой сменой. */
+  epoch: number;
+  can_moderate: boolean;
+}
+
+/** Приглашение без ключа: срок, число входов, отзыв. */
+export interface InviteView {
+  id: Id;
+  author: Id;
+  author_nick: string;
+  created: number;
+  /** 0 — бессрочно. */
+  expires: number;
+  /** 0 — без ограничения. */
+  uses: number;
+  used: number;
+  revoked: boolean;
+  live: boolean;
+  mine: boolean;
+}
+
+export interface InviteOptions {
+  /** Сколько живёт, мс; 0 — бессрочно. */
+  expiresIn: number;
+  /** Сколько раз можно войти; 0 — без ограничения. */
+  uses: number;
+}
+
+/** Приватность сети и устройства. */
+export interface Privacy {
+  /** Выбрано в настройках. */
+  hide_ip: boolean;
+  /** Действует сейчас — настройка применяется при запуске. */
+  active: boolean;
+  /** Закрыта ли база код-паролем. */
+  passcode: boolean;
+  /** Где ключ базы без кода: в хранилище системы или в файле рядом. */
+  key_storage: 'system' | 'file';
 }
 
 export interface Bootstrap {
@@ -135,7 +187,13 @@ export type Notice =
   /** В канале обновлений новый пост: вышла версия, которую можно поставить. */
   | { kind: 'news'; version: string; title: string }
   /** Лента канала обновлений изменилась. */
-  | { kind: 'news-feed' };
+  | { kind: 'news-feed' }
+  /** Ключ пространства сменили, а нашей копии в раздаче нет. */
+  | { kind: 'key-lost'; space: Id }
+  /** Нас исключили — пространство с устройства стёрто. */
+  | { kind: 'removed'; space: Id; name: string }
+  /** Пространство перешло на новый ключ. */
+  | { kind: 'rekeyed'; space: Id };
 
 /** Приложение, чей звук можно включить на комнату. */
 export interface MusicSource {
@@ -157,6 +215,14 @@ export type PlayerCommand = 'toggle' | 'next' | 'previous';
 
 export const api = {
   bootstrap: () => invoke<Bootstrap>('bootstrap'),
+  lockState: () => invoke<boolean>('lock_state'),
+  unlock: (passcode: string) => invoke<void>('unlock', { passcode }),
+  wipeLocked: () => invoke<void>('wipe_locked'),
+  setPasscode: (passcode: string, current: string | null = null) =>
+    invoke<Privacy>('set_passcode', { passcode, current }),
+  clearPasscode: (current: string) => invoke<Privacy>('clear_passcode', { current }),
+  privacy: () => invoke<Privacy>('privacy_info'),
+  setHideIp: (hide: boolean) => invoke<Privacy>('set_hide_ip', { hide }),
   netStatus: () => invoke<NetStatus>('net_status'),
 
   listSpaces: () => invoke<SpaceRow[]>('list_spaces'),
@@ -175,7 +241,15 @@ export const api = {
 
   createSpace: (name: string) => invoke<Id>('create_space', { name }),
   joinSpace: (ticket: string) => invoke<Id>('join_space', { ticket }),
-  spaceInvite: (space: Id) => invoke<string>('space_invite', { space }),
+  spaceInvite: (space: Id, options: InviteOptions | null = null) =>
+    invoke<string>('space_invite', { space, options }),
+  governance: (space: Id) => invoke<Governance>('space_governance', { space }),
+  listInvites: (space: Id) => invoke<InviteView[]>('list_invites', { space }),
+  revokeInvite: (space: Id, invite: Id) => invoke<void>('revoke_invite', { space, invite }),
+  removeMember: (space: Id, member: Id) => invoke<void>('remove_member', { space, member }),
+  rotateKey: (space: Id) => invoke<number>('rotate_space_key', { space }),
+  setAdmin: (space: Id, member: Id, admin: boolean) =>
+    invoke<void>('set_admin', { space, member, admin }),
   leaveSpace: (space: Id) => invoke<void>('leave_space', { space }),
   deleteChannel: (space: Id, channel: Id) => invoke<void>('delete_channel', { space, channel }),
   openDirect: (peer: Id) => invoke<Id>('open_direct', { peer }),

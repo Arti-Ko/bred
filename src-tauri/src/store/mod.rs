@@ -4,9 +4,11 @@
 //! таблицы, которые пересчитываются при применении события. Так лента канала
 //! читается одним индексным запросом, а не сборкой из лога на каждый рендер.
 
+mod governance;
 mod model;
 mod schema;
 
+pub use governance::{InviteRow, Role, Rotation};
 pub use model::{
     AttachmentRow, ChannelRow, EmojiRow, MemberRow, MessageRow, ReactionRow, ReplyPreview, SpaceRow,
 };
@@ -37,11 +39,17 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn open(path: &Path) -> Result<Self> {
+    /// Открыть зашифрованную базу. Базу прежних версий — открытым текстом —
+    /// сначала переписываем в зашифрованную.
+    pub fn open(path: &Path, key: &[u8; 32]) -> Result<Self> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
+        if is_plaintext(path)? {
+            encrypt_in_place(path, key)?;
+        }
         let conn = Connection::open(path)?;
+        apply_key(&conn, key)?;
         Self::from_connection(conn)
     }
 
@@ -50,12 +58,13 @@ impl Store {
         Self::from_connection(Connection::open_in_memory()?)
     }
 
-    fn from_connection(conn: Connection) -> Result<Self> {
+    fn from_connection(mut conn: Connection) -> Result<Self> {
         // WAL — чтобы чтение ленты не блокировалось записью входящих событий.
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         schema::migrate(&conn)?;
+        governance::upgrade(&mut conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             me: Mutex::new(Id::ZERO),
@@ -254,7 +263,28 @@ impl Store {
             "DELETE FROM reads WHERE channel IN (SELECT id FROM channels WHERE space = ?1)",
             params![id],
         )?;
-        for table in ["messages", "channels", "peers", "events", "spaces"] {
+        for table in ["invite_revokes", "invite_entries"] {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE invite IN (SELECT id FROM invites WHERE space = ?1)"
+                ),
+                params![id],
+            )?;
+        }
+        for table in [
+            "messages",
+            "channels",
+            "emojis",
+            "peers",
+            "events",
+            "space_claims",
+            "role_grants",
+            "removals",
+            "key_rotations",
+            "past_keys",
+            "invites",
+            "spaces",
+        ] {
             tx.execute(
                 &format!(
                     "DELETE FROM {table} WHERE {} = ?1",
@@ -326,7 +356,13 @@ impl Store {
             return Ok(Applied::Duplicate);
         }
 
-        materialize(&tx, &id, &signed.event)?;
+        let reshaped = materialize(&tx, &id, &signed.event)?;
+        // Решение о правах, приехавшее позже того, на что оно влияет, меняет
+        // уже записанное: без пересборки у разных участников остались бы разные
+        // каналы и сообщения — смотря кто в каком порядке что получил.
+        if reshaped && governance::affects_stored(&tx, &signed.event)? {
+            governance::rebuild(&tx, signed.event.space)?;
+        }
         tx.commit()?;
         Ok(Applied::Fresh)
     }
@@ -576,7 +612,8 @@ impl Store {
     pub fn recent_peers(&self, space: SpaceId, since: i64) -> Result<Vec<Id>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id FROM peers WHERE space = ?1 AND last_seen >= ?2
+            "SELECT id FROM peers p WHERE space = ?1 AND last_seen >= ?2
+               AND NOT EXISTS (SELECT 1 FROM removals x WHERE x.space = p.space AND x.member = p.id)
               ORDER BY last_seen DESC LIMIT 32",
         )?;
         let rows = stmt
@@ -592,7 +629,9 @@ impl Store {
     pub fn known_peers(&self, space: SpaceId) -> Result<Vec<(Id, Option<Vec<u8>>)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, addr FROM peers WHERE space = ?1 ORDER BY last_seen DESC LIMIT 32",
+            "SELECT id, addr FROM peers p WHERE space = ?1
+               AND NOT EXISTS (SELECT 1 FROM removals x WHERE x.space = p.space AND x.member = p.id)
+             ORDER BY last_seen DESC LIMIT 32",
         )?;
         let rows = stmt
             .query_map(params![&space.0[..]], |r| {
@@ -604,10 +643,13 @@ impl Store {
     }
 
     pub fn members(&self, space: SpaceId) -> Result<Vec<MemberRow>> {
+        let roles: HashMap<Id, Role> = self.roles(space)?.into_iter().collect();
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT p.id, COALESCE(p.nick, ''), p.last_seen, p.avatar, p.dh FROM peers p
-             WHERE p.space = ?1 ORDER BY p.last_seen DESC",
+             WHERE p.space = ?1
+               AND NOT EXISTS (SELECT 1 FROM removals x WHERE x.space = p.space AND x.member = p.id)
+             ORDER BY p.last_seen DESC",
         )?;
         let rows = stmt
             .query_map(params![&space.0[..]], |r| {
@@ -622,8 +664,15 @@ impl Store {
                         .and_then(|raw| Id::from_slice(&raw)),
                     online: false,
                     last_seen: r.get(2)?,
+                    role: Role::Member,
                 })
             })?
+            .map(|row| {
+                row.map(|mut member| {
+                    member.role = roles.get(&member.id).copied().unwrap_or(Role::Member);
+                    member
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
     }
@@ -832,14 +881,16 @@ impl Store {
 }
 
 /// Обновление производных таблиц под конкретное событие.
-fn materialize(tx: &rusqlite::Transaction<'_>, id: &Id, ev: &Event) -> Result<()> {
+/// Записать последствия события в производные таблицы. `true` — изменились
+/// чьи-то права, и уже записанное, возможно, придётся пересобрать.
+fn materialize(tx: &rusqlite::Transaction<'_>, id: &Id, ev: &Event) -> Result<bool> {
+    // Исключённый мог успеть отправить что-то после исключения — пока ключ
+    // ещё не сменился. В логе это остаётся, но силы не имеет.
+    if governance::silenced(tx, ev)? {
+        return Ok(false);
+    }
     match &ev.kind {
-        EventKind::SpaceCreate { name } => {
-            tx.execute(
-                "UPDATE spaces SET name = ?2 WHERE id = ?1",
-                params![&ev.space.0[..], name],
-            )?;
-        }
+        EventKind::SpaceCreate { name } => return governance::claim(tx, ev, name, false),
         EventKind::ChannelCreate {
             name,
             category,
@@ -905,10 +956,32 @@ fn materialize(tx: &rusqlite::Transaction<'_>, id: &Id, ev: &Event) -> Result<()
             )?;
         }
         EventKind::Delete { target } => {
-            let removed = tx.execute(
-                "UPDATE messages SET deleted = 1, body = '' WHERE id = ?1 AND author = ?2",
-                params![&target.0[..], &ev.author.0[..]],
-            )?;
+            // Своё удаляет каждый, чужое — тот, кто наводит порядок. Сообщения
+            // владельца не трогает никто, кроме него самого.
+            let target_author: Option<Id> = tx
+                .query_row(
+                    "SELECT author FROM messages WHERE id = ?1",
+                    params![&target.0[..]],
+                    |r| r.get::<_, Vec<u8>>(0),
+                )
+                .optional()?
+                .map(id_from_row);
+            let allowed = match target_author {
+                None => false,
+                Some(author) if author == ev.author => true,
+                Some(author) => {
+                    governance::moderator_at(tx, ev)?
+                        && governance::role(tx, ev.space, author)? != Role::Owner
+                }
+            };
+            let removed = if allowed {
+                tx.execute(
+                    "UPDATE messages SET deleted = 1, body = '' WHERE id = ?1",
+                    params![&target.0[..]],
+                )?
+            } else {
+                0
+            };
             // Ссылки на вложения снимаем вместе с сообщением: сами байты уберёт
             // сборщик мусора, когда на них не останется ни одной ссылки.
             if removed > 0 {
@@ -923,11 +996,23 @@ fn materialize(tx: &rusqlite::Transaction<'_>, id: &Id, ev: &Event) -> Result<()
             hash,
             sticker,
         } => {
+            // Занятое имя перезаписывает только его автор или модератор.
+            if !may_touch_emoji(tx, ev, name)? {
+                return Ok(false);
+            }
             tx.execute(
-                "INSERT INTO emojis(space, name, hash, sticker) VALUES(?1, ?2, ?3, ?4)
+                "INSERT INTO emojis(space, name, hash, sticker, author, added)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(space, name) DO UPDATE SET hash = excluded.hash,
-                     sticker = excluded.sticker",
-                params![&ev.space.0[..], name, &hash.0[..], *sticker as i64],
+                     sticker = excluded.sticker, author = excluded.author, added = excluded.added",
+                params![
+                    &ev.space.0[..],
+                    name,
+                    &hash.0[..],
+                    *sticker as i64,
+                    &ev.author.0[..],
+                    ev.ts
+                ],
             )?;
             // Держим ссылку на файл, чтобы уборщик не унёс картинку эмодзи.
             tx.execute(
@@ -937,8 +1022,19 @@ fn materialize(tx: &rusqlite::Transaction<'_>, id: &Id, ev: &Event) -> Result<()
             )?;
         }
         EventKind::ChannelDelete { channel } => {
-            // Прав в пространстве нет: кто внутри, тот и может убрать канал.
-            // Событие остаётся в логе, поэтому решение видно и воспроизводимо.
+            // Канал со всей историей убирает только администратор. Событие
+            // остаётся в логе, поэтому решение видно и воспроизводимо.
+            let created: Option<i64> = tx
+                .query_row(
+                    "SELECT created_ts FROM channels WHERE id = ?1",
+                    params![&channel.0[..]],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let old_ways = governance::legacy(ev.ts) && created.is_some_and(governance::legacy);
+            if !old_ways && !governance::moderator_at(tx, ev)? {
+                return Ok(false);
+            }
             tx.execute(
                 "DELETE FROM attachments WHERE message IN
                    (SELECT id FROM messages WHERE channel = ?1)",
@@ -963,6 +1059,9 @@ fn materialize(tx: &rusqlite::Transaction<'_>, id: &Id, ev: &Event) -> Result<()
             )?;
         }
         EventKind::EmojiRemove { name } => {
+            if !may_touch_emoji(tx, ev, name)? {
+                return Ok(false);
+            }
             tx.execute(
                 "DELETE FROM emojis WHERE space = ?1 AND name = ?2",
                 params![&ev.space.0[..], name],
@@ -985,6 +1084,13 @@ fn materialize(tx: &rusqlite::Transaction<'_>, id: &Id, ev: &Event) -> Result<()
                 )?;
             }
         }
+        EventKind::Founded { .. }
+        | EventKind::RoleSet { .. }
+        | EventKind::MemberRemove { .. }
+        | EventKind::KeyRotate { .. }
+        | EventKind::InviteCreate { .. }
+        | EventKind::InviteRevoke { .. }
+        | EventKind::InviteUse { .. } => return governance::materialize(tx, id, ev),
         EventKind::Profile { nick, avatar, dh } => {
             tx.execute(
                 "INSERT INTO peers(id, space, nick, avatar, dh, last_seen)
@@ -1013,7 +1119,25 @@ fn materialize(tx: &rusqlite::Transaction<'_>, id: &Id, ev: &Event) -> Result<()
             }
         }
     }
-    Ok(())
+    Ok(false)
+}
+
+/// Может ли автор события занять или убрать эмодзи с этим именем.
+fn may_touch_emoji(tx: &rusqlite::Transaction<'_>, ev: &Event, name: &str) -> Result<bool> {
+    let holder: Option<(Option<Vec<u8>>, i64)> = tx
+        .query_row(
+            "SELECT author, added FROM emojis WHERE space = ?1 AND name = ?2",
+            params![&ev.space.0[..], name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(match holder {
+        None => true,
+        Some((Some(author), _)) if Id::from_slice(&author) == Some(ev.author) => true,
+        // До выпуска 0.8 набор эмодзи был общим — см. `governance::legacy`.
+        Some((_, added)) if governance::legacy(ev.ts) && governance::legacy(added) => true,
+        Some(_) => governance::moderator_at(tx, ev)?,
+    })
 }
 
 /// Отмечаем автора как известного участника пространства.
@@ -1044,6 +1168,111 @@ fn contiguous_prefix(conn: &Connection, space: SpaceId, author: Id) -> Result<u6
     Ok(expected - 1)
 }
 
+impl Store {
+    /// Перешифровать базу новым ключом. Сам SQLCipher делает это одной
+    /// транзакцией: база либо целиком на новом ключе, либо на старом.
+    pub fn rekey(&self, key: &[u8; 32]) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute_batch(&format!("PRAGMA rekey = \"x'{}'\";", hex(key)))?;
+        Ok(())
+    }
+}
+
+/// Ключ SQLCipher — сырые 32 байта, без собственного растягивания пароля:
+/// он и так случайный, а код-пароль уже прошёл через Argon2 в сейфе.
+fn apply_key(conn: &Connection, key: &[u8; 32]) -> Result<()> {
+    conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex(key)))?;
+    // Ключ проверяется только при первом чтении. Неверный — здесь и ошибка,
+    // а не где-то посреди миграции.
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map_err(|_| anyhow::anyhow!("базу не открыть этим ключом"))?;
+    Ok(())
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Открытая ли база: у неё в начале стоит заголовок SQLite, у зашифрованной —
+/// шум.
+fn is_plaintext(path: &Path) -> Result<bool> {
+    use std::io::Read;
+    let mut head = [0u8; 16];
+    match std::fs::File::open(path) {
+        Ok(mut file) => Ok(file.read_exact(&mut head).is_ok() && &head == b"SQLite format 3\0"),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Переписать открытую базу в зашифрованную.
+///
+/// Порядок важен: сначала полностью готовая и проверенная зашифрованная
+/// копия, потом подмена. Оборвись процесс на любом шаге — на диске остаётся
+/// либо старая база, либо новая, но не половина.
+fn encrypt_in_place(path: &Path, key: &[u8; 32]) -> Result<()> {
+    let sidecar = |suffix: &str| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(suffix);
+        std::path::PathBuf::from(name)
+    };
+    let fresh = sidecar(".encrypting");
+    let _ = std::fs::remove_file(&fresh);
+    {
+        let plain = Connection::open(path)?;
+        // Всё из журнала WAL — в основной файл, иначе свежие записи потеряются.
+        plain.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        plain.execute(
+            &format!("ATTACH DATABASE ?1 AS sealed KEY \"x'{}'\"", hex(key)),
+            params![fresh.to_string_lossy()],
+        )?;
+        plain.query_row("SELECT sqlcipher_export('sealed')", [], |_| Ok(()))?;
+        plain.execute_batch("DETACH DATABASE sealed;")?;
+    }
+    // Проверяем строго и без поблажек: после подмены открытой базы уже не
+    // будет, и усечённая копия (кончилось место, оборвался процесс) стоила бы
+    // всей истории.
+    {
+        let check = Connection::open(&fresh)?;
+        apply_key(&check, key)?;
+        let verdict: String = check.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+        if verdict != "ok" {
+            anyhow::bail!("зашифрованная копия базы повреждена: {verdict}");
+        }
+        let plain = Connection::open(path)?;
+        let tables: Vec<String> = {
+            let mut stmt = plain.prepare(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+            )?;
+            let names = stmt
+                .query_map([], |r| r.get(0))?
+                .collect::<Result<_, _>>()?;
+            names
+        };
+        for table in tables {
+            let count = format!("SELECT count(*) FROM \"{table}\"");
+            let had: i64 = plain.query_row(&count, [], |r| r.get(0))?;
+            let has: i64 = check.query_row(&count, [], |r| r.get(0))?;
+            if had != has {
+                anyhow::bail!("в зашифрованной копии таблица {table}: {has} строк вместо {had}");
+            }
+        }
+        std::fs::File::open(&fresh)?.sync_all()?;
+    }
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(sidecar(suffix));
+    }
+    std::fs::rename(&fresh, path)?;
+    #[cfg(unix)]
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    tracing::info!("база переписана в зашифрованную");
+    Ok(())
+}
+
 fn id_from_row(raw: Vec<u8>) -> Id {
     Id::from_slice(&raw).unwrap_or(Id::ZERO)
 }
@@ -1055,6 +1284,49 @@ fn key_from_row(raw: Vec<u8>) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temp_db() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "bred-db-{}-{}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("bred.sqlite")
+    }
+
+    #[test]
+    fn old_plaintext_base_is_encrypted_without_losing_anything() {
+        let path = temp_db();
+        {
+            // База прежней версии — без ключа.
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            schema::migrate(&conn).unwrap();
+            conn.execute("INSERT INTO settings(k, v) VALUES('проверка', x'2a')", [])
+                .unwrap();
+        }
+        assert!(is_plaintext(&path).unwrap());
+
+        let key = [7u8; 32];
+        let store = Store::open(&path, &key).unwrap();
+        assert_eq!(store.get_setting("проверка").unwrap(), Some(vec![0x2a]));
+        drop(store);
+
+        assert!(
+            !is_plaintext(&path).unwrap(),
+            "на диске больше нет открытого текста"
+        );
+        let raw = std::fs::read(&path).unwrap();
+        assert!(!raw
+            .windows("проверка".len())
+            .any(|w| w == "проверка".as_bytes()));
+        assert!(
+            Store::open(&path, &[8u8; 32]).is_err(),
+            "чужим ключом не открыть"
+        );
+        assert!(Store::open(&path, &key).is_ok());
+    }
 
     #[test]
     fn device_belongs_to_account_until_revoked() {

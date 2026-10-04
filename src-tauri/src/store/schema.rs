@@ -167,6 +167,7 @@ CREATE TABLE IF NOT EXISTS device_revocations (
 /// именно так и падало приложение после обновления.
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch(BASE)?;
+    conn.execute_batch(super::governance::SCHEMA)?;
 
     // Колонки, появившиеся после первых сборок. Каждая новая правка схемы —
     // ещё одна строка здесь, а не молчаливое изменение BASE.
@@ -177,6 +178,11 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // обратиться: рой gossip сам никого не набирает, а ссылка-приглашение
     // одноразовая — она живёт только до закрытия приложения.
     add_column(conn, "peers", "addr", "BLOB")?;
+    // Протокол 4: смены ключа и авторы эмодзи.
+    add_column(conn, "spaces", "epoch", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column(conn, "spaces", "key_event", "BLOB")?;
+    add_column(conn, "emojis", "author", "BLOB")?;
+    add_column(conn, "emojis", "added", "INTEGER NOT NULL DEFAULT 0")?;
 
     Ok(())
 }

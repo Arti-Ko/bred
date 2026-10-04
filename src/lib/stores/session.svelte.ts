@@ -31,6 +31,7 @@ import { forgetPrefetched, prefetchAll } from '../prefetch';
 import { chime } from '../chime';
 import { validEmojiName } from '../format';
 import { news } from './news.svelte';
+import { expiresText, governance, usesText } from './governance.svelte';
 import { report } from './report.svelte';
 import { prefs } from './prefs.svelte';
 import { updates } from './updates.svelte';
@@ -367,6 +368,7 @@ export class Session {
     await this.#loadMembers();
     await this.#loadVoice();
     await this.#loadEmojis();
+    void governance.load(space);
 
     const first = this.channels.find((c) => !c.voice);
     if (first) await this.selectChannel(first.id);
@@ -576,10 +578,44 @@ export class Session {
     try {
       const ticket = await api.spaceInvite(this.spaceId);
       await navigator.clipboard.writeText(ticket);
-      this.#note('ссылка-приглашение скопирована в буфер');
+      this.#note(
+        'ссылка-приглашение скопирована: действует 7 дней, ключа в ней нет — ' +
+          'впустит любой участник в сети; погасить — /приглашения',
+      );
     } catch (error) {
       this.#note(errorText(error));
     }
+  }
+
+  /** Строка результата в ленте — для действий из других хранилищ. */
+  say(text: string): void {
+    this.#note(text);
+  }
+
+  async reloadMembers(): Promise<void> {
+    await this.#loadMembers();
+  }
+
+  /** Пространства больше нет у нас — исключили или вышли. */
+  async dropSpace(space: Id, message: string): Promise<void> {
+    this.spaces = await api.listSpaces();
+    if (this.spaceId === space) {
+      this.spaceId = null;
+      this.channelId = null;
+      this.messages = [];
+      this.channels = [];
+      this.members = [];
+      if (this.spaces.length > 0) await this.selectSpace(this.spaces[0].id);
+      else void governance.load(null);
+    }
+    this.#note(message);
+  }
+
+  /** Участник по имени или началу ключа — для команд. */
+  #member(argument: string): MemberRow {
+    const who = this.members.find((m) => m.nick === argument || m.id.startsWith(argument));
+    if (!who) throw new Error(`не нашёл участника «${argument}»`);
+    return who;
   }
 
   notifyTyping(): void {
@@ -711,10 +747,7 @@ export class Session {
           break;
         case 'лс':
         case 'dm': {
-          const who = this.members.find(
-            (m) => m.nick === argument || m.id.startsWith(argument),
-          );
-          if (!who) throw new Error(`не нашёл участника «${argument}»`);
+          const who = this.#member(argument);
           await this.openDirect(who.id);
           this.#note(`открыта переписка с ${who.nick}`);
           break;
@@ -723,6 +756,42 @@ export class Session {
         case 'leave':
           await this.leaveSpace();
           break;
+        case 'исключить':
+        case 'kick':
+          await governance.remove(this.#member(argument));
+          break;
+        case 'админ':
+        case 'admin':
+          await governance.setAdmin(this.#member(argument), true);
+          break;
+        case 'неадмин':
+        case 'unadmin':
+          await governance.setAdmin(this.#member(argument), false);
+          break;
+        case 'ключ':
+        case 'rekey':
+          await governance.rotate();
+          break;
+        case 'приглашения':
+        case 'invites': {
+          await governance.load(this.spaceId);
+          const live = governance.invites.filter((i) => i.live);
+          if (argument) {
+            const target = live.find((i) => i.id.startsWith(argument));
+            if (!target) throw new Error(`нет действующего приглашения «${argument}»`);
+            await governance.revoke(target.id);
+            this.#note('приглашение погашено');
+            break;
+          }
+          this.#note(
+            live.length === 0
+              ? 'действующих приглашений нет'
+              : live
+                  .map((i) => `${i.id.slice(0, 6)} от ${i.author_nick}: ${expiresText(i.expires)}, ${usesText(i)}`)
+                  .join(' · ') + ' — погасить: /приглашения <код>',
+          );
+          break;
+        }
         case 'экран':
         case 'screen':
           await call.toggleScreen();
@@ -767,8 +836,9 @@ export class Session {
         case 'помощь':
         case 'help':
           this.#note(
-            'команды: /простор /канал /голос /звонок /войти /позвать [всех] /визитка ' +
-              '/лс /имя /аватар /файл /эмодзи /стикер /экран /покинуть /обновление /обновления /баг',
+            'команды: /простор /канал /голос /звонок /войти /позвать [всех] /приглашения /визитка ' +
+              '/лс /имя /аватар /файл /эмодзи /стикер /экран /покинуть /обновление /обновления /баг · ' +
+              'для администраторов: /исключить /админ /неадмин /ключ',
           );
           break;
         default:
