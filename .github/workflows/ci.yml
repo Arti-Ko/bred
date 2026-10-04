@@ -89,4 +89,4 @@ jobs:
       # сброс на диск, хранилище ключей. Перенос базы в зашифрованную на
       # Windows падал с «отказано в доступе», а тесты гонялись только на Linux.
       - name: Тесты базы и сейфа
-        run: cargo test --manifest-path src-tauri/Cargo.toml --lib -- store:: vault::
+        run: "cargo test --manifest-path src-tauri/Cargo.toml --lib -- store:: vault::"
