@@ -64,6 +64,11 @@ impl Kind {
 /// урезается так, чтобы с шапкой и хвостом сообщение туда помещалось.
 pub const MESSAGE_LIMIT: usize = 4096;
 const BODY_BUDGET: usize = 2800;
+/// Потолок подписи к вложениям — 1024 знака после разметки. С запасом: Telegram
+/// считает в единицах UTF-16, а мы меряем так же, но лучше не впритык.
+pub const CAPTION_LIMIT: usize = 1000;
+const CLIPPED_HERE: &str = "[текст урезан]";
+const CLIPPED_TO_FILE: &str = "[целиком — в файле отчёта]";
 
 /// Номер пользователя: восемь цифр из ключа аккаунта, вида `4829-1305`.
 ///
@@ -145,18 +150,92 @@ pub fn escape(text: &str) -> String {
 }
 
 /// Урезать текст по знакам, а не по байтам: кириллицу пополам не режем.
-fn clip(text: &str, limit: usize) -> String {
+fn clip(text: &str, limit: usize, note: &str) -> String {
     if text.chars().count() <= limit {
         return text.to_string();
     }
     let mut out: String = text.chars().take(limit).collect();
-    out.push_str("…\n[текст урезан]");
+    out.push('…');
+    if !note.is_empty() {
+        out.push('\n');
+        out.push_str(note);
+    }
     out
 }
 
-/// Сообщение целиком.
+/// Сколько знаков сообщения увидит Telegram: без разметки, сущности
+/// раскрыты, счёт в единицах UTF-16 — так он меряет свои пределы.
+pub fn visible_len(html: &str) -> usize {
+    let mut plain = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' if in_tag => in_tag = false,
+            _ if !in_tag => plain.push(c),
+            _ => {}
+        }
+    }
+    plain
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .encode_utf16()
+        .count()
+}
+
+/// Сообщение целиком — когда вложений нет и карточка идёт текстом.
 pub fn compose(card: &Card) -> String {
-    let body = escape(&clip(card.body.trim(), BODY_BUDGET));
+    compose_with(card, BODY_BUDGET, CLIPPED_HERE)
+}
+
+/// Карточка подписью к вложениям: всё одним сообщением.
+///
+/// Подпись втрое короче сообщения. Если текст человека в неё не влезает, он
+/// урезается, а целиком уходит файлом отчёта в том же сообщении — второй флаг.
+pub fn caption(card: &Card) -> (String, bool) {
+    let full = compose_with(card, usize::MAX, CLIPPED_TO_FILE);
+    if visible_len(&full) <= CAPTION_LIMIT {
+        return (full, false);
+    }
+    let body = card.body.trim().chars().count();
+    let mut budget = body;
+    while budget > 0 {
+        let overflow =
+            visible_len(&compose_with(card, budget, CLIPPED_TO_FILE)).saturating_sub(CAPTION_LIMIT);
+        if overflow == 0 {
+            break;
+        }
+        budget = budget.saturating_sub(overflow.max(16));
+    }
+    (compose_with(card, budget, CLIPPED_TO_FILE), true)
+}
+
+/// Файл отчёта: полный текст, если в подпись он не влез, и журнал.
+/// `None` — ни того, ни другого не нужно.
+pub fn text_file(card: &Card, clipped: bool, log: Option<&str>) -> Option<(String, String)> {
+    match (clipped, log) {
+        (false, None) => None,
+        (false, Some(log)) => Some((format!("журнал-{}.txt", card.id), log.to_string())),
+        (true, log) => {
+            let mut text = format!(
+                "Отчёт {id} · {kind} · {title}\n\n{body}\n",
+                id = card.id,
+                kind = card.kind.label,
+                title = card.title.trim(),
+                body = card.body.trim(),
+            );
+            if let Some(log) = log {
+                text.push_str("\n──────── журнал ────────\n");
+                text.push_str(log);
+            }
+            Some((format!("отчёт-{}.txt", card.id), text))
+        }
+    }
+}
+
+fn compose_with(card: &Card, budget: usize, note: &str) -> String {
+    let body = escape(&clip(card.body.trim(), budget, note));
     // Длинный текст — сворачиваемой цитатой: в ленте чата видно начало, а не
     // экран сплошного текста.
     let quote = if card.body.chars().count() > 500 {
@@ -184,7 +263,7 @@ pub fn compose(card: &Card) -> String {
          {tags}",
         icon = card.kind.icon,
         kind = escape(card.kind.label),
-        title = escape(&clip(card.title.trim(), 120)),
+        title = escape(&clip(card.title.trim(), 120, "")),
         nick = escape(card.nick),
         number = user_number(card.account),
         account = card.account,
@@ -265,6 +344,43 @@ mod tests {
             text.contains("#R_K7Q2XM"),
             "хэштеги при урезании не теряются"
         );
+    }
+
+    #[test]
+    fn short_report_fits_a_caption_whole() {
+        let (text, clipped) = caption(&card("пропадает звук через десять минут"));
+        assert!(!clipped);
+        assert!(visible_len(&text) <= CAPTION_LIMIT);
+        assert!(text.contains("пропадает звук"));
+        assert!(text.contains("#R_K7Q2XM"));
+    }
+
+    #[test]
+    fn long_report_is_clipped_in_caption_and_kept_in_file() {
+        let essay = "длинное описание ".repeat(200);
+        let card = card(&essay);
+        let (text, clipped) = caption(&card);
+        assert!(clipped);
+        assert!(
+            visible_len(&text) <= CAPTION_LIMIT,
+            "{}",
+            visible_len(&text)
+        );
+        assert!(text.contains("[целиком — в файле отчёта]"));
+        assert!(
+            text.contains("#R_K7Q2XM"),
+            "хэштеги при урезании не теряются"
+        );
+        let (name, file) = text_file(&card, clipped, Some("строка журнала")).unwrap();
+        assert_eq!(name, "отчёт-R-K7Q2XM.txt");
+        assert!(file.contains(essay.trim()));
+        assert!(file.contains("строка журнала"));
+    }
+
+    #[test]
+    fn visible_length_counts_like_telegram() {
+        assert_eq!(visible_len("<b>a&amp;b</b>"), 3);
+        assert_eq!(visible_len("🎧"), 2, "эмодзи — две единицы UTF-16");
     }
 
     #[test]

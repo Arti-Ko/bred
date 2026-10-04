@@ -1,8 +1,8 @@
 //! Отчёт о проблеме доходит до Telegram в том виде, в каком задуман.
 //!
 //! Настоящий Telegram в тесте не нужен и вреден: подставляем свой крошечный
-//! сервер на месте Bot API и смотрим, что именно к нему пришло — карточка,
-//! альбом, документы, журнал, и всё ответом на карточку.
+//! сервер на месте Bot API и смотрим, что именно к нему пришло. Отчёт — всегда
+//! одно сообщение: карточка текстом или подписью к группе вложений.
 
 use std::{
     path::PathBuf,
@@ -139,35 +139,32 @@ async fn report_arrives_as_card_with_replies() {
     let paths: Vec<&str> = seen.iter().map(|(p, _)| p.as_str()).collect();
     assert_eq!(
         paths,
-        vec![
-            "/bot123:test/sendMessage",
-            "/bot123:test/sendMediaGroup",
-            "/bot123:test/sendDocument",
-            "/bot123:test/sendDocument",
-        ],
-        "карточка, альбом фото с видео, GIF документом, журнал"
+        vec!["/bot123:test/sendMediaGroup"],
+        "одно сообщение: фото, видео, GIF и журнал одной группой файлов"
     );
 
-    let card = &seen[0].1;
+    let group = &seen[0].1;
     assert!(
-        card.contains("Хрипит &lt;звук&gt;"),
+        group.contains("Хрипит &lt;звук&gt;"),
         "текст человека экранирован"
     );
-    assert!(card.contains("&amp; дальше"));
+    assert!(group.contains("&amp; дальше"));
     assert!(
-        card.contains(&format!("#{}", id.replace('-', "_"))),
+        group.contains(&format!("#{}", id.replace('-', "_"))),
         "номер отчёта — хэштегом"
     );
-    assert!(card.contains("#баг #звук"));
-
-    for (path, body) in &seen[1..] {
+    assert!(group.contains("#баг #звук"));
+    for index in 0..4 {
         assert!(
-            body.contains(r#""message_id":77"#),
-            "{path}: вложения — ответом на карточку"
+            group.contains(&format!("attach://file{index}")),
+            "вложение {index}"
         );
     }
-    assert!(seen[1].1.contains("attach://file0") && seen[1].1.contains("attach://file1"));
-    assert!(seen[3].1.contains("строка журнала"), "журнал приложен");
+    assert!(group.contains("строка журнала"), "журнал — в той же группе");
+    assert!(
+        !group.contains("reply_parameters"),
+        "отвечать не на что: сообщение одно"
+    );
 
     // Второй отчёт сразу следом — отказ с объяснением, а не тишина.
     let again = reporter
@@ -185,6 +182,30 @@ async fn report_arrives_as_card_with_replies() {
         .await;
     assert!(again.unwrap_err().to_string().contains("подождите"));
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn photo_alone_comes_as_one_captioned_photo() {
+    let (api, seen) = fake_telegram().await;
+    let dir = std::env::temp_dir().join(format!("bred-report-photo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let bot = report::telegram::Bot::new(&api, "123:test", "-1001").unwrap();
+    bot.send_bundle(
+        vec![report::telegram::Media {
+            kind: report::telegram::MediaKind::Photo,
+            name: "снимок.png".into(),
+            mime: "image/png".into(),
+            bytes: vec![7u8; 64],
+        }],
+        "карточка",
+    )
+    .await
+    .unwrap();
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "одно сообщение");
+    assert!(seen[0].0.ends_with("/sendPhoto"));
+    assert!(seen[0].1.contains("карточка"), "карточка — подписью к фото");
     std::fs::remove_dir_all(&dir).ok();
 }
 

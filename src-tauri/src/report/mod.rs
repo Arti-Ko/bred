@@ -29,8 +29,9 @@ mod secrets {
 
 /// Не чаще одного отчёта за столько: кнопку жмут дважды, а чат — не мусорка.
 const COOLDOWN: Duration = Duration::from_secs(30);
-/// Вложений в одном отчёте.
-pub const MAX_FILES: usize = 10;
+/// Вложений в одном отчёте. Десятым в группу ляжет файл журнала, а больше
+/// десяти Telegram в одно сообщение не кладёт.
+pub const MAX_FILES: usize = 9;
 /// Потолок Bot API на загрузку файла — пятьдесят мегабайт.
 const MAX_FILE: u64 = 50 * 1024 * 1024;
 /// Фото больше десяти мегабайт Telegram как фото не принимает — уйдёт документом.
@@ -273,42 +274,43 @@ async fn send_to(
     };
 
     let bot = Bot::new(&target.api, &target.token, &target.chat)?;
-    let message = bot.send_message(&format::compose(&card)).await?;
 
     // Файлы читаются только сейчас: человек мог выбрать видео на полсотни
     // мегабайт, и держать его в памяти с момента выбора незачем.
-    if !draft.files.is_empty() {
-        let mut media = Vec::with_capacity(draft.files.len());
-        for path in &draft.files {
-            let info = inspect(path);
-            let bytes = tokio::fs::read(path)
-                .await
-                .map_err(|err| anyhow!("«{}» не читается: {err}", info.name))?;
+    let mut media = Vec::with_capacity(draft.files.len() + 1);
+    for path in &draft.files {
+        let info = inspect(path);
+        let bytes = tokio::fs::read(path)
+            .await
+            .map_err(|err| anyhow!("«{}» не читается: {err}", info.name))?;
+        media.push(Media {
+            kind: match info.kind {
+                "photo" => MediaKind::Photo,
+                "video" => MediaKind::Video,
+                _ => MediaKind::Document,
+            },
+            name: info.name,
+            mime: mime_of(path).to_string(),
+            bytes,
+        });
+    }
+    let log = context.log.as_deref().filter(|_| with_log);
+
+    // Одно сообщение на отчёт: без вложений — карточка текстом, с ними —
+    // карточка подписью к группе, а журнал и длинный текст — файлом в ней же.
+    if media.is_empty() && log.is_none() {
+        bot.send_message(&format::compose(&card)).await?;
+    } else {
+        let (caption, clipped) = format::caption(&card);
+        if let Some((name, text)) = format::text_file(&card, clipped, log) {
             media.push(Media {
-                kind: match info.kind {
-                    "photo" => MediaKind::Photo,
-                    "video" => MediaKind::Video,
-                    _ => MediaKind::Document,
-                },
-                name: info.name,
-                mime: mime_of(path).to_string(),
-                bytes,
+                kind: MediaKind::Document,
+                name,
+                mime: "text/plain".to_string(),
+                bytes: text.into_bytes(),
             });
         }
-        bot.send_media(&media, &format!("📎 <code>{id}</code>"), message)
-            .await?;
-    }
-
-    if with_log {
-        if let Some(log) = &context.log {
-            bot.send_text_file(
-                &format!("журнал-{id}.txt"),
-                log,
-                &format!("🧾 журнал · <code>{id}</code>"),
-                message,
-            )
-            .await?;
-        }
+        bot.send_bundle(media, &caption).await?;
     }
 
     tracing::info!(report = %id, "отчёт о проблеме отправлен");

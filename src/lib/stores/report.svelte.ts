@@ -11,7 +11,8 @@ import { api, errorText, type ReportFile, type ReportInfo } from '../ipc';
 /** Расширения, которые предлагаем в выборе файла. */
 const MEDIA = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'heic', 'mp4', 'mov', 'm4v', 'webm'];
 /** Столько вложений принимает ядро. */
-const MAX_FILES = 10;
+/** Девять файлов и журнал — десять вложений, больше в одно сообщение Telegram не кладёт. */
+const MAX_FILES = 9;
 
 class Report {
   open = $state(false);
