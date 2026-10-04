@@ -1,9 +1,8 @@
 //! Отправка в Telegram через Bot API — напрямую, без своего сервера.
 //!
-//! Отчёт — одно сообщение. Без вложений это карточка текстом. С вложениями —
-//! одна группа, а карточка — её подпись: фото и видео альбомом, если ничего
-//! другого нет, иначе всё файлами (Telegram не кладёт фото и документы в одну
-//! группу). Журнал и полный текст длинного описания — файлом в той же группе.
+//! Карточка отчёта уходит первым сообщением, вложения — ответом на неё:
+//! фото и видео альбомами, всё прочее документами, журнал — файлом. В чате
+//! это одна ветка, и по хэштегу из карточки находится всё сразу.
 
 use anyhow::{anyhow, Result};
 use reqwest::multipart::{Form, Part};
@@ -42,14 +41,6 @@ impl MediaKind {
     }
 }
 
-/// Где в группе подпись: у альбома фото Telegram показывает подпись первого,
-/// у группы файлов — каждую под своим файлом.
-#[derive(Clone, Copy)]
-enum Caption {
-    First,
-    Last,
-}
-
 pub struct Media {
     pub kind: MediaKind,
     pub name: String,
@@ -74,7 +65,7 @@ impl Bot {
         })
     }
 
-    /// Карточка отчёта текстом — когда вложений нет.
+    /// Карточка отчёта. Возвращает номер сообщения — вложения уходят ответом на него.
     pub async fn send_message(&self, html: &str) -> Result<i64> {
         let reply = self
             .call("sendMessage", || {
@@ -90,56 +81,72 @@ impl Bot {
             .ok_or_else(|| anyhow!("Telegram не вернул номер сообщения"))
     }
 
-    /// Всё одним сообщением: вложения группой, карточка — подписью.
-    ///
-    /// Фото и видео без прочего — альбомом с картинками в ленте. Если среди
-    /// вложений есть файлы или журнал, — всё файлами: Telegram не смешивает в
-    /// одной группе фото с документами, а две группы — уже два сообщения.
-    /// Картинки-файлы он показывает миниатюрами, так что видно и их.
-    pub async fn send_bundle(&self, media: Vec<Media>, caption: &str) -> Result<()> {
-        if media.len() > ALBUM {
-            return Err(anyhow!(
-                "в одно сообщение Telegram помещается не больше {ALBUM} вложений"
-            ));
-        }
-        if media.iter().all(|item| item.kind != MediaKind::Document) {
-            let refs: Vec<&Media> = media.iter().collect();
-            match self.send_group(&refs, caption, Caption::First).await {
-                Ok(()) => return Ok(()),
-                // Telegram не смог обработать фото или видео — необычный
-                // размер, редкий кодек, повреждённый файл. Не повод терять
-                // отчёт: те же файлы уходят документами, как есть.
-                Err(err) => tracing::debug!(%err, "вложения не приняты как фото, шлём файлами"),
+    /// Вложения ответом на карточку: фото и видео — альбомами, остальное —
+    /// альбомами документов. В одном альбоме Telegram не смешивает документы
+    /// с фото, поэтому их два вида.
+    pub async fn send_media(&self, media: &[Media], caption: &str, reply_to: i64) -> Result<()> {
+        let (visual, documents): (Vec<&Media>, Vec<&Media>) = media
+            .iter()
+            .partition(|item| item.kind != MediaKind::Document);
+        let mut first = true;
+        for group in visual.chunks(ALBUM).chain(documents.chunks(ALBUM)) {
+            // Подпись — только у первого вложения: в альбоме она одна на всех.
+            let caption = if first { caption } else { "" };
+            first = false;
+            let sent = self.send_group(group, caption, reply_to).await;
+            if sent.is_ok() || group.iter().all(|item| item.kind == MediaKind::Document) {
+                sent?;
+                continue;
             }
+            // Telegram не смог обработать фото или видео — необычный размер,
+            // редкий кодек, повреждённый файл. Не повод терять вложение и весь
+            // отчёт: те же файлы уходят документами, как есть.
+            tracing::debug!(error = %sent.unwrap_err(), "вложение не принято как фото, шлём файлом");
+            let as_files: Vec<Media> = group
+                .iter()
+                .map(|item| Media {
+                    kind: MediaKind::Document,
+                    name: item.name.clone(),
+                    mime: item.mime.clone(),
+                    bytes: item.bytes.clone(),
+                })
+                .collect();
+            let refs: Vec<&Media> = as_files.iter().collect();
+            self.send_group(&refs, caption, reply_to).await?;
         }
-        let files: Vec<Media> = media
-            .into_iter()
-            .map(|item| Media {
-                kind: MediaKind::Document,
-                ..item
-            })
-            .collect();
-        let refs: Vec<&Media> = files.iter().collect();
-        // У группы файлов подпись видна под каждым, у кого она есть, — ставим
-        // её последнему, и карточка оказывается внизу, как текст сообщения.
-        self.send_group(&refs, caption, Caption::Last).await
+        Ok(())
     }
 
-    async fn send_group(&self, group: &[&Media], caption: &str, at: Caption) -> Result<()> {
+    async fn send_group(&self, group: &[&Media], caption: &str, reply_to: i64) -> Result<()> {
         if group.len() == 1 {
-            self.send_single(group[0], caption).await
+            self.send_single(group[0], caption, reply_to).await
         } else {
-            let index = match at {
-                Caption::First => 0,
-                Caption::Last => group.len() - 1,
-            };
-            self.send_album(group, caption, index).await
+            self.send_album(group, caption, reply_to).await
         }
     }
 
-    async fn send_single(&self, item: &Media, caption: &str) -> Result<()> {
+    /// Журнал — текстовым файлом ответом на карточку.
+    pub async fn send_text_file(
+        &self,
+        name: &str,
+        text: &str,
+        caption: &str,
+        reply_to: i64,
+    ) -> Result<()> {
+        let file = Media {
+            kind: MediaKind::Document,
+            name: name.to_string(),
+            mime: "text/plain".to_string(),
+            bytes: text.as_bytes().to_vec(),
+        };
+        self.send_single(&file, caption, reply_to).await
+    }
+
+    async fn send_single(&self, item: &Media, caption: &str, reply_to: i64) -> Result<()> {
         self.call(item.kind.method(), || {
-            let mut form = self.base_form().part(item.kind.field(), file_part(item));
+            let mut form = self
+                .reply_form(reply_to)
+                .part(item.kind.field(), file_part(item));
             if !caption.is_empty() {
                 form = form
                     .text("caption", caption.to_string())
@@ -154,7 +161,7 @@ impl Bot {
         .map(|_| ())
     }
 
-    async fn send_album(&self, group: &[&Media], caption: &str, at: usize) -> Result<()> {
+    async fn send_album(&self, group: &[&Media], caption: &str, reply_to: i64) -> Result<()> {
         let described: Vec<serde_json::Value> = group
             .iter()
             .enumerate()
@@ -163,7 +170,7 @@ impl Bot {
                     "type": item.kind.field(),
                     "media": format!("attach://file{index}"),
                 });
-                if index == at && !caption.is_empty() {
+                if index == 0 && !caption.is_empty() {
                     entry["caption"] = caption.into();
                     entry["parse_mode"] = "HTML".into();
                 }
@@ -171,7 +178,7 @@ impl Bot {
             })
             .collect();
         self.call("sendMediaGroup", || {
-            let mut form = self.base_form().text(
+            let mut form = self.reply_form(reply_to).text(
                 "media",
                 serde_json::Value::Array(described.clone()).to_string(),
             );
@@ -184,8 +191,11 @@ impl Bot {
         .map(|_| ())
     }
 
-    fn base_form(&self) -> Form {
-        Form::new().text("chat_id", self.chat.clone())
+    fn reply_form(&self, reply_to: i64) -> Form {
+        Form::new().text("chat_id", self.chat.clone()).text(
+            "reply_parameters",
+            format!(r#"{{"message_id":{reply_to},"allow_sending_without_reply":true}}"#),
+        )
     }
 
     /// Вызов метода Bot API. Форма собирается заново на каждую попытку: тело
