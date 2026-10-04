@@ -1259,7 +1259,12 @@ fn encrypt_in_place(path: &Path, key: &[u8; 32]) -> Result<()> {
                 anyhow::bail!("в зашифрованной копии таблица {table}: {has} строк вместо {had}");
             }
         }
-        std::fs::File::open(&fresh)?.sync_all()?;
+        // На диск — с правом записи: Windows отказывает в сбросе файла,
+        // открытого только для чтения («отказано в доступе», os error 5).
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fresh)?
+            .sync_all()?;
     }
     for suffix in ["-wal", "-shm"] {
         let _ = std::fs::remove_file(sidecar(suffix));

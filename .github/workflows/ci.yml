@@ -84,3 +84,9 @@ jobs:
       - run: mkdir dist
 
       - run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      # База и сейф ведут себя по-разному на разных системах: права файлов,
+      # сброс на диск, хранилище ключей. Перенос базы в зашифрованную на
+      # Windows падал с «отказано в доступе», а тесты гонялись только на Linux.
+      - name: Тесты базы и сейфа
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib -- store:: vault::
