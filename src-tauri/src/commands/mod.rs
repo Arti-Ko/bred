@@ -740,7 +740,10 @@ mod paste_tests {
 
     #[test]
     fn pasted_name_keeps_only_a_harmless_file_name() {
-        assert_eq!(pasted_name("%D1%81%D0%BD%D0%B8%D0%BC%D0%BE%D0%BA.png"), "снимок.png");
+        assert_eq!(
+            pasted_name("%D1%81%D0%BD%D0%B8%D0%BC%D0%BE%D0%BA.png"),
+            "снимок.png"
+        );
         assert_eq!(pasted_name("..%2F..%2Fetc%2Fpasswd"), "passwd");
         assert_eq!(pasted_name("C:%5CUsers%5Cx%5Cdoc.txt"), "doc.txt");
         assert_eq!(pasted_name(".hidden"), "hidden");

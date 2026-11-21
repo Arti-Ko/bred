@@ -1214,8 +1214,20 @@ impl Media {
                 let (congested, relayed) = self.path_pressure();
 
                 for (track, ceiling, relay_ceiling, floor, start) in [
-                    (Track::Video, CEILING_VIDEO, RELAY_CEILING_VIDEO, FLOOR_VIDEO, CEILING_VIDEO),
-                    (Track::Screen, CEILING_SCREEN, RELAY_CEILING_SCREEN, FLOOR_SCREEN, START_SCREEN),
+                    (
+                        Track::Video,
+                        CEILING_VIDEO,
+                        RELAY_CEILING_VIDEO,
+                        FLOOR_VIDEO,
+                        CEILING_VIDEO,
+                    ),
+                    (
+                        Track::Screen,
+                        CEILING_SCREEN,
+                        RELAY_CEILING_SCREEN,
+                        FLOOR_SCREEN,
+                        START_SCREEN,
+                    ),
                 ] {
                     let dropped: u64 = self
                         .peers
@@ -1705,7 +1717,10 @@ mod tests {
 
     #[test]
     fn pressure_cuts_bitrate_at_once_and_calm_raises_it_slowly() {
-        let mut state = Governor { current: 2_000_000, calm: 0 };
+        let mut state = Governor {
+            current: 2_000_000,
+            calm: 0,
+        };
         let down = next_bitrate(&mut state, true, 8_000_000, FLOOR_SCREEN);
         assert_eq!(down, 1_400_000, "под давлением — сразу на треть вниз");
 
@@ -1721,10 +1736,19 @@ mod tests {
 
     #[test]
     fn bitrate_never_leaves_its_corridor() {
-        let mut state = Governor { current: FLOOR_SCREEN, calm: 0 };
-        assert_eq!(next_bitrate(&mut state, true, 8_000_000, FLOOR_SCREEN), FLOOR_SCREEN);
+        let mut state = Governor {
+            current: FLOOR_SCREEN,
+            calm: 0,
+        };
+        assert_eq!(
+            next_bitrate(&mut state, true, 8_000_000, FLOOR_SCREEN),
+            FLOOR_SCREEN
+        );
 
-        let mut state = Governor { current: 8_000_000, calm: 0 };
+        let mut state = Governor {
+            current: 8_000_000,
+            calm: 0,
+        };
         assert_eq!(
             next_bitrate(&mut state, false, RELAY_CEILING_SCREEN, FLOOR_SCREEN),
             RELAY_CEILING_SCREEN,
@@ -1739,7 +1763,10 @@ mod tests {
         ping.extend_from_slice(&me.0);
         assert!(keyframe_wanted_from(&ping, me));
         assert!(!keyframe_wanted_from(&ping, author(2)), "просьба к другому");
-        assert!(!keyframe_wanted_from(&[], me), "обычный пинг ничего не просит");
+        assert!(
+            !keyframe_wanted_from(&[], me),
+            "обычный пинг ничего не просит"
+        );
         assert!(!keyframe_wanted_from(&ping[..10], me), "обрезанная просьба");
     }
 

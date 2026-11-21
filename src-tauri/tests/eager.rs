@@ -38,13 +38,19 @@ async fn until(what: &str, limit: Duration, mut ready: impl FnMut() -> bool) {
 async fn files_arrive_without_being_asked_for() {
     let dir_a = workspace("a");
     let dir_b = workspace("b");
-    let (alice, _na) = App::start(&dir_a.join("bred.sqlite")).await.expect("узел А");
-    let (boris, _nb) = App::start(&dir_b.join("bred.sqlite")).await.expect("узел Б");
+    let (alice, _na) = App::start(&dir_a.join("bred.sqlite"))
+        .await
+        .expect("узел А");
+    let (boris, _nb) = App::start(&dir_b.join("bred.sqlite"))
+        .await
+        .expect("узел Б");
 
     let space = alice.create_space("Проверка").await.expect("пространство");
-    until("адрес узла появится", Duration::from_secs(20), || {
-        !alice.net.addr_now().is_empty()
-    })
+    until(
+        "адрес узла появится",
+        Duration::from_secs(20),
+        || !alice.net.addr_now().is_empty(),
+    )
     .await;
     let invite = alice.invite(space).await.expect("приглашение");
     boris.join_space(&invite).await.expect("вход по ссылке");
@@ -53,7 +59,11 @@ async fn files_arrive_without_being_asked_for() {
     // Скриншот с ретины — несколько мегабайт: ровно то, что раньше приходило
     // плашкой. И два маленьких следом — по тому же соединению.
     let mut sent = Vec::new();
-    for (name, size) in [("снимок.png", 6_000_000usize), ("a.png", 40_000), ("b.png", 50_000)] {
+    for (name, size) in [
+        ("снимок.png", 6_000_000usize),
+        ("a.png", 40_000),
+        ("b.png", 50_000),
+    ] {
         let source = dir_a.join(name);
         let payload: Vec<u8> = (0..size).map(|i| (i * 7 % 251) as u8).collect();
         std::fs::write(&source, &payload).expect("исходный файл");
@@ -66,21 +76,29 @@ async fn files_arrive_without_being_asked_for() {
     }
 
     // Никаких `download`: только ждём, пока файлы окажутся у Бориса.
-    until("файлы приедут сами", Duration::from_secs(60), || {
-        sent.iter().all(|(hash, _)| {
-            boris
-                .store
-                .blob_path(*hash)
-                .ok()
-                .flatten()
-                .is_some_and(|p| p.exists())
-        })
-    })
+    until(
+        "файлы приедут сами",
+        Duration::from_secs(60),
+        || {
+            sent.iter().all(|(hash, _)| {
+                boris
+                    .store
+                    .blob_path(*hash)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|p| p.exists())
+            })
+        },
+    )
     .await;
 
     for (hash, payload) in &sent {
         let path = boris.store.blob_path(*hash).unwrap().unwrap();
-        assert_eq!(&std::fs::read(path).unwrap(), payload, "байты обязаны совпасть");
+        assert_eq!(
+            &std::fs::read(path).unwrap(),
+            payload,
+            "байты обязаны совпасть"
+        );
     }
 
     std::fs::remove_dir_all(&dir_a).ok();

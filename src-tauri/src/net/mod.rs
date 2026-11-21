@@ -952,7 +952,9 @@ impl Net {
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone();
         let _guard = lock.lock().await;
-        let result = self.fetch_blob_locked(space, hash, holders, live_only).await;
+        let result = self
+            .fetch_blob_locked(space, hash, holders, live_only)
+            .await;
         drop(_guard);
         // Замок больше никому не нужен — иначе таблица росла бы на каждый файл.
         let mut locks = self.blob_locks.lock();
@@ -990,7 +992,11 @@ impl Net {
         let (live, rest): (Vec<_>, Vec<_>) = self
             .candidates(space, holders)
             .into_iter()
-            .filter_map(|id| iroh::PublicKey::from_bytes(&id.0).ok().map(|peer| (id, peer)))
+            .filter_map(|id| {
+                iroh::PublicKey::from_bytes(&id.0)
+                    .ok()
+                    .map(|peer| (id, peer))
+            })
             .filter(|(_, peer)| *peer != me)
             .partition(|(id, _)| online.contains(id));
         let mut waves: Vec<Vec<EndpointId>> = live
@@ -998,18 +1004,29 @@ impl Net {
             .map(|w| w.iter().map(|(_, p)| *p).collect())
             .collect();
         if !live_only {
-            waves.extend(rest.chunks(BLOB_WAVE).map(|w| w.iter().map(|(_, p)| *p).collect()));
+            waves.extend(
+                rest.chunks(BLOB_WAVE)
+                    .map(|w| w.iter().map(|(_, p)| *p).collect()),
+            );
         }
         if waves.is_empty() {
-            return Err(anyhow::anyhow!("некого спросить: никого с этим файлом нет в сети"));
+            return Err(anyhow::anyhow!(
+                "некого спросить: никого с этим файлом нет в сети"
+            ));
         }
 
         let mut last: Option<anyhow::Error> = None;
         let mut resumed = 0;
         let mut wave_index = 0;
         while wave_index < waves.len() {
-            let offset = tokio::fs::metadata(&partial).await.map(|m| m.len()).unwrap_or(0);
-            let Some(offer) = self.race(&waves[wave_index], space, hash, key, offset, &mut last).await else {
+            let offset = tokio::fs::metadata(&partial)
+                .await
+                .map(|m| m.len())
+                .unwrap_or(0);
+            let Some(offer) = self
+                .race(&waves[wave_index], space, hash, key, offset, &mut last)
+                .await
+            else {
                 wave_index += 1;
                 continue;
             };
@@ -1098,7 +1115,8 @@ impl Net {
                         match net.fetch_blob(space, hash, size, &holders, true).await {
                             Ok(_) => {
                                 net.blob_retry.lock().remove(&hash);
-                                let _ = net.ctx.notices.send(Notice::Applied { space, event: hash });
+                                let _ =
+                                    net.ctx.notices.send(Notice::Applied { space, event: hash });
                             }
                             Err(err) => {
                                 tracing::debug!(hash = %hash.short(), %err, "файл пока не достать");
@@ -1115,7 +1133,9 @@ impl Net {
     /// Пора ли снова пробовать этот файл. Заодно отмечает его занятым.
     fn blob_due(&self, hash: crate::domain::Id) -> bool {
         let mut retry = self.blob_retry.lock();
-        let entry = retry.entry(hash).or_insert((0, std::time::Instant::now(), false));
+        let entry = retry
+            .entry(hash)
+            .or_insert((0, std::time::Instant::now(), false));
         if entry.2 || entry.1 > std::time::Instant::now() {
             return false;
         }
@@ -1126,7 +1146,9 @@ impl Net {
     /// Не вышло — следующая попытка позже, и чем дольше не выходит, тем реже.
     fn blob_failed(&self, hash: crate::domain::Id) {
         let mut retry = self.blob_retry.lock();
-        let entry = retry.entry(hash).or_insert((0, std::time::Instant::now(), false));
+        let entry = retry
+            .entry(hash)
+            .or_insert((0, std::time::Instant::now(), false));
         let pause = BLOB_BACKOFF[(entry.0 as usize).min(BLOB_BACKOFF.len() - 1)];
         *entry = (entry.0 + 1, std::time::Instant::now() + pause, false);
     }

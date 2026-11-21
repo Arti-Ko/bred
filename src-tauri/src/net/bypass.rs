@@ -99,9 +99,19 @@ fn physical() -> Vec<Interface> {
 /// Туннели, которые система честно туннелями не называет.
 fn looks_like_tunnel(name: &str) -> bool {
     let name = name.to_ascii_lowercase();
-    ["utun", "tun", "tap", "wg", "ipsec", "ppp", "wintun", "zerotier", "tailscale"]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
+    [
+        "utun",
+        "tun",
+        "tap",
+        "wg",
+        "ipsec",
+        "ppp",
+        "wintun",
+        "zerotier",
+        "tailscale",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
 }
 
 /// Есть ли интернет через этот интерфейс: хоть одно проверочное соединение.
@@ -112,9 +122,12 @@ async fn online_via(index: NonZeroU32) -> bool {
             continue;
         };
         probes.spawn(async move {
-            tokio::time::timeout(PROBE_TIMEOUT, bred_netbind::connect_tcp_via(addr, Some(index)))
-                .await
-                .is_ok_and(|r| r.is_ok())
+            tokio::time::timeout(
+                PROBE_TIMEOUT,
+                bred_netbind::connect_tcp_via(addr, Some(index)),
+            )
+            .await
+            .is_ok_and(|r| r.is_ok())
         });
     }
     while let Some(done) = probes.join_next().await {

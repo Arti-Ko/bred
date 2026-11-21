@@ -770,7 +770,12 @@ impl Store {
     /// По этому списку ядро тянет файлы само, не дожидаясь, пока их покажут.
     /// Раньше файл просил только интерфейс, и только когда ленту открыли: если
     /// автор к тому времени ушёл, взять файл было уже не у кого.
-    pub fn missing_blobs(&self, max_size: u64, since_ms: i64, limit: usize) -> Result<Vec<(SpaceId, Id, u64)>> {
+    pub fn missing_blobs(
+        &self,
+        max_size: u64,
+        since_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<(SpaceId, Id, u64)>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "SELECT e.space, a.hash, MAX(a.size), MAX(e.ts) AS fresh

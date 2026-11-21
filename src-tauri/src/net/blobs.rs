@@ -288,7 +288,14 @@ where
 }
 
 /// Принять файл по ответу держателя.
-pub async fn receive(ctx: &Ctx, offer: Offer, hash: Id, target: &Path, partial: &Path, offset: u64) -> Result<PathBuf> {
+pub async fn receive(
+    ctx: &Ctx,
+    offer: Offer,
+    hash: Id,
+    target: &Path,
+    partial: &Path,
+    offset: u64,
+) -> Result<PathBuf> {
     let Offer { total, recv, _send } = offer;
     let path = receive_into(ctx, recv, total, hash, target, partial, offset).await;
     drop(_send);
