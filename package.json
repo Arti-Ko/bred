@@ -9,6 +9,7 @@
     "preview": "vite preview",
     "check": "svelte-check --tsconfig ./tsconfig.json",
     "tauri": "tauri",
+    "clean:rust": "cargo clean --manifest-path src-tauri/Cargo.toml --profile dev",
     "test:games": "tsc tools/games-selftest.ts --outDir node_modules/.cache/games --module commonjs --target es2022 --moduleResolution node --skipLibCheck --strict && node node_modules/.cache/games/tools/games-selftest.js",
     "test:format": "tsc tools/format-selftest.ts --outDir node_modules/.cache/format --module commonjs --target es2022 --moduleResolution node --skipLibCheck --strict && node node_modules/.cache/format/tools/format-selftest.js"
   },

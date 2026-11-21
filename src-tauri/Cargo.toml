@@ -98,6 +98,14 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_WindowsAndMessaging",
 ] }
 
+[profile.dev]
+# Полная отладочная информация раздувала target/debug до десятков гигабайт:
+# её копию получает каждый тестовый бинарь. Номеров строк в паниках хватает.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 # Скорость, а не размер. На горячем пути — шифрование каждого пакета звонка,
 # blake3 по вложениям и postcard по событиям; `opt-level = "s"` экономил
