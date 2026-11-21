@@ -22,6 +22,8 @@ bytes = "1.12.1"
 chacha20poly1305 = "0.10.1"
 data-encoding = "2.11.0"
 iroh = "1"
+bred-netbind = { path = "vendor/bred-netbind" }
+netdev = "0.45"
 iroh-gossip = { version = "0.101", default-features = false, features = ["net"] }
 iroh-mainline-address-lookup = "0.5.0"
 n0-future = "0.3"
@@ -97,6 +99,13 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[patch.crates-io]
+# Наши копии с одной правкой в каждой: сокеты идут мимо VPN (vendor/bred-netbind).
+# При обновлении iroh — скопировать свежие версии и перенести правки (ищи
+# «bred_netbind» в vendor/netwatch/src/udp.rs и vendor/iroh-relay/src/client/tls.rs).
+netwatch = { path = "vendor/netwatch" }
+iroh-relay = { path = "vendor/iroh-relay" }
 
 [profile.dev]
 # Полная отладочная информация раздувала target/debug до десятков гигабайт:

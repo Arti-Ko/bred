@@ -1,0 +1,10 @@
+[package]
+name = "bred-netbind"
+version = "0.1.0"
+edition = "2021"
+description = "Привязка сокетов БРЕДа к физическому интерфейсу — мимо VPN"
+publish = false
+
+[dependencies]
+socket2 = { version = "0.6", features = ["all"] }
+tokio = { version = "1", features = ["net"] }

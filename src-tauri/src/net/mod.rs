@@ -10,6 +10,7 @@
 //! протоколом (см. [`sync`]).
 
 pub mod blobs;
+pub mod bypass;
 pub mod ctx;
 pub mod dns;
 pub mod invite;
@@ -212,6 +213,11 @@ pub struct Net {
 impl Net {
     /// Поднимает узел: endpoint, gossip, приём досинхронизации, локальный маячок.
     pub async fn spawn(ctx: Arc<Ctx>) -> Result<Arc<Self>> {
+        // Мимо VPN — до того, как iroh создаст первый сокет: привязка
+        // применяется к каждому новому сокету, старые она не трогает.
+        if let Some(interface) = bypass::engage().await {
+            bypass::track(interface);
+        }
         let lookup = MemoryLookup::new();
         let mut builder = Endpoint::builder(presets::N0)
             .secret_key(ctx.identity.secret().clone())

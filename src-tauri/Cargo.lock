@@ -464,6 +464,7 @@ dependencies = [
  "argon2",
  "blake3",
  "block2",
+ "bred-netbind",
  "bytes",
  "chacha20poly1305",
  "data-encoding",
@@ -473,6 +474,7 @@ dependencies = [
  "iroh-mainline-address-lookup",
  "keyring",
  "n0-future",
+ "netdev",
  "objc2",
  "objc2-app-kit",
  "objc2-core-audio-types",
@@ -504,6 +506,14 @@ dependencies = [
  "windows 0.62.2",
  "windows-core 0.62.2",
  "x25519-dalek",
+]
+
+[[package]]
+name = "bred-netbind"
+version = "0.1.0"
+dependencies = [
+ "socket2",
+ "tokio",
 ]
 
 [[package]]
@@ -2792,10 +2802,9 @@ dependencies = [
 [[package]]
 name = "iroh-relay"
 version = "1.0.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "24bd586cf927f7b700f56ec3639b53cb5fa901ce284784051ff71092bfbf8193"
 dependencies = [
  "blake3",
+ "bred-netbind",
  "bytes",
  "cfg_aliases",
  "data-encoding",
@@ -3472,10 +3481,9 @@ dependencies = [
 [[package]]
 name = "netwatch"
 version = "0.19.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4d9cbe01741347ef750d743d6690603f5eed8341e679fb51c8e629337aa11976"
 dependencies = [
  "atomic-waker",
+ "bred-netbind",
  "bytes",
  "cfg_aliases",
  "derive_more",
