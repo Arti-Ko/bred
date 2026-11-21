@@ -423,6 +423,7 @@ pub fn run() {
             commands::send_pcm,
             commands::set_voice_volume,
             commands::request_keyframe,
+            commands::attach_bytes,
             commands::set_music_volume,
         ])
         .run(tauri::generate_context!())

@@ -43,6 +43,19 @@ const REFRESH_WINDOW = 60;
 /** Должно совпадать с `app::PAGE` в ядре. */
 const PAGE = 200;
 
+/**
+ * Имя вставленного файла.
+ *
+ * Снимок экрана из буфера приходит безликим `image.png` — каждое такое
+ * вложение называлось бы одинаково. Даём ему имя по времени.
+ */
+function pastedName(file: File): string {
+  if (file.name && !/^image\.(png|jpe?g|gif|webp|tiff?)$/i.test(file.name)) return file.name;
+  const ext = file.type.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+  const stamp = new Date().toISOString().slice(0, 19).replace('T', ' ').replace(/:/g, '-');
+  return `снимок ${stamp}.${ext}`;
+}
+
 export class Session {
   me = $state<Id>('');
   nick = $state('');
@@ -462,17 +475,54 @@ export class Session {
     try {
       const picked = await openFileDialog({ multiple: true, title: 'Что отправить' });
       if (!picked) return;
-      const paths = Array.isArray(picked) ? picked : [picked];
-
-      const prepared: Attachment[] = [];
-      for (const path of paths) {
-        prepared.push(await api.attachFile(path));
-      }
-      this.pending = [...this.pending, ...prepared];
-      this.#note(`прикреплено: ${prepared.map((a) => a.name).join(', ')}`);
+      await this.attachPaths(Array.isArray(picked) ? picked : [picked]);
     } catch (error) {
       this.status = errorText(error);
     }
+  }
+
+  /** Прикрепить файлы по путям — из окна выбора или перетащенные в окно. */
+  async attachPaths(paths: string[]): Promise<void> {
+    await this.#attachEach(paths, (path) => api.attachFile(path));
+  }
+
+  /**
+   * Прикрепить вставленное из буфера обмена.
+   *
+   * Пути у вставки нет — только содержимое: снимок экрана или скопированный
+   * в Finder и Проводнике файл. Его ядро и примет байтами.
+   */
+  async attachFiles(files: File[]): Promise<void> {
+    await this.#attachEach(files, async (file) =>
+      api.attachBytes(pastedName(file), new Uint8Array(await file.arrayBuffer())),
+    );
+  }
+
+  async #attachEach<T>(items: T[], prepare: (item: T) => Promise<Attachment>): Promise<void> {
+    if (items.length === 0) return;
+    if (!this.spaceId) {
+      this.status = 'сначала выберите пространство';
+      return;
+    }
+    // По одному и с запоминанием удачных: один битый файл в пачке не должен
+    // отменять остальные.
+    const prepared: Attachment[] = [];
+    let failure = '';
+    for (const item of items) {
+      try {
+        prepared.push(await prepare(item));
+      } catch (error) {
+        failure = errorText(error);
+      }
+    }
+    if (prepared.length > 0) {
+      // Тот же файл дважды — это одно вложение: адресация по содержимому.
+      const known = new Set(this.pending.map((a) => a.hash));
+      const fresh = prepared.filter((a) => !known.has(a.hash) && known.add(a.hash));
+      this.pending = [...this.pending, ...fresh];
+      this.#note(`прикреплено: ${prepared.map((a) => a.name).join(', ')}`);
+    }
+    if (failure) this.status = `не удалось прикрепить: ${failure}`;
   }
 
   dropAttachment(hash: Id): void {

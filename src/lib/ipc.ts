@@ -274,6 +274,8 @@ export const api = {
   ) => invoke<Id>('send_message', { space, channel, body, replyTo, thread, attachments }),
 
   attachFile: (path: string) => invoke<Attachment>('attach_file', { path }),
+  attachBytes: (name: string, bytes: Uint8Array) =>
+    invoke<Attachment>('attach_bytes', bytes, { headers: { 'x-bred-name': encodeURIComponent(name) } }),
   setAvatar: (path: string) => invoke<Attachment>('set_avatar', { path }),
   downloadAttachment: (space: Id, hash: Id) =>
     invoke<string>('download_attachment', { space, hash }),

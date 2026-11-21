@@ -340,6 +340,82 @@ pub async fn attach_file(app: State<'_, Arc<App>>, path: String) -> Answer<Attac
     app.attach(std::path::Path::new(&path)).await.map_err(fail)
 }
 
+/// Прикрепить то, что вставили из буфера обмена: снимок экрана или файл.
+///
+/// Вебвью отдаёт вставленное содержимым, без пути на диске, а вложение ядро
+/// принимает файлом. Поэтому байты кладутся во временную папку под своим
+/// именем — по нему же определяется тип, — а после импорта папка стирается:
+/// сам файл к этому времени уже скопирован в хранилище вложений.
+#[tauri::command]
+pub async fn attach_bytes(
+    app: State<'_, Arc<App>>,
+    request: tauri::ipc::Request<'_>,
+) -> Answer<Attachment> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("ожидались сырые байты файла".to_string());
+    };
+    if bytes.len() as u64 > crate::net::blobs::MAX_BLOB {
+        return Err("файл слишком большой".to_string());
+    }
+    let name = request
+        .headers()
+        .get("x-bred-name")
+        .and_then(|value| value.to_str().ok())
+        .map(pasted_name)
+        .unwrap_or_else(|| "вставка".to_string());
+
+    let dir = std::env::temp_dir().join(format!("bred-paste-{:016x}", rand::random::<u64>()));
+    let result = async {
+        tokio::fs::create_dir_all(&dir).await?;
+        let path = dir.join(&name);
+        tokio::fs::write(&path, bytes).await?;
+        app.attach(&path).await
+    }
+    .await;
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    result.map_err(fail)
+}
+
+/// Имя вставленного файла: только последняя часть, без путей и служебных
+/// символов. Имя приходит из вебвью — значит, доверять ему как пути нельзя.
+fn pasted_name(raw: &str) -> String {
+    let decoded = percent_decode(raw);
+    let last = decoded
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .take(120)
+        .collect::<String>();
+    let trimmed = last.trim().trim_start_matches('.');
+    if trimmed.is_empty() {
+        "вставка".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Разбор `%XX` — имя едет в заголовке, а там допустим только ASCII.
+fn percent_decode(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+            if let Some(byte) = hex.and_then(|hex| u8::from_str_radix(hex, 16).ok()) {
+                out.push(byte);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// Скачать вложение у того, у кого оно есть. Возвращает путь к файлу.
 /// Поставить картинку профиля: годится и PNG, и анимированный GIF.
 #[tauri::command]
@@ -656,4 +732,20 @@ pub fn mark_read(app: State<'_, Arc<App>>, channel: Id) -> Answer<()> {
 #[tauri::command]
 pub async fn typing(app: State<'_, Arc<App>>, space: SpaceId, channel: Id) -> Answer<()> {
     app.typing(space, channel).await.map_err(fail)
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::pasted_name;
+
+    #[test]
+    fn pasted_name_keeps_only_a_harmless_file_name() {
+        assert_eq!(pasted_name("%D1%81%D0%BD%D0%B8%D0%BC%D0%BE%D0%BA.png"), "снимок.png");
+        assert_eq!(pasted_name("..%2F..%2Fetc%2Fpasswd"), "passwd");
+        assert_eq!(pasted_name("C:%5CUsers%5Cx%5Cdoc.txt"), "doc.txt");
+        assert_eq!(pasted_name(".hidden"), "hidden");
+        assert_eq!(pasted_name(""), "вставка");
+        assert_eq!(pasted_name("%2E%2E"), "вставка");
+        assert_eq!(pasted_name("%ZZbad%"), "%ZZbad%");
+    }
 }

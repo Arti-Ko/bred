@@ -17,6 +17,7 @@
   import { prefs } from './lib/stores/prefs.svelte';
   import { session } from './lib/stores/session.svelte';
   import LockScreen from './lib/components/LockScreen.svelte';
+  import FileDrop from './lib/components/FileDrop.svelte';
   import { api } from './lib/ipc';
   import type { Component } from 'svelte';
 
@@ -195,6 +196,8 @@
 {#if locked}
   <LockScreen onunlock={start} />
 {:else if locked === false}
+
+<FileDrop />
 
 <!-- Зов в комнату, отчёт о проблеме и новость о выпуске — поверх всего и в
      любом оформлении -->
