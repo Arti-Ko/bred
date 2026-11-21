@@ -961,7 +961,7 @@ impl App {
 
         let path = self
             .net
-            .fetch_blob(space, hash, meta.size, &holders)
+            .fetch_blob(space, hash, meta.size, &holders, false)
             .await?;
         let _ = self
             .ctx

@@ -58,13 +58,6 @@ use wire::{Broadcast, Presence};
 /// минуту, а человек всё это время смотрит на пустое место вместо картинки.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
 
-/// Сколько ждём сам файл после того, как соединение установлено.
-///
-/// Раньше на всё про всё было пятнадцать секунд, и крупный файл через
-/// ретранслятор просто не успевал приехать: обрыв выглядел как «не работает
-/// отправка файлов», хотя байты шли и шли.
-const FETCH_TIMEOUT: Duration = Duration::from_secs(180);
-
 /// Сколько готовы ждать ретранслятора, чтобы позвать соседей ещё раз.
 ///
 /// Это не пауза перед подпиской — подписка идёт сразу. Ожидание нужно только
@@ -148,6 +141,30 @@ const PRESENCE_INTERVAL: Duration = Duration::from_secs(3);
 /// целый период после того, как протух.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Файлы не больше этого ядро тянет само, сразу как узнало о них. Крупнее —
+/// по нажатию: полгигабайта, которые никто не открывал, качать незачем.
+const EAGER_BLOB: u64 = 64 * 1024 * 1024;
+/// За какой срок сообщения подтягиваем их файлы сами. Старше — по нажатию.
+const EAGER_WINDOW_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+/// Сколько файлов тянем в фоне одновременно.
+const BLOB_PARALLEL: usize = 3;
+/// Сколько держателей спрашиваем разом.
+const BLOB_WAVE: usize = 4;
+/// Сколько раз продолжаем оборвавшуюся загрузку, прежде чем сдаться до
+/// следующего раза.
+const BLOB_RESUMES: u32 = 6;
+/// Как часто фоновая подкачка просыпается без повода — на случай, если
+/// держатель вернулся в сеть, а новых событий нет.
+const BLOB_SWEEP: Duration = Duration::from_secs(15);
+/// Паузы между попытками достать один файл. Держателя чаще всего просто нет
+/// в сети: стучаться к нему каждые пятнадцать секунд часами бессмысленно.
+const BLOB_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+];
+
 pub struct Net {
     endpoint: Endpoint,
     gossip: Gossip,
@@ -166,6 +183,12 @@ pub struct Net {
     /// рукопожатиями — и она приходилась на тот же endpoint, по которому идёт
     /// звонок.
     sync_pool: parking_lot::Mutex<HashMap<EndpointId, iroh::endpoint::Connection>>,
+    /// Соединения для файлов, по одному на держателя.
+    blob_client: Arc<blobs::BlobClient>,
+    /// Замок на каждый качающийся файл.
+    blob_locks: parking_lot::Mutex<HashMap<crate::domain::Id, Arc<tokio::sync::Mutex<()>>>>,
+    /// Фоновая подкачка: сколько раз не вышло, когда снова и идёт ли сейчас.
+    blob_retry: parking_lot::Mutex<HashMap<crate::domain::Id, (u32, std::time::Instant, bool)>>,
     /// С кем сверка идёт прямо сейчас.
     ///
     /// Она заводится из трёх мест сразу: по появлению соседа, по часам и по
@@ -259,6 +282,9 @@ impl Net {
             neighbors: RwLock::new(HashMap::new()),
             addr_bytes,
             sync_pool: parking_lot::Mutex::new(HashMap::new()),
+            blob_client: Arc::new(blobs::BlobClient::default()),
+            blob_locks: parking_lot::Mutex::new(HashMap::new()),
+            blob_retry: parking_lot::Mutex::new(HashMap::new()),
             syncing: parking_lot::Mutex::new(std::collections::HashSet::new()),
             lan_synced: parking_lot::Mutex::new(HashMap::new()),
             flood: parking_lot::Mutex::new(HashMap::new()),
@@ -285,6 +311,7 @@ impl Net {
         }
         net.clone().keep_swarm_alive();
         net.clone().keep_history_in_sync();
+        net.clone().keep_blobs_fetched();
 
         // Подписываемся на рой сразу, не дожидаясь ретранслятора.
         //
@@ -889,50 +916,213 @@ impl Net {
         ordered
     }
 
-    /// Скачать вложение. Перебираем тех, у кого он может быть, пока кто-то не
-    /// отдаст: автор может быть офлайн, но файл уже есть у любого, кто его получил.
+    /// Скачать вложение. Возвращает путь к готовому файлу.
+    ///
+    /// Держателей спрашиваем волнами, а не по одному: в волне все наперегонки,
+    /// и качаем у того, кто первым ответил «есть». Раньше живой держатель стоял
+    /// в очереди за мёртвыми, и каждый мёртвый стоил шести секунд. Сначала те,
+    /// кто сейчас на связи, — у них ответ придёт за секунды.
+    ///
+    /// Оборванная загрузка продолжается с того же места, уже у победителя
+    /// следующей волны: байты одни и те же, хеш один.
+    ///
+    /// `live_only` — не звать тех, кого нет в сети. Так ходит фоновая подкачка:
+    /// она повторяет попытки часто, и стучаться каждый раз ко всем ушедшим
+    /// значило бы забивать сеть дозвонами в пустоту.
     pub async fn fetch_blob(
         &self,
         space: SpaceId,
         hash: crate::domain::Id,
-        size: u64,
+        _size: u64,
         holders: &[crate::domain::Id],
+        live_only: bool,
     ) -> Result<std::path::PathBuf> {
+        // Один файл — одна загрузка. Интерфейс и фоновая подкачка просят его
+        // одновременно, и вдвоём они писали бы в один и тот же `.part`.
+        let lock = self
+            .blob_locks
+            .lock()
+            .entry(hash)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().await;
+        let result = self.fetch_blob_locked(space, hash, holders, live_only).await;
+        drop(_guard);
+        // Замок больше никому не нужен — иначе таблица росла бы на каждый файл.
+        let mut locks = self.blob_locks.lock();
+        if locks.get(&hash).is_some_and(|l| Arc::strong_count(l) <= 2) {
+            locks.remove(&hash);
+        }
+        result
+    }
+
+    async fn fetch_blob_locked(
+        &self,
+        space: SpaceId,
+        hash: crate::domain::Id,
+        holders: &[crate::domain::Id],
+        live_only: bool,
+    ) -> Result<std::path::PathBuf> {
+        if let Some(path) = self.ctx.store.blob_path(hash)?.filter(|p| p.exists()) {
+            return Ok(path); // пока ждали замка, файл докачал кто-то другой
+        }
+        let key = self
+            .ctx
+            .space(space)
+            .ok_or_else(|| anyhow::anyhow!("неизвестное пространство"))?
+            .key;
+        let target = self.ctx.blob_path(hash);
+        let partial = target.with_extension("part");
+        let me = self.endpoint.id();
+
+        let online: std::collections::HashSet<_> = self
+            .ctx
+            .presence_of(space)
+            .into_iter()
+            .map(|p| p.author)
+            .collect();
+        let (live, rest): (Vec<_>, Vec<_>) = self
+            .candidates(space, holders)
+            .into_iter()
+            .filter_map(|id| iroh::PublicKey::from_bytes(&id.0).ok().map(|peer| (id, peer)))
+            .filter(|(_, peer)| *peer != me)
+            .partition(|(id, _)| online.contains(id));
+        let mut waves: Vec<Vec<EndpointId>> = live
+            .chunks(BLOB_WAVE)
+            .map(|w| w.iter().map(|(_, p)| *p).collect())
+            .collect();
+        if !live_only {
+            waves.extend(rest.chunks(BLOB_WAVE).map(|w| w.iter().map(|(_, p)| *p).collect()));
+        }
+        if waves.is_empty() {
+            return Err(anyhow::anyhow!("некого спросить: никого с этим файлом нет в сети"));
+        }
+
         let mut last: Option<anyhow::Error> = None;
-        for holder in self.candidates(space, holders) {
-            let holder = &holder;
-            let Ok(peer) = iroh::PublicKey::from_bytes(&holder.0) else {
+        let mut resumed = 0;
+        let mut wave_index = 0;
+        while wave_index < waves.len() {
+            let offset = tokio::fs::metadata(&partial).await.map(|m| m.len()).unwrap_or(0);
+            let Some(offer) = self.race(&waves[wave_index], space, hash, key, offset, &mut last).await else {
+                wave_index += 1;
                 continue;
             };
-            // Два разных срока. Дозвон короткий: узла может не быть в сети, и
-            // висеть на нём минутами нельзя — очередь запросов к ядру забивается,
-            // и интерфейс сообщает «connection lost». А вот сама передача
-            // длинная: большой файл через ретранслятор едет долго, и обрывать
-            // его на пятнадцатой секунде — это и есть «файлы не отправляются».
-            let attempt = tokio::time::timeout(
-                CONNECT_TIMEOUT + FETCH_TIMEOUT,
-                blobs::fetch(
-                    self.ctx.clone(),
-                    &self.endpoint,
-                    EndpointAddr::from(peer),
-                    space,
-                    hash,
-                    size,
-                ),
-            )
-            .await
-            .unwrap_or_else(|_| Err(anyhow::anyhow!("собеседник не ответил вовремя")));
-
-            match attempt {
+            match blobs::receive(&self.ctx, offer, hash, &target, &partial, offset).await {
                 Ok(path) => return Ok(path),
                 Err(err) => {
-                    tracing::debug!(holder = %holder.short(), %err, "не отдал файл, пробуем следующего");
+                    tracing::debug!(hash = %hash.short(), %err, "загрузка оборвалась, продолжим");
                     last = Some(err);
+                    // Оборвалось посреди — та же волна ещё раз, с нового места:
+                    // держатель, скорее всего, жив, а байты уже на диске.
+                    resumed += 1;
+                    if resumed > BLOB_RESUMES {
+                        break;
+                    }
                 }
             }
         }
-        Err(last
-            .unwrap_or_else(|| anyhow::anyhow!("некого спросить: нет ни одного держателя файла")))
+        Err(last.unwrap_or_else(|| anyhow::anyhow!("ни у кого из спрошенных файла нет")))
+    }
+
+    /// Спросить волну держателей разом; первый ответивший «есть» — победитель.
+    /// Остальные запросы гасятся вместе с задачами: отменённый поток держатель
+    /// видит сразу и перестаёт слать.
+    async fn race(
+        &self,
+        wave: &[EndpointId],
+        space: SpaceId,
+        hash: crate::domain::Id,
+        key: [u8; 32],
+        offset: u64,
+        last: &mut Option<anyhow::Error>,
+    ) -> Option<blobs::Offer> {
+        let mut asks = tokio::task::JoinSet::new();
+        for peer in wave {
+            let client = self.blob_client.clone();
+            let endpoint = self.endpoint.clone();
+            let peer = *peer;
+            asks.spawn(async move { client.ask(&endpoint, peer, space, hash, &key, offset).await });
+        }
+        while let Some(joined) = asks.join_next().await {
+            match joined {
+                Ok(Ok(offer)) => {
+                    asks.abort_all();
+                    return Some(offer);
+                }
+                Ok(Err(err)) => *last = Some(err),
+                Err(_) => {}
+            }
+        }
+        None
+    }
+
+    /// Тянуть файлы самим, не дожидаясь, пока их покажут.
+    ///
+    /// Раньше файл просил только интерфейс — и только когда человек открывал
+    /// ленту. Автор к тому времени часто уже уходил, и картинка не приходила
+    /// никогда. Теперь всё, что не больше [`EAGER_BLOB`], расходится по всем,
+    /// пока автор на связи, и дальше его отдаёт любой, у кого файл есть.
+    fn keep_blobs_fetched(self: Arc<Self>) {
+        tokio::spawn(async move {
+            let slots = Arc::new(tokio::sync::Semaphore::new(BLOB_PARALLEL));
+            loop {
+                tokio::select! {
+                    _ = self.ctx.blobs_wanted.notified() => {}
+                    _ = tokio::time::sleep(BLOB_SWEEP) => {}
+                }
+                // Новые события приходят пачкой — даём пачке долететь.
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+                let since = crate::domain::now_ms() - EAGER_WINDOW_MS;
+                let missing = self
+                    .ctx
+                    .store
+                    .missing_blobs(EAGER_BLOB, since, 64)
+                    .unwrap_or_default();
+                for (space, hash, size) in missing {
+                    if !self.blob_due(hash) {
+                        continue;
+                    }
+                    let Ok(permit) = slots.clone().acquire_owned().await else {
+                        return;
+                    };
+                    let net = self.clone();
+                    tokio::spawn(async move {
+                        let holders = net.ctx.store.attachment_holders(hash).unwrap_or_default();
+                        match net.fetch_blob(space, hash, size, &holders, true).await {
+                            Ok(_) => {
+                                net.blob_retry.lock().remove(&hash);
+                                let _ = net.ctx.notices.send(Notice::Applied { space, event: hash });
+                            }
+                            Err(err) => {
+                                tracing::debug!(hash = %hash.short(), %err, "файл пока не достать");
+                                net.blob_failed(hash);
+                            }
+                        }
+                        drop(permit);
+                    });
+                }
+            }
+        });
+    }
+
+    /// Пора ли снова пробовать этот файл. Заодно отмечает его занятым.
+    fn blob_due(&self, hash: crate::domain::Id) -> bool {
+        let mut retry = self.blob_retry.lock();
+        let entry = retry.entry(hash).or_insert((0, std::time::Instant::now(), false));
+        if entry.2 || entry.1 > std::time::Instant::now() {
+            return false;
+        }
+        entry.2 = true;
+        true
+    }
+
+    /// Не вышло — следующая попытка позже, и чем дольше не выходит, тем реже.
+    fn blob_failed(&self, hash: crate::domain::Id) {
+        let mut retry = self.blob_retry.lock();
+        let entry = retry.entry(hash).or_insert((0, std::time::Instant::now(), false));
+        let pause = BLOB_BACKOFF[(entry.0 as usize).min(BLOB_BACKOFF.len() - 1)];
+        *entry = (entry.0 + 1, std::time::Instant::now() + pause, false);
     }
 
     /// Догнать историю у соседа, переиспользуя уже поднятое соединение.

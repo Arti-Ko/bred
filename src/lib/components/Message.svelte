@@ -3,7 +3,7 @@
   import { chunks, loneSticker, timecode, tokenize } from '../format';
   import { session } from '../stores/session.svelte';
   import { governance } from '../stores/governance.svelte';
-  import { isViewable, previewUrl } from '../previews';
+  import { AUTO_FETCH_LIMIT, isViewable, previewUrl } from '../previews';
   import EmojiPicker from './EmojiPicker.svelte';
 
   interface Props {
@@ -74,9 +74,13 @@
   $effect(() => {
     for (const file of message.attachments) {
       // Не ждём флага «уже на диске»: previewUrl сам заберёт файл у того,
-      // у кого он есть. Раньше получатель не видел картинку вовсе.
-      if (isViewable(file) && !asked.has(file.hash)) {
-        asked.add(file.hash);
+      // у кого он есть. Но и одной неудачей не ограничиваемся: спрашиваем
+      // заново, когда файл оказался на диске. Раньше после трёх неудачных
+      // попыток картинка навсегда оставалась плашкой «скачать» — даже когда
+      // файл потом доехал. Это и было «скриншот приходит файлом».
+      const ask = `${file.hash}:${file.local}`;
+      if (isViewable(file) && !asked.has(ask)) {
+        asked.add(ask);
         void previewUrl(file.hash, session.spaceId).then((url) => {
           if (url) previews = { ...previews, [file.hash]: url };
         });
@@ -148,6 +152,12 @@
           >
         </figcaption>
       </figure>
+    {:else if isViewable(file) && !file.local && file.size <= AUTO_FETCH_LIMIT}
+      <div class="file loading">
+        <span class="glyph">▢</span>
+        <span class="name">{file.name}</span>
+        <span class="meta">картинка загружается… · {size(file.size)}</span>
+      </div>
     {:else}
     <div class="file" class:ready={file.local}>
       <span class="glyph">{file.local ? '▣' : '▢'}</span>
@@ -482,6 +492,10 @@
     background: var(--bg-raised);
     color: var(--fg-dim);
     font-size: var(--text-sm);
+  }
+  /* Картинка ещё едет: плашка тише обычной и без кнопок — нажимать нечего, ядро тянет само */
+  .file.loading {
+    opacity: 0.7;
   }
   .file:hover {
     border-color: var(--fg-dim);

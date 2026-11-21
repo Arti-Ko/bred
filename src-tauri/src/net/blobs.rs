@@ -10,14 +10,17 @@
 
 use anyhow::{anyhow, Context, Result};
 use iroh::{
-    endpoint::Connection,
+    endpoint::{Connection, RecvStream, SendStream},
     protocol::{AcceptError, ProtocolHandler},
-    Endpoint, EndpointAddr,
+    Endpoint, EndpointAddr, EndpointId,
 };
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -78,19 +81,26 @@ impl ProtocolHandler for BlobProtocol {
     }
 }
 
+/// Раздача по одному соединению — сколько угодно файлов, каждый своим потоком.
+///
+/// Раньше соединение обслуживало один файл, и на каждую картинку получатель
+/// заново искал адрес, пробивал NAT и проходил рукопожатие — через
+/// ретранслятор это секунды на файл. Цикл заканчивается, когда получатель сам
+/// закрывает соединение, поэтому байты, которые он ещё не дочитал, не
+/// обрываются: это ровно то, ради чего раньше здесь ждали `closed()`.
+///
+/// Старые версии открывают один поток и закрывают соединение — для них ничего
+/// не изменилось.
 async fn serve(ctx: Arc<Ctx>, connection: Connection) -> Result<()> {
     let peer = Id(*connection.remote_id().as_bytes());
-    let (send, recv) = connection.accept_bi().await?;
-    serve_stream(&ctx, send, recv, Some(peer)).await?;
-
-    // Ждём, пока получатель закроет соединение сам.
-    //
-    // Если вернуть управление сразу, соединение закроется здесь — вместе с
-    // байтами, которые собеседник ещё не успел дочитать. У него это выглядит
-    // как «connection lost», хотя файл был отдан целиком. Синхронизация
-    // сообщений живёт в цикле и потому уцелела, а раздача файлов — разовая,
-    // и обрывалась тем чаще, чем крупнее файл.
-    connection.closed().await;
+    while let Ok((send, recv)) = connection.accept_bi().await {
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            if let Err(err) = serve_stream(&ctx, send, recv, Some(peer)).await {
+                tracing::debug!(%err, "раздача файла прервана");
+            }
+        });
+    }
     Ok(())
 }
 
@@ -151,49 +161,138 @@ where
 
 /// Сколько ждём, пока узел возьмёт трубку. Мёртвый адрес должен отваливаться
 /// быстро: за ним в очереди стоят живые.
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(6);
+/// Сколько ждём ответа «есть / нет» на уже поднятом соединении.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Обрыв — это не «долго», а «ни байта за это время».
+///
+/// Раньше на весь файл было три минуты. Через ретранслятор за них проходит
+/// сотня-другая мегабайт, и большой файл рвался на середине при совершенно
+/// живой связи — каждая следующая попытка упиралась в тот же срок.
+pub const STALL_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Скачать вложение у конкретного пира. Возвращает путь к готовому файлу.
-pub async fn fetch(
-    ctx: Arc<Ctx>,
-    endpoint: &Endpoint,
-    peer: EndpointAddr,
-    space: SpaceId,
-    hash: Id,
-    expected_size: u64,
-) -> Result<PathBuf> {
-    if expected_size > MAX_BLOB {
-        return Err(anyhow!("файл больше допустимых {MAX_BLOB} байт"));
+/// У этого узла файла нет — спрашивать его снова незачем, в отличие от
+/// узла, который просто не ответил.
+#[derive(Debug)]
+pub struct NotHere;
+
+impl std::fmt::Display for NotHere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("у пира нет этого файла")
     }
-    let key = ctx
-        .space(space)
-        .ok_or_else(|| anyhow!("неизвестное пространство"))?
-        .key;
+}
 
-    let target = ctx.blob_path(hash);
-    let partial = target.with_extension("part");
-    // Докачиваем: то, что уже успели получить в прошлый раз, не выбрасываем.
-    let offset = tokio::fs::metadata(&partial)
-        .await
-        .map(|m| m.len())
-        .unwrap_or(0);
+impl std::error::Error for NotHere {}
 
-    let connection = tokio::time::timeout(CONNECT_TIMEOUT, endpoint.connect(peer, BLOB_ALPN))
+/// Ответ держателя: файл есть, байты пойдут по этому потоку.
+pub struct Offer {
+    pub total: u64,
+    /// Держим, пока принимаем: закрытие нашей стороны держатель понял бы как
+    /// отказ.
+    _send: SendStream,
+    recv: RecvStream,
+}
+
+/// Соединения для файлов — по одному на держателя, переиспользуются.
+#[derive(Default)]
+pub struct BlobClient {
+    pool: Mutex<HashMap<EndpointId, Connection>>,
+}
+
+impl BlobClient {
+    /// Спросить держателя о файле. Сперва по живому соединению, и только если
+    /// его нет или оно умерло — новым.
+    pub async fn ask(
+        &self,
+        endpoint: &Endpoint,
+        peer: EndpointId,
+        space: SpaceId,
+        hash: Id,
+        key: &[u8; 32],
+        offset: u64,
+    ) -> Result<Offer> {
+        let pooled = self.pool.lock().get(&peer).cloned();
+        if let Some(connection) = pooled {
+            match ask_over(&connection, space, hash, key, offset).await {
+                Ok(offer) => return Ok(offer),
+                Err(err) if err.is::<NotHere>() => return Err(err),
+                Err(_) => {
+                    self.pool.lock().remove(&peer);
+                }
+            }
+        }
+        let connection = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            endpoint.connect(EndpointAddr::from(peer), BLOB_ALPN),
+        )
         .await
         .map_err(|_| anyhow!("узел не отвечает"))??;
-    let (send, recv) = connection.open_bi().await?;
-    fetch_stream(
-        ctx.as_ref(),
-        send,
-        recv,
+        self.pool.lock().insert(peer, connection.clone());
+        ask_over(&connection, space, hash, key, offset).await
+    }
+}
+
+async fn ask_over(
+    connection: &Connection,
+    space: SpaceId,
+    hash: Id,
+    key: &[u8; 32],
+    offset: u64,
+) -> Result<Offer> {
+    tokio::time::timeout(REPLY_TIMEOUT, async {
+        let (mut send, mut recv) = connection.open_bi().await?;
+        let total = request(&mut send, &mut recv, space, hash, key, offset).await?;
+        Ok(Offer {
+            total,
+            _send: send,
+            recv,
+        })
+    })
+    .await
+    .map_err(|_| anyhow!("держатель молчит"))?
+}
+
+/// Отправить запрос и прочитать ответ. `Ok` — сколько всего байт в файле.
+async fn request<W, R>(
+    send: &mut W,
+    recv: &mut R,
+    space: SpaceId,
+    hash: Id,
+    key: &[u8; 32],
+    offset: u64,
+) -> Result<u64>
+where
+    W: AsyncWriteExt + Unpin,
+    R: AsyncReadExt + Unpin,
+{
+    let request = BlobRequest {
         space,
         hash,
-        &key,
-        &target,
-        &partial,
         offset,
-    )
-    .await
+    };
+    write_frame(send, &seal(key, &request)?).await?;
+    send.flush().await?;
+
+    let raw = read_frame(recv).await?;
+    let total = match open::<BlobReply>(key, &raw)? {
+        BlobReply::Sending { total } => total,
+        BlobReply::Missing => return Err(NotHere.into()),
+    };
+    if total > MAX_BLOB {
+        return Err(anyhow!("пир заявил файл больше допустимого"));
+    }
+    if offset > total {
+        return Err(anyhow!("у пира файл короче, чем мы уже скачали"));
+    }
+    Ok(total)
+}
+
+/// Принять файл по ответу держателя.
+pub async fn receive(ctx: &Ctx, offer: Offer, hash: Id, target: &Path, partial: &Path, offset: u64) -> Result<PathBuf> {
+    let Offer { total, recv, _send } = offer;
+    let path = receive_into(ctx, recv, total, hash, target, partial, offset).await;
+    drop(_send);
+    path
 }
 
 /// Скачивание поверх пары потоков — см. пояснение к `serve_stream`.
@@ -213,23 +312,22 @@ where
     W: AsyncWriteExt + Unpin,
     R: AsyncReadExt + Unpin,
 {
-    let request = BlobRequest {
-        space,
-        hash,
-        offset,
-    };
-    write_frame(&mut send, &seal(key, &request)?).await?;
-    send.flush().await?;
+    let total = request(&mut send, &mut recv, space, hash, key, offset).await?;
+    receive_into(ctx, recv, total, hash, target, partial, offset).await
+}
 
-    let raw = read_frame(&mut recv).await?;
-    let total = match open::<BlobReply>(key, &raw)? {
-        BlobReply::Sending { total } => total,
-        BlobReply::Missing => return Err(anyhow!("у пира нет этого файла")),
-    };
-    if total > MAX_BLOB {
-        return Err(anyhow!("пир заявил файл больше допустимого"));
-    }
-
+async fn receive_into<R>(
+    ctx: &Ctx,
+    mut recv: R,
+    total: u64,
+    hash: Id,
+    target: &Path,
+    partial: &Path,
+    offset: u64,
+) -> Result<PathBuf>
+where
+    R: AsyncReadExt + Unpin,
+{
     if let Some(dir) = partial.parent() {
         tokio::fs::create_dir_all(dir).await?;
     }
@@ -242,12 +340,17 @@ where
     let mut buffer = vec![0u8; CHUNK];
     let mut written = offset;
     loop {
-        let read = recv.read(&mut buffer).await?;
+        let read = tokio::time::timeout(STALL_TIMEOUT, recv.read(&mut buffer))
+            .await
+            .map_err(|_| anyhow!("держатель замолчал на {written} из {total} байт"))??;
         if read == 0 {
             break;
         }
         written += read as u64;
         if written > total {
+            drop(file);
+            // Лишнее нельзя просто отрезать: неизвестно, где начался мусор.
+            let _ = tokio::fs::remove_file(partial).await;
             return Err(anyhow!("пир прислал больше, чем обещал"));
         }
         file.write_all(&buffer[..read]).await?;

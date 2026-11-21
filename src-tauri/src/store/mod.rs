@@ -765,6 +765,34 @@ impl Store {
         Ok(row)
     }
 
+    /// Вложения недавних сообщений, которых у нас ещё нет, — свежие первыми.
+    ///
+    /// По этому списку ядро тянет файлы само, не дожидаясь, пока их покажут.
+    /// Раньше файл просил только интерфейс, и только когда ленту открыли: если
+    /// автор к тому времени ушёл, взять файл было уже не у кого.
+    pub fn missing_blobs(&self, max_size: u64, since_ms: i64, limit: usize) -> Result<Vec<(SpaceId, Id, u64)>> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT e.space, a.hash, MAX(a.size), MAX(e.ts) AS fresh
+               FROM attachments a JOIN events e ON e.id = a.message
+              WHERE a.size <= ?1 AND e.ts >= ?2
+                AND NOT EXISTS (SELECT 1 FROM blobs b WHERE b.hash = a.hash)
+              GROUP BY a.hash
+              ORDER BY fresh DESC
+              LIMIT ?3",
+        )?;
+        let rows = stmt
+            .query_map(params![max_size as i64, since_ms, limit as i64], |r| {
+                Ok((
+                    id_from_row(r.get::<_, Vec<u8>>(0)?),
+                    id_from_row(r.get::<_, Vec<u8>>(1)?),
+                    r.get::<_, i64>(2)? as u64,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Кто из участников пространства упоминал это вложение — у них и просим.
     pub fn attachment_holders(&self, hash: Id) -> Result<Vec<Id>> {
         let conn = self.conn.lock();

@@ -163,6 +163,8 @@ pub struct Ctx {
     adopting: Mutex<()>,
     /// О каких раздачах без нашей копии уже сказали — чтобы не повторять.
     lost: Mutex<std::collections::HashSet<Id>>,
+    /// Пришли новые события — может, с вложениями, которые пора тянуть.
+    pub blobs_wanted: tokio::sync::Notify,
 }
 
 impl Ctx {
@@ -189,6 +191,7 @@ impl Ctx {
             on_change: std::sync::OnceLock::new(),
             adopting: Mutex::new(()),
             lost: Mutex::new(std::collections::HashSet::new()),
+            blobs_wanted: tokio::sync::Notify::new(),
         }
     }
 
@@ -438,6 +441,7 @@ impl Ctx {
         self.clock.lock().observe(signed.event.lamport);
         match self.store.apply(signed)? {
             Applied::Fresh => {
+                self.blobs_wanted.notify_one();
                 let _ = self.notices.send(Notice::Applied {
                     space: signed.event.space,
                     event: signed.id(),
