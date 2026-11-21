@@ -546,6 +546,20 @@ pub fn set_voice_volume(app: State<'_, Arc<App>>, author: Id, gain: f32) -> Answ
     Ok(())
 }
 
+/// Попросить собеседника о ключевом кадре: в его картинке у нас дыра.
+#[tauri::command]
+pub fn request_keyframe(app: State<'_, Arc<App>>, author: Id, track: String) -> Answer<()> {
+    let track = match track.as_str() {
+        "screen" => crate::net::media::Track::Screen,
+        "video" => crate::net::media::Track::Video,
+        other => return Err(format!("нет такой дорожки картинки: {other}")),
+    };
+    app.net
+        .media()
+        .request_keyframe(author, track)
+        .map_err(|err| err.to_string())
+}
+
 /// Громкость общего плеера у себя.
 #[tauri::command]
 pub fn set_music_volume(app: State<'_, Arc<App>>, gain: f32) -> Answer<()> {

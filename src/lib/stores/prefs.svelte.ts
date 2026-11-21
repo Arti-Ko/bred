@@ -20,6 +20,23 @@ interface Stored {
   adequate: boolean;
   /** Что уже пройдено. Непустой список — замок открыт. */
   trophies: Trophy[];
+  /** Выбранные микрофон, камера и колонки. Пусто — системные по умолчанию. */
+  devices: Record<DeviceKind, ChosenDevice | null>;
+}
+
+/** Что можно выбрать в настройках звонка. */
+export type DeviceKind = 'mic' | 'camera' | 'speaker';
+
+/**
+ * Выбранное устройство.
+ *
+ * Название храним рядом с идентификатором: идентификатор вебвью может
+ * пересчитать после сброса разрешений, а «AirPods Темы» остаются собой — по
+ * имени их и находим снова.
+ */
+export interface ChosenDevice {
+  id: string;
+  label: string;
 }
 
 const DEFAULTS: Stored = {
@@ -29,6 +46,7 @@ const DEFAULTS: Stored = {
   musicVolume: 0.7,
   adequate: false,
   trophies: [],
+  devices: { mic: null, camera: null, speaker: null },
 };
 
 function load(): Stored {
@@ -85,6 +103,14 @@ export class Prefs {
   /** Победы. Первая же открывает замок, остальные — для коллекции. */
   trophies = $state<Trophy[]>(load().trophies);
 
+  /** Выбранные устройства звонка. */
+  devices = $state<Record<DeviceKind, ChosenDevice | null>>({ ...DEFAULTS.devices, ...load().devices });
+
+  setDevice(kind: DeviceKind, device: ChosenDevice | null): void {
+    this.devices = { ...this.devices, [kind]: device };
+    this.#save();
+  }
+
   get unlocked(): boolean {
     return this.trophies.length > 0;
   }
@@ -133,6 +159,7 @@ export class Prefs {
           musicVolume: this.musicVolume,
           adequate: this.adequate,
           trophies: this.trophies,
+          devices: this.devices,
         }),
       );
     } catch {

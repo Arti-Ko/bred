@@ -6,6 +6,9 @@
   import { report } from '../stores/report.svelte';
   import { governance } from '../stores/governance.svelte';
   import { privacy } from '../stores/privacy.svelte';
+  import { call } from '../stores/call.svelte';
+  import { devices } from '../stores/devices.svelte';
+  import type { DeviceKind } from '../stores/prefs.svelte';
   import { previewUrl } from '../previews';
 
   /** Своя картинка профиля: человек должен видеть, как его увидят другие. */
@@ -32,7 +35,14 @@
   $effect(() => {
     void updates.init();
     void privacy.load();
+    void devices.refresh();
   });
+
+  const deviceRows: Array<{ kind: DeviceKind; label: string }> = [
+    { kind: 'mic', label: 'микрофон' },
+    { kind: 'camera', label: 'камера' },
+    { kind: 'speaker', label: 'колонки' },
+  ];
 
   const stageText: Record<string, string> = {
     idle: 'не проверялось',
@@ -90,6 +100,37 @@
     </div>
 
     <div class="group">звонки</div>
+    {#each deviceRows as row (row.kind)}
+      <div class="row">
+        <span class="k">{row.label}</span>
+        {#if row.kind === 'speaker' && !devices.canPickSpeaker}
+          <span class="v">системные</span>
+          <span class="hint">эта платформа не даёт выбрать колонки — меняются в настройках системы</span>
+        {:else}
+          <select
+            class="pick"
+            aria-label={row.label}
+            value={devices.selected(row.kind)}
+            onchange={(event) => void call.chooseDevice(row.kind, event.currentTarget.value)}
+          >
+            <option value="">как в системе</option>
+            {#each devices.choices(row.kind) as device (device.id)}
+              <option value={device.id}>{device.label}</option>
+            {/each}
+          </select>
+        {/if}
+      </div>
+    {/each}
+    {#if devices.unnamed}
+      <div class="row">
+        <span class="k"></span>
+        <button class="act" onclick={() => devices.reveal()}>показать названия</button>
+        <span class="hint">названия устройств видны после разрешения на микрофон и камеру</span>
+      </div>
+    {/if}
+    {#if devices.error}
+      <div class="row"><span class="k">устройства</span><span class="v">{devices.error}</span></div>
+    {/if}
     <div class="row">
       <span class="k">видео</span>
       <button class="act" onclick={() => prefs.toggleColorVideo()}>
@@ -401,6 +442,22 @@
     border-color: var(--inv-bg);
     color: var(--inv-fg);
     font-weight: 700;
+  }
+
+  .pick {
+    min-width: 0;
+    width: 100%;
+    padding: 1px 6px;
+    border: 1px solid var(--fg-faint);
+    background: var(--bg);
+    color: var(--fg);
+    font: inherit;
+    font-size: var(--text-sm);
+  }
+  .pick:hover,
+  .pick:focus {
+    outline: none;
+    border-color: var(--fg-dim);
   }
 
   .avatar {

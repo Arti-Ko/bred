@@ -16,6 +16,18 @@
 
 /** Сколько ждём, прежде чем начать играть, — сорок миллисекунд. */
 const PRIME = 1920;
+/**
+ * Докуда запас может вырасти — сто пятьдесят миллисекунд.
+ *
+ * Сорока миллисекунд хватает, пока главный поток свободен. Во время
+ * демонстрации экрана он занят кадрами, особенно на маке, и задумывается
+ * дольше — каждый раз это был провал в голосе. Теперь провал растит запас, а
+ * тишина в ровном потоке медленно возвращает его к норме.
+ */
+const MAX_TARGET = 7200;
+/** Через сколько квантов без провалов убавляем запас и на сколько. */
+const SHRINK_AFTER = 750;
+const SHRINK_BY = 240;
 /** Коридор вокруг нормы, в пределах которого ничего не трогаем. */
 const SLACK = 960;
 /** Дальше этого запас уже задержка: выбрасываем лишнее сразу. */
@@ -34,6 +46,9 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     this.size = 0;
     this.primed = false;
     this.quanta = 0;
+    /** Нынешняя норма запаса: растёт на провалах, тает в покое. */
+    this.target = PRIME;
+    this.steady = 0;
     this.port.onmessage = (event) => this.take(event.data);
   }
 
@@ -62,8 +77,8 @@ class PlaybackProcessor extends AudioWorkletProcessor {
 
     // Главный поток задумался и выдал накопленное разом: догонять бессмысленно,
     // отставание осталось бы навсегда.
-    if (this.size > CEILING) {
-      const drop = this.size - PRIME;
+    if (this.size > Math.max(CEILING, this.target * 2)) {
+      const drop = this.size - this.target;
       this.read = (this.read + drop) % CAPACITY;
       this.size -= drop;
     }
@@ -76,7 +91,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     if (!left) return true;
 
     if (!this.primed) {
-      if (this.size < PRIME) {
+      if (this.size < this.target) {
         left.fill(0);
         if (right !== left) right.fill(0);
         return true;
@@ -90,8 +105,8 @@ class PlaybackProcessor extends AudioWorkletProcessor {
     let nudge = 0;
     if (this.quanta >= NUDGE_EVERY) {
       this.quanta = 0;
-      if (this.size > PRIME + SLACK) nudge = 1;
-      else if (this.size < PRIME - SLACK && this.size > 0) nudge = -1;
+      if (this.size > this.target + SLACK) nudge = 1;
+      else if (this.size < this.target - SLACK && this.size > 0) nudge = -1;
     }
     if (nudge === 1) {
       this.read = (this.read + 1) % CAPACITY;
@@ -104,6 +119,10 @@ class PlaybackProcessor extends AudioWorkletProcessor {
         // заикаемся по одному кадру.
         left[i] = 0;
         right[i] = 0;
+        if (this.primed) {
+          this.target = Math.min(MAX_TARGET, Math.round(this.target * 1.5));
+          this.steady = 0;
+        }
         this.primed = false;
         continue;
       }
@@ -112,6 +131,13 @@ class PlaybackProcessor extends AudioWorkletProcessor {
       if (nudge === -1 && i === 0) continue; // этот отсчёт прозвучит дважды
       this.read = (this.read + 1) % CAPACITY;
       this.size -= 1;
+    }
+    if (this.primed) {
+      this.steady += 1;
+      if (this.steady >= SHRINK_AFTER && this.target > PRIME) {
+        this.steady = 0;
+        this.target = Math.max(PRIME, this.target - SHRINK_BY);
+      }
     }
     return true;
   }

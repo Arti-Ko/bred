@@ -9,6 +9,9 @@
   import { api, errorText } from '../ipc';
   import { governance } from '../stores/governance.svelte';
   import { privacy } from '../stores/privacy.svelte';
+  import { call } from '../stores/call.svelte';
+  import { devices } from '../stores/devices.svelte';
+  import type { DeviceKind } from '../stores/prefs.svelte';
   import { news } from '../stores/news.svelte';
   import { prefs } from '../stores/prefs.svelte';
   import { report } from '../stores/report.svelte';
@@ -29,7 +32,14 @@
 
   $effect(() => {
     void privacy.load();
+    void devices.refresh();
   });
+
+  const deviceRows: Array<{ kind: DeviceKind; label: string }> = [
+    { kind: 'mic', label: 'Микрофон' },
+    { kind: 'camera', label: 'Камера' },
+    { kind: 'speaker', label: 'Колонки и наушники' },
+  ];
 
   $effect(() => {
     void updates.init();
@@ -137,6 +147,34 @@
 
   <section>
     <h3>Звонки и уведомления</h3>
+    {#each deviceRows as row (row.kind)}
+      <label class="field">
+        <span class="field-label">{row.label}</span>
+        {#if row.kind === 'speaker' && !devices.canPickSpeaker}
+          <div class="input">Системные — платформа не даёт выбрать</div>
+        {:else}
+          <select
+            class="input"
+            value={devices.selected(row.kind)}
+            onchange={(event) => void call.chooseDevice(row.kind, event.currentTarget.value)}
+          >
+            <option value="">Как в системе</option>
+            {#each devices.choices(row.kind) as device (device.id)}
+              <option value={device.id}>{device.label}</option>
+            {/each}
+          </select>
+        {/if}
+      </label>
+    {/each}
+    {#if devices.unnamed}
+      <button class="row-btn" onclick={() => devices.reveal()}>
+        <span class="label">
+          <b>Показать названия устройств</b>
+          <span>видны после разрешения на микрофон и камеру</span>
+        </span>
+      </button>
+    {/if}
+    {#if devices.error}<p class="error">{devices.error}</p>{/if}
     <div class="switch">
       <span class="label">
         <b>Видео в цвете</b>
@@ -379,6 +417,14 @@
   .face-text span {
     color: var(--fg-dimmer);
     font-size: var(--text-sm);
+  }
+
+  .field {
+    display: block;
+  }
+  .field select.input {
+    width: 100%;
+    cursor: pointer;
   }
 
   .pair {

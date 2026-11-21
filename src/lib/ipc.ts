@@ -299,6 +299,8 @@ export const api = {
   ring: (to: Id[]) => invoke<number>('ring', { to }),
   /** Громкость собеседника у себя: сводит звук ядро, оно и крутит регулятор. */
   setVoiceVolume: (author: Id, gain: number) => invoke<void>('set_voice_volume', { author, gain }),
+  requestKeyframe: (author: Id, track: 'video' | 'screen') =>
+    invoke<void>('request_keyframe', { author, track }),
   setMusicVolume: (gain: number) => invoke<void>('set_music_volume', { gain }),
   musicControl: (command: PlayerCommand) => invoke<void>('music_control', { command }),
   playerState: (space: Id) => invoke<PlayerState | null>('player_state', { space }),

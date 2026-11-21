@@ -97,6 +97,17 @@ const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// времени опоздавший кадр не нужен никому, а неограниченная очередь при
 /// медленном получателе съедает память гигабайтами.
 pub const SINK_QUEUE: usize = 96;
+/// Не чаще одного ключевого кадра по просьбе в это время.
+///
+/// Ключевой кадр экрана весит сотни килобайт. Просят его как раз тогда, когда
+/// канал не справляется, и ответ на каждую просьбу без паузы добивал бы канал
+/// окончательно.
+const KEYFRAME_COOLDOWN: Duration = Duration::from_millis(700);
+/// Метка в пинге: «пришли ключевой кадр». Дальше — дорожка и кому.
+///
+/// Едет в пинге, а не новой дорожкой: старые версии пинг узнают и отбрасывают,
+/// не заглядывая внутрь, — формат и ALPN менять не пришлось.
+const PING_WANT_KEYFRAME: u8 = 1;
 
 // ── формат провода ──────────────────────────────────────────────────────────
 
@@ -395,6 +406,10 @@ struct FrameQueue {
     inner: Mutex<VecDeque<Bytes>>,
     ready: tokio::sync::Notify,
     closed: AtomicBool,
+    /// Выбросили кадр — и цепочка разорвана: каждый следующий дельта-кадр
+    /// ссылается на пропавший, и декодер показал бы из них кашу. До ключевого
+    /// кадра дельты не отправляем вовсе.
+    broken: AtomicBool,
     /// Сколько кадров пришлось выбросить — это и есть сигнал governor'у, что
     /// исходящий канал не тянет заданный битрейт.
     dropped: AtomicU64,
@@ -406,11 +421,19 @@ impl FrameQueue {
             inner: Mutex::new(VecDeque::with_capacity(VIDEO_QUEUE)),
             ready: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
+            broken: AtomicBool::new(false),
             dropped: AtomicU64::new(0),
         })
     }
 
-    fn push(&self, bytes: Bytes, keyframe: bool) {
+    /// Поставить кадр в очередь. `true` — цепочка только что порвалась и нужен
+    /// ключевой кадр.
+    ///
+    /// Раньше переполненная очередь выбрасывала один дельта-кадр и спокойно
+    /// принимала следующие. Получатель декодировал их поверх дыры, и до
+    /// планового ключевого кадра — до трёх секунд — демонстрация стояла или
+    /// рассыпалась квадратами. Это и было «лагает».
+    fn push(&self, bytes: Bytes, keyframe: bool) -> bool {
         {
             let mut queue = self.inner.lock();
             if keyframe {
@@ -418,13 +441,19 @@ impl FrameQueue {
                 self.dropped
                     .fetch_add(queue.len() as u64, Ordering::Relaxed);
                 queue.clear();
+                self.broken.store(false, Ordering::Relaxed);
+            } else if self.broken.load(Ordering::Relaxed) {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                return false;
             } else if queue.len() >= VIDEO_QUEUE {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
-                return;
+                self.broken.store(true, Ordering::Relaxed);
+                return true;
             }
             queue.push_back(bytes);
         }
         self.ready.notify_one();
+        false
     }
 
     fn pop(&self) -> Option<Bytes> {
@@ -467,6 +496,32 @@ const CEILING_SCREEN: u32 = 8_000_000;
 /// Полы: ниже картинка бессмысленна, лучше её выключить, чем показывать кашу.
 const FLOOR_VIDEO: u32 = 120_000;
 const FLOOR_SCREEN: u32 = 600_000;
+/// С чего начинает демонстрация.
+///
+/// Раньше она с первого кадра шла на потолке — до восьми мегабит. Канал это
+/// принимал не сразу: сначала заполнялась очередь в роутере, и голос всех в
+/// звонке вставал в неё же. Теперь старт скромный, а дальше — разгон, пока
+/// задержка ровная.
+const START_SCREEN: u32 = 2_000_000;
+/// Потолки, когда собеседник за ретранслятором.
+///
+/// Через ретранслятор всё соединение — один TCP. Датаграмма голоса там ждёт,
+/// пока пройдёт всё, что встало перед ней, включая ключевой кадр экрана. Здесь
+/// картинка обязана уступить, иначе разговор превращается в рацию.
+const RELAY_CEILING_VIDEO: u32 = 400_000;
+const RELAY_CEILING_SCREEN: u32 = 1_500_000;
+/// Насколько задержка может вырасти над обычной, прежде чем это считается
+/// перегрузкой.
+///
+/// Выброшенный кадр — запоздалый сигнал: к нему очередь в роутере уже полна, и
+/// голос опаздывает на сотни миллисекунд. Рост задержки виден раньше.
+const RTT_SLACK: Duration = Duration::from_millis(60);
+/// Как долго помним самую низкую задержку. Путь мог смениться, и вчерашний
+/// минимум больше не достижим — тогда базу надо отпустить.
+const RTT_FLOOR_FOR: Duration = Duration::from_secs(30);
+/// Дорожка без кадров дольше этого считается выключенной: её подбор
+/// начинается заново, со стартового битрейта.
+const TRACK_IDLE: Duration = Duration::from_secs(3);
 
 /// Состояние подбора битрейта по одной дорожке.
 struct Governor {
@@ -561,6 +616,12 @@ pub struct Media {
     dialing: Mutex<HashMap<Id, Dial>>,
     /// Подбор битрейта по дорожкам картинки.
     governors: Mutex<HashMap<Track, Governor>>,
+    /// Когда по дорожке картинки последний раз уходил кадр.
+    sent_at: Mutex<HashMap<Track, Instant>>,
+    /// Самая низкая задержка до каждого собеседника и когда её видели.
+    rtt_floor: Mutex<HashMap<EndpointId, (Duration, Instant)>>,
+    /// Когда последний раз просили свой кодировщик о ключевом кадре.
+    keyframe_asked: Mutex<Option<Instant>>,
     links: AtomicU64,
     /// Отсчёт для отметок живости: `Instant` в атомик не положить.
     epoch: Instant,
@@ -586,6 +647,9 @@ impl Media {
             dropped: Mutex::new(0),
             dialing: Mutex::new(HashMap::new()),
             governors: Mutex::new(HashMap::new()),
+            keyframe_asked: Mutex::new(None),
+            sent_at: Mutex::new(HashMap::new()),
+            rtt_floor: Mutex::new(HashMap::new()),
             links: AtomicU64::new(0),
             epoch: Instant::now(),
         });
@@ -737,13 +801,18 @@ impl Media {
         if track.reliable() {
             let counter = self.nonce.fetch_add(1, Ordering::Relaxed);
             let sealed = Bytes::from(seal_media(&cipher, counter, &head(0, 1), data)?);
+            self.sent_at.lock().insert(track, Instant::now());
+            let mut broke = false;
             for peer in self.peers.read().values() {
                 let queue = if track == Track::Screen {
                     &peer.screen
                 } else {
                     &peer.video
                 };
-                queue.push(sealed.clone(), keyframe);
+                broke |= queue.push(sealed.clone(), keyframe);
+            }
+            if broke {
+                self.want_keyframe();
             }
             return Ok(());
         }
@@ -790,6 +859,31 @@ impl Media {
             }
         }
         Ok(())
+    }
+
+    /// Попросить свой кодировщик о ключевом кадре — не чаще, чем раз в
+    /// [`KEYFRAME_COOLDOWN`].
+    fn want_keyframe(&self) {
+        let mut asked = self.keyframe_asked.lock();
+        if asked.is_some_and(|at| at.elapsed() < KEYFRAME_COOLDOWN) {
+            return;
+        }
+        *asked = Some(Instant::now());
+        drop(asked);
+        let _ = self.ctx.notices.send(Notice::Keyframe);
+    }
+
+    /// Попросить собеседника о ключевом кадре: у нас дыра в его картинке.
+    ///
+    /// Без этого получатель ждал планового ключевого кадра — до трёх секунд
+    /// стоп-кадра на каждую потерю. Уходит пингом всем: так проще, чем искать
+    /// соединение, а остальные увидят, что просьба не им, и пропустят.
+    pub fn request_keyframe(&self, author: Id, track: Track) -> Result<()> {
+        let mut payload = Vec::with_capacity(2 + author.0.len());
+        payload.push(PING_WANT_KEYFRAME);
+        payload.push(track.code());
+        payload.extend_from_slice(&author.0);
+        self.broadcast(Track::Ping, false, 0, 0, &payload)
     }
 
     /// Приём от одного собеседника: датаграммы со звуком и потоки с картинкой.
@@ -920,7 +1014,12 @@ impl Media {
         }
         link.heard.store(self.now_ms(), Ordering::Relaxed);
         if head.track == Track::Ping {
-            return; // своё дело он уже сделал — отметил, что собеседник на связи
+            // Своё дело он уже сделал — отметил, что собеседник на связи. Но
+            // может ещё и нести просьбу о ключевом кадре.
+            if keyframe_wanted_from(&data, self.ctx.identity.id()) {
+                self.want_keyframe();
+            }
+            return;
         }
 
         let Some(frame) = self.reassembly.lock().push(link.author, head, data) else {
@@ -1112,10 +1211,11 @@ impl Media {
                 // Сетка платит за каждого собеседника отдельной копией кадра,
                 // поэтому потолок на дорожку делится на число слушателей.
                 let listeners = self.peers.read().len().max(1) as u32;
+                let (congested, relayed) = self.path_pressure();
 
-                for (track, ceiling, floor) in [
-                    (Track::Video, CEILING_VIDEO, FLOOR_VIDEO),
-                    (Track::Screen, CEILING_SCREEN, FLOOR_SCREEN),
+                for (track, ceiling, relay_ceiling, floor, start) in [
+                    (Track::Video, CEILING_VIDEO, RELAY_CEILING_VIDEO, FLOOR_VIDEO, CEILING_VIDEO),
+                    (Track::Screen, CEILING_SCREEN, RELAY_CEILING_SCREEN, FLOOR_SCREEN, START_SCREEN),
                 ] {
                     let dropped: u64 = self
                         .peers
@@ -1130,41 +1230,103 @@ impl Media {
                         })
                         .sum();
 
+                    let ceiling = if relayed { relay_ceiling } else { ceiling };
                     let share = (ceiling / listeners).max(floor);
+                    let idle = self
+                        .sent_at
+                        .lock()
+                        .get(&track)
+                        .is_none_or(|at| at.elapsed() > TRACK_IDLE);
+
                     let mut governors = self.governors.lock();
+                    // Выключенная дорожка подбирается заново: иначе включённая
+                    // через минуту демонстрация сразу получила бы весь потолок,
+                    // до которого подбор успел дорасти вхолостую.
+                    if idle {
+                        governors.remove(&track);
+                        continue;
+                    }
                     let state = governors.entry(track).or_insert(Governor {
-                        current: share,
+                        current: start.min(share),
                         calm: 0,
                     });
+                    let next = next_bitrate(state, dropped > 0 || congested, share, floor);
 
-                    let next = if dropped > 0 {
-                        state.calm = 0;
-                        // Отступаем заметно: мелкий шаг вниз на переполненном
-                        // канале означает ещё несколько секунд рассыпающейся
-                        // картинки, пока подбор доедет до реального потолка.
-                        (state.current * 4 / 5).max(floor)
-                    } else {
-                        state.calm += 1;
-                        if state.calm < CALM_TICKS {
-                            state.current
-                        } else {
-                            state.calm = 0;
-                            // Наверх — осторожно: канал мог освободиться на миг.
-                            (state.current + state.current / 10).min(share)
-                        }
-                    };
-
-                    if next != state.current {
-                        state.current = next;
-                        let _ = self.ctx.notices.send(Notice::Bitrate {
-                            track: track.name(),
-                            bps: next,
-                        });
-                    }
+                    // Шлём каждый тик, а не только при смене: интерфейс
+                    // поднимает кодировщик со своими настройками, и молчание
+                    // подбора оставило бы его на них навсегда. Мелкие подвижки
+                    // интерфейс отбрасывает сам.
+                    state.current = next;
+                    let _ = self.ctx.notices.send(Notice::Bitrate {
+                        track: track.name(),
+                        bps: next,
+                    });
                 }
             }
         });
     }
+
+    /// Растёт ли задержка хоть до кого-то и идёт ли кто-то через ретранслятор.
+    ///
+    /// Задержку сравниваем с самой низкой за последние полминуты: абсолютное
+    /// значение ничего не говорит — сосед за океаном и сосед за стенкой.
+    fn path_pressure(&self) -> (bool, bool) {
+        let mut congested = false;
+        let mut relayed = false;
+        let peers: Vec<(EndpointId, Connection)> = self
+            .peers
+            .read()
+            .iter()
+            .map(|(id, peer)| (*id, peer.connection.clone()))
+            .collect();
+        let mut floors = self.rtt_floor.lock();
+        floors.retain(|id, _| peers.iter().any(|(peer, _)| peer == id));
+        for (id, connection) in peers {
+            let paths = connection.paths();
+            let Some(path) = paths.iter().find(|path| path.is_selected()) else {
+                continue;
+            };
+            relayed |= path.is_relay();
+            let rtt = path.rtt();
+            if rtt.is_zero() {
+                continue;
+            }
+            let floor = floors.entry(id).or_insert((rtt, Instant::now()));
+            if rtt <= floor.0 || floor.1.elapsed() > RTT_FLOOR_FOR {
+                *floor = (rtt, Instant::now());
+            }
+            congested |= rtt > floor.0 + RTT_SLACK;
+        }
+        (congested, relayed)
+    }
+}
+
+/// Следующий битрейт дорожки.
+///
+/// Вниз — сразу и заметно: мелкий шаг на переполненном канале означал бы ещё
+/// несколько секунд опаздывающего голоса. Вверх — осторожно и только после
+/// нескольких спокойных тиков: канал мог освободиться на миг.
+fn next_bitrate(state: &mut Governor, pressed: bool, share: u32, floor: u32) -> u32 {
+    if pressed {
+        state.calm = 0;
+        return (state.current * 7 / 10).max(floor);
+    }
+    if state.current > share {
+        // Потолок упал — собеседников стало больше или путь ушёл на
+        // ретранслятор. Ждать здесь нечего.
+        return share;
+    }
+    state.calm += 1;
+    if state.calm < CALM_TICKS {
+        return state.current;
+    }
+    state.calm = 0;
+    (state.current + state.current / 7).min(share)
+}
+
+/// Просит ли пинг ключевой кадр именно у нас.
+fn keyframe_wanted_from(ping: &[u8], me: Id) -> bool {
+    ping.len() == 2 + me.0.len() && ping[0] == PING_WANT_KEYFRAME && ping[2..] == me.0[..]
 }
 
 /// Отправка кадров одной дорожки — одним долгоживущим потоком, кадр за кадром.
@@ -1508,6 +1670,77 @@ mod tests {
             VIDEO_QUEUE as u64,
             "выброшенное обязано считаться: по нему governor снижает битрейт"
         );
+    }
+
+    #[test]
+    fn after_a_drop_deltas_wait_for_a_keyframe() {
+        let queue = FrameQueue::new();
+        for _ in 0..VIDEO_QUEUE {
+            assert!(!queue.push(Bytes::from_static(b"delta"), false));
+        }
+        assert!(
+            queue.push(Bytes::from_static(b"lost"), false),
+            "первая потеря обязана попросить ключевой кадр"
+        );
+        while queue.pop().is_some() {}
+
+        assert!(
+            !queue.push(Bytes::from_static(b"orphan"), false),
+            "повторно не просим — просьба уже ушла"
+        );
+        assert!(
+            queue.pop().is_none(),
+            "дельта после дыры ссылается на пропавший кадр — слать её нельзя, хоть место и есть"
+        );
+
+        queue.push(Bytes::from_static(b"key"), true);
+        queue.push(Bytes::from_static(b"delta"), false);
+        assert_eq!(queue.pop().as_deref(), Some(&b"key"[..]));
+        assert_eq!(
+            queue.pop().as_deref(),
+            Some(&b"delta"[..]),
+            "с ключевого кадра цепочка снова целая"
+        );
+    }
+
+    #[test]
+    fn pressure_cuts_bitrate_at_once_and_calm_raises_it_slowly() {
+        let mut state = Governor { current: 2_000_000, calm: 0 };
+        let down = next_bitrate(&mut state, true, 8_000_000, FLOOR_SCREEN);
+        assert_eq!(down, 1_400_000, "под давлением — сразу на треть вниз");
+
+        state.current = down;
+        assert_eq!(
+            next_bitrate(&mut state, false, 8_000_000, FLOOR_SCREEN),
+            down,
+            "один спокойный тик — ещё не повод прибавлять"
+        );
+        let up = next_bitrate(&mut state, false, 8_000_000, FLOOR_SCREEN);
+        assert!(up > down && up < down * 6 / 5, "вверх — понемногу: {up}");
+    }
+
+    #[test]
+    fn bitrate_never_leaves_its_corridor() {
+        let mut state = Governor { current: FLOOR_SCREEN, calm: 0 };
+        assert_eq!(next_bitrate(&mut state, true, 8_000_000, FLOOR_SCREEN), FLOOR_SCREEN);
+
+        let mut state = Governor { current: 8_000_000, calm: 0 };
+        assert_eq!(
+            next_bitrate(&mut state, false, RELAY_CEILING_SCREEN, FLOOR_SCREEN),
+            RELAY_CEILING_SCREEN,
+            "ушли на ретранслятор — потолок опускается сразу, без разгона вниз"
+        );
+    }
+
+    #[test]
+    fn keyframe_request_is_only_for_its_addressee() {
+        let me = author(1);
+        let mut ping = vec![PING_WANT_KEYFRAME, Track::Screen.code()];
+        ping.extend_from_slice(&me.0);
+        assert!(keyframe_wanted_from(&ping, me));
+        assert!(!keyframe_wanted_from(&ping, author(2)), "просьба к другому");
+        assert!(!keyframe_wanted_from(&[], me), "обычный пинг ничего не просит");
+        assert!(!keyframe_wanted_from(&ping[..10], me), "обрезанная просьба");
     }
 
     // ── сборка кадров ───────────────────────────────────────────────────────

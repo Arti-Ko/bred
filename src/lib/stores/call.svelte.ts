@@ -12,7 +12,9 @@ import {
   type PlayerCommand,
   type PlayerState,
 } from '../ipc';
-import { Capture, missingCapabilities, Playback, videoSupported, VoicePlayer } from '../media';
+import { Capture, missingCapabilities, Playback, sinkError, videoSupported, VoicePlayer } from '../media';
+import { devices } from './devices.svelte';
+import type { DeviceKind } from './prefs.svelte';
 import { prefs } from './prefs.svelte';
 import { platform } from '../platform';
 
@@ -431,8 +433,13 @@ export class Call {
     try {
       // Звук собеседников играет один плеер: сводит их ядро. Подписываемся до
       // входа в комнату — иначе первые слова пришедших упали бы в никуда.
+      const [micId, cameraId, speakerId] = await Promise.all([
+        devices.resolve('mic'),
+        devices.resolve('camera'),
+        devices.resolve('speaker'),
+      ]);
       this.#voice = new VoicePlayer();
-      await this.#voice.start((message) => (this.status = message));
+      await this.#voice.start((message) => (this.status = message), speakerId);
       // Возвращаем ранее настроенную громкость, чтобы не крутить её заново.
       for (const [author, value] of Object.entries(prefs.volumes)) {
         void api.setVoiceVolume(author, value).catch(() => undefined);
@@ -447,6 +454,8 @@ export class Call {
         video: withVideo && videoSupported(),
         onError: (message) => (this.status = message),
         onLevel: (rms) => this.#takeLevel(rms),
+        micId,
+        cameraId,
       });
 
       await api.joinCall(space, channel);
@@ -556,6 +565,31 @@ export class Call {
    * Раньше её включали пересбором всего захвата: на секунду пропадал голос, а
    * идущая демонстрация экрана молча обрывалась.
    */
+  /** Выбор в настройках: запомнить и, если идёт звонок, переключиться сразу. */
+  async chooseDevice(kind: DeviceKind, id: string): Promise<void> {
+    const option = devices.list(kind).find((device) => device.id === id);
+    prefs.setDevice(kind, option ? { id: option.id, label: option.label } : null);
+    await this.applyDevice(kind);
+  }
+
+  async applyDevice(kind: DeviceKind): Promise<void> {
+    if (!this.active) return;
+    const id = await devices.resolve(kind);
+    const report = (message: string) => (this.status = message);
+    try {
+      if (kind === 'speaker') {
+        await this.#voice?.setSink(id).catch((error) => report(sinkError(error)));
+      } else if (kind === 'mic') {
+        await this.#capture?.switchMic(id, report);
+      } else {
+        await this.#capture?.switchCamera(id, report);
+        this.stream = this.#capture?.stream ?? null;
+      }
+    } catch (error) {
+      this.status = errorText(error);
+    }
+  }
+
   async toggleCamera(): Promise<void> {
     if (!this.active || !this.#capture) return;
     const next = !this.camOn;

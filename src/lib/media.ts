@@ -58,6 +58,19 @@ const AUDIO_BLOCK = 960;
  * страховка: реже — значит дешевле.
  */
 const KEYFRAME_EVERY = 90;
+/** Как часто повторяем кадр неподвижного экрана, мс. */
+const IDLE_FRAME_EVERY = 1000;
+/**
+ * Сколько кадров может ждать декодер, прежде чем мы признаем, что он не
+ * успевает, и перескочим на свежий ключевой.
+ */
+const DECODE_BACKLOG = 4;
+/**
+ * Как часто можно повторять просьбу о ключевом кадре. Пинг с ней — датаграмма
+ * и может потеряться, так что повтор нужен; чаще — только забивать канал
+ * ключевыми кадрами, которых и так ждут.
+ */
+const KEYFRAME_ASK_EVERY = 800;
 /** Модули ворклетов. Лежат в `public/`, отдаются со своего origin. */
 const CAPTURE_WORKLET = '/audio-capture-worklet.js';
 const PLAYBACK_WORKLET = '/audio-playback-worklet.js';
@@ -247,7 +260,44 @@ export interface CaptureOptions {
    * индикатора «меня слышно?» проверяется только вопросом вслух.
    */
   onLevel?: (level: number) => void;
+  /** Выбранный микрофон. Пусто — системный. */
+  micId?: string;
+  /** Выбранная камера. Пусто — системная. */
+  cameraId?: string;
 }
+
+/**
+ * Запросить устройство, а если выбранное пропало — взять системное.
+ *
+ * Выбор в настройках — пожелание, а не условие: наушники могли остаться в
+ * другой комнате, и звонок без них лучше, чем звонок, который не начался.
+ */
+async function openDevice(
+  kind: 'audio' | 'video',
+  base: MediaTrackConstraints,
+  deviceId: string | undefined,
+): Promise<MediaStream> {
+  if (deviceId) {
+    try {
+      return await navigator.mediaDevices.getUserMedia({
+        [kind]: { ...base, deviceId: { exact: deviceId } },
+      });
+    } catch (error) {
+      const name = error instanceof DOMException ? error.name : '';
+      if (name !== 'OverconstrainedError' && name !== 'NotFoundError' && name !== 'NotReadableError') {
+        throw error;
+      }
+    }
+  }
+  return navigator.mediaDevices.getUserMedia({ [kind]: base });
+}
+
+const MIC: MediaTrackConstraints = {
+  echoCancellation: true,
+  noiseSuppression: true,
+  autoGainControl: true,
+};
+const CAMERA_SHAPE: MediaTrackConstraints = { width: 640, height: 360, frameRate: 24 };
 
 interface VideoConfig {
   width: number;
@@ -278,9 +328,13 @@ const SCREEN_FPS = 30;
  * делает её нечитаемой.
  */
 const SCREEN_BITS_PER_PIXEL = 0.07;
-/** Границы битрейта демонстрации. Верхняя совпадает с потолком governor'а в ядре. */
-const SCREEN_BITRATE_MIN = 1_500_000;
-const SCREEN_BITRATE_MAX = 8_000_000;
+/**
+ * Границы стартового битрейта демонстрации. Верхняя — стартовая у governor'а
+ * в ядре (`START_SCREEN`): начинать с потолка значит забить очередь роутера, в
+ * которой стоит и голос. Дальше битрейт разгоняет ядро, пока задержка ровная.
+ */
+const SCREEN_BITRATE_MIN = 1_000_000;
+const SCREEN_BITRATE_MAX = 2_000_000;
 
 
 /** Кодировщик картинки вместе со всем, что нужно, чтобы его перенастроить. */
@@ -382,6 +436,7 @@ export class Capture {
   #onLevel: ((level: number) => void) | null = null;
   /** Дорожки картинки по виду: камера и демонстрация настраиваются порознь. */
   #lanes = new Map<TrackKind, VideoLane>();
+  #cameraId: string | undefined;
 
   /** Своя камера — для плитки «вы». Без камеры пусто. */
   get stream(): MediaStream | null {
@@ -390,14 +445,8 @@ export class Capture {
 
   async start(options: CaptureOptions): Promise<void> {
     this.#onLevel = options.onLevel ?? null;
-    this.#stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-      video: false,
-    });
+    this.#cameraId = options.cameraId;
+    this.#stream = await openDevice('audio', MIC, options.micId);
 
     await this.#startAudio(options.onError);
     if (options.video) await this.setCamera(true, options.onError);
@@ -419,9 +468,7 @@ export class Capture {
       return;
     }
     if (this.#camera) return;
-    const camera = await navigator.mediaDevices.getUserMedia({
-      video: { width: 640, height: 360, frameRate: 24 },
-    });
+    const camera = await openDevice('video', CAMERA_SHAPE, this.#cameraId);
     this.#camera = camera;
     const track = camera.getVideoTracks()[0];
     if (!track) return;
@@ -444,6 +491,37 @@ export class Capture {
     this.#lanes.clear();
     this.#stream?.getTracks().forEach((track) => track.stop());
     this.#stream = null;
+  }
+
+  /**
+   * Сменить микрофон посреди звонка.
+   *
+   * Новый захват поднимается до того, как гасится старый: если новое устройство
+   * не открылось, человек остаётся со старым, а не без голоса.
+   */
+  async switchMic(deviceId: string, onError: (message: string) => void): Promise<void> {
+    if (!this.#stream) return;
+    const muted = this.#stream.getAudioTracks().some((track) => !track.enabled);
+    const fresh = await openDevice('audio', MIC, deviceId);
+    for (const stop of this.#stopFns.splice(0)) {
+      try {
+        stop();
+      } catch {
+        // Узел уже отключён.
+      }
+    }
+    this.#stream.getTracks().forEach((track) => track.stop());
+    this.#stream = fresh;
+    this.setMuted(muted);
+    await this.#startAudio(onError);
+  }
+
+  /** Сменить камеру. Если она сейчас включена — переоткрыть уже с новой. */
+  async switchCamera(deviceId: string, onError: (message: string) => void): Promise<void> {
+    this.#cameraId = deviceId;
+    if (!this.#camera) return;
+    await this.setCamera(false, onError);
+    await this.setCamera(true, onError);
   }
 
   setMuted(muted: boolean): void {
@@ -766,21 +844,57 @@ export class Capture {
       }
       schedule();
     };
-    // Пока окно на виду — по кадрам отрисовки. Когда свёрнуто — по таймеру:
-    // requestAnimationFrame в скрытом окне не вызывается вовсе, и собеседник
-    // видел, будто камеру выключили.
+    // Пока окно на виду — по новым кадрам источника, если вебвью умеет о них
+    // сообщать, иначе по кадрам отрисовки. Раньше было только второе: на
+    // неподвижном экране снимок 1080p брался тридцать раз в секунду впустую, а
+    // на маке это копирование в главном потоке — том же, через который идёт
+    // голос. Отсюда и «демка включена — голос рвётся».
+    //
+    // Когда окно свёрнуто — по таймеру: ни то, ни другое в скрытом окне не
+    // вызывается вовсе, и собеседник видел, будто камеру выключили.
+    const byFrames = typeof video.requestVideoFrameCallback === 'function';
+    let lastCallback = performance.now();
+    // Ожидание следующего кадра — одно на дорожку. Каждый новый вызов
+    // отменяет прежний жетоном: иначе сторож ниже или свёрнутое окно заводили
+    // бы вторую цепочку рядом с первой, и кадры снимались бы вдвое чаще.
+    let chain = 0;
     const schedule = () => {
       if (!running) return;
-      if (document.hidden) window.setTimeout(pump, 1000 / entry.config.framerate);
-      else requestAnimationFrame(pump);
+      const token = ++chain;
+      const next = () => {
+        if (token !== chain) return;
+        lastCallback = performance.now();
+        pump();
+      };
+      if (document.hidden) window.setTimeout(next, 1000 / entry.config.framerate);
+      else if (byFrames) video.requestVideoFrameCallback(next);
+      else requestAnimationFrame(next);
     };
     schedule();
+    // Неподвижный экран честно молчит, но новый собеседник и governor ждут хоть
+    // какого-то кадра: раз в секунду повторяем последний сами. Заодно это
+    // страховка от застрявшего ожидания — например, окно свернули, пока ждали
+    // кадр отрисовки, а в свёрнутом окне он не придёт.
+    const idleGuard = window.setInterval(() => {
+      if (running && performance.now() - lastCallback > IDLE_FRAME_EVERY) {
+        lastCallback = performance.now();
+        encodedAt = 0;
+        pump();
+      }
+    }, IDLE_FRAME_EVERY);
 
     keepStop(() => {
       running = false;
+      window.clearInterval(idleGuard);
       video.srcObject = null;
     });
   }
+}
+
+/** Человеческое объяснение, почему колонки не выбрались. */
+export function sinkError(error: unknown): string {
+  const text = error instanceof Error ? error.message : String(error);
+  return `не удалось переключить колонки, звук идёт в системные: ${text}`;
 }
 
 // ── входящий поток ──────────────────────────────────────────────────────────
@@ -797,8 +911,16 @@ export class VoicePlayer {
   #awake: (() => void) | null = null;
   /** Остановили, пока поднимались: дальше не идём, иначе узел и подписка повиснут. */
   #stopped = false;
+  /**
+   * Обход для WKWebView: аудиоконтекст там не умеет выбирать колонки, а
+   * элемент `<audio>` умеет. Тогда звук идёт через него, и только тогда —
+   * лишнее звено добавляет задержку, а системным колонкам оно не нужно.
+   */
+  #element: HTMLAudioElement | null = null;
+  #bridge: MediaStreamAudioDestinationNode | null = null;
+  #sinkId = '';
 
-  async start(onError: (message: string) => void): Promise<void> {
+  async start(onError: (message: string) => void, sinkId = ''): Promise<void> {
     const context = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
     this.#context = context;
     // Тот же сторож, что и у захвата: прерванный системой контекст сам не
@@ -821,6 +943,7 @@ export class VoicePlayer {
     node.connect(context.destination);
     this.#node = node;
     if (context.state === 'suspended') void context.resume().catch(() => undefined);
+    if (sinkId) await this.setSink(sinkId).catch((error) => onError(sinkError(error)));
 
     const channel = new Channel<ArrayBuffer | number[]>();
     // Кадр уходит в ворклет без копии: владение буфером передаётся. Крупные
@@ -833,8 +956,75 @@ export class VoicePlayer {
     await invoke('voice_stream', { channel });
   }
 
+  /**
+   * Куда играть звонок. Пусто — в системные колонки.
+   *
+   * Не вышло — остаёмся в системных и сообщаем: молчащий звонок хуже звонка
+   * не в те наушники.
+   */
+  async setSink(sinkId: string): Promise<void> {
+    const context = this.#context;
+    const node = this.#node;
+    if (!context || !node || sinkId === this.#sinkId) return;
+
+    if ('setSinkId' in context) {
+      await (context as AudioContext & { setSinkId(id: string): Promise<void> }).setSinkId(sinkId);
+      this.#sinkId = sinkId;
+      return;
+    }
+
+    if (!sinkId) {
+      this.#dropElement();
+      node.connect(context.destination);
+      this.#sinkId = '';
+      return;
+    }
+
+    const element = this.#element ?? new Audio();
+    const bridge = this.#bridge ?? context.createMediaStreamDestination();
+    try {
+      await (element as HTMLAudioElement & { setSinkId(id: string): Promise<void> }).setSinkId(sinkId);
+      if (!this.#bridge) {
+        element.srcObject = bridge.stream;
+        node.connect(bridge);
+        await element.play();
+        node.disconnect(context.destination);
+      }
+    } catch (error) {
+      if (!this.#bridge) {
+        try {
+          node.disconnect(bridge);
+        } catch {
+          // и не был подключён
+        }
+        element.srcObject = null;
+      }
+      throw error;
+    }
+    this.#element = element;
+    this.#bridge = bridge;
+    this.#sinkId = sinkId;
+  }
+
+  #dropElement(): void {
+    if (this.#bridge) {
+      try {
+        this.#node?.disconnect(this.#bridge);
+      } catch {
+        // уже отключён
+      }
+    }
+    if (this.#element) {
+      this.#element.pause();
+      this.#element.srcObject = null;
+    }
+    this.#element = null;
+    this.#bridge = null;
+  }
+
   stop(): void {
     this.#stopped = true;
+    this.#dropElement();
     this.#awake?.();
     this.#awake = null;
     this.#node?.disconnect();
@@ -857,6 +1047,12 @@ export class Playback {
   #canvases = new Map<string, HTMLCanvasElement>();
   /** Когда последний раз приходил кадр по каждой дорожке. */
   #lastFrame = new Map<string, number>();
+  /** Номер последнего принятого кадра дорожки — по нему видно дыру. */
+  #seq = new Map<string, number>();
+  /** Дорожки с дырой: дельты до ключевого кадра не декодируем. */
+  #broken = new Set<string>();
+  /** Когда последний раз просили ключевой кадр по дорожке. */
+  #asked = new Map<string, number>();
   #watch: number | null = null;
 
   /** Забыть участника: декодеры на ушедших иначе копятся всю встречу. */
@@ -868,6 +1064,9 @@ export class Playback {
       this.#codecs.delete(key);
       this.#canvases.delete(key);
       this.#lastFrame.delete(key);
+      this.#seq.delete(key);
+      this.#broken.delete(key);
+      this.#asked.delete(key);
     }
   }
 
@@ -899,6 +1098,9 @@ export class Playback {
       this.#watch = null;
     }
     this.#lastFrame.clear();
+    this.#seq.clear();
+    this.#broken.clear();
+    this.#asked.clear();
     for (const decoder of this.#video.values()) shut(decoder);
     this.#video.clear();
     this.#codecs.clear();
@@ -915,6 +1117,7 @@ export class Playback {
     // Ключ с дорожкой: у одного участника камера и экран идут одновременно.
     const key = `${frame.track}:${frame.author}`;
     this.#lastFrame.set(key, Date.now());
+    if (!this.#intact(key, frame)) return;
     let decoder = this.#video.get(key);
     // Декодер, на котором случилась ошибка, закрыт навсегда и молча
     // отказывается от всего, что ему дают. Раньше на этом картинка человека
@@ -922,14 +1125,21 @@ export class Playback {
     // ключевого кадра. То же — если собеседник сменил кодек, например, включив
     // демонстрацию, под которую нашёлся аппаратный H.264.
     if (decoder && (decoder.state === 'closed' || this.#codecs.get(key) !== frame.codec)) {
-      if (!frame.keyframe) return;
+      if (!frame.keyframe) {
+        this.#askKeyframe(key, frame);
+        return;
+      }
       shut(decoder);
       this.#video.delete(key);
       decoder = undefined;
     }
     if (!decoder) {
-      // До первого ключевого кадра декодер запускать бессмысленно.
-      if (!frame.keyframe) return;
+      // До первого ключевого кадра декодер запускать бессмысленно — и ждать
+      // планового незачем: просим сразу.
+      if (!frame.keyframe) {
+        this.#askKeyframe(key, frame);
+        return;
+      }
       decoder = new VideoDecoder({
         output: (image) => this.#draw(key, image),
         error: (error) => onError(`декодер картинки: ${error.message}`),
@@ -959,6 +1169,41 @@ export class Playback {
     } catch {
       // Испорченный кадр: декодер закроется, и следующий ключевой его пересоберёт.
     }
+  }
+
+  /**
+   * Цела ли цепочка кадров дорожки.
+   *
+   * Дельта-кадр ссылается на предыдущий. Если тот пропал — ядро выбросило его,
+   * потому что интерфейс не успевал, или отправитель не протолкнул его в канал,
+   * — декодер рисует кашу или молча стоит до планового ключевого кадра, а это
+   * до трёх секунд. Раньше так и было: демонстрация «лагала» на каждой потере.
+   * Теперь пропускаем дельты до ключевого и сразу просим его у отправителя.
+   *
+   * Та же мера, когда декодер не успевает: копить ему очередь — значит
+   * показывать экран со всё растущим опозданием.
+   */
+  #intact(key: string, frame: IncomingFrame): boolean {
+    const previous = this.#seq.get(key);
+    this.#seq.set(key, frame.seq);
+    if (frame.keyframe) {
+      this.#broken.delete(key);
+      return true;
+    }
+    const gap = previous !== undefined && ((frame.seq - previous) >>> 0) !== 1;
+    const backlog = (this.#video.get(key)?.decodeQueueSize ?? 0) > DECODE_BACKLOG;
+    if (gap || backlog) this.#broken.add(key);
+    if (!this.#broken.has(key)) return true;
+    this.#askKeyframe(key, frame);
+    return false;
+  }
+
+  #askKeyframe(key: string, frame: IncomingFrame): void {
+    if (frame.track !== 'video' && frame.track !== 'screen') return;
+    const now = Date.now();
+    if (now - (this.#asked.get(key) ?? 0) < KEYFRAME_ASK_EVERY) return;
+    this.#asked.set(key, now);
+    void invoke('request_keyframe', { author: frame.author, track: frame.track }).catch(() => undefined);
   }
 
   /**
