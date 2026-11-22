@@ -8,8 +8,10 @@
     onclose: () => void;
     children: Snippet;
     footer?: Snippet;
+    /** Широкое окно постоянной высоты — для экранов с разделами, как настройки. */
+    wide?: boolean;
   }
-  const { title, onclose, children, footer }: Props = $props();
+  const { title, onclose, children, footer, wide = false }: Props = $props();
 </script>
 
 <svelte:window
@@ -21,7 +23,7 @@
 />
 
 <div class="scrim" role="presentation" onclick={onclose}></div>
-<div class="dialog" role="dialog" aria-label={title} aria-modal="true">
+<div class="dialog" class:wide role="dialog" aria-label={title} aria-modal="true">
   <header>
     <b>{title}</b>
     <button class="icon-btn" onclick={onclose} aria-label="Закрыть"><Icon name="close" /></button>
@@ -55,6 +57,17 @@
     border-radius: 16px;
     background: var(--bg-raised);
     box-shadow: 0 40px 80px -50px #000;
+    overflow: hidden;
+  }
+  .dialog.wide {
+    width: min(44rem, calc(100vw - 2.5rem));
+    height: min(34rem, 86vh);
+    max-height: none;
+  }
+  .dialog.wide .inner {
+    flex: 1;
+    min-height: 0;
+    padding: 0;
     overflow: hidden;
   }
   header {

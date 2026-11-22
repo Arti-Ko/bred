@@ -46,7 +46,7 @@ class DevicesStore {
   unnamed = $state(false);
   error = $state('');
   /** Виды устройств, список которых вебвью пока прячет. */
-  #hidden = new Set<DeviceKind>();
+  #hidden = $state(new Set<DeviceKind>());
   /** Идущий запрос доступа к звуку — один на всех, кто ждёт. */
   #unlocking: Promise<void> | null = null;
   #watching = false;
@@ -57,6 +57,21 @@ class DevicesStore {
    */
   get canPickSpeaker(): boolean {
     return speakerSelectable() && (this.speakers.length > 0 || this.unnamed);
+  }
+
+  /** Прячет ли вебвью этот вид устройств — до разрешения в этом запуске. */
+  hidden(kind: DeviceKind): boolean {
+    return this.#hidden.has(kind);
+  }
+
+  /**
+   * Показать микрофоны и колонки, если они ещё скрыты. Звук спрашиваем без
+   * кнопки: микрофон открывается на миг, а без этого в списке пусто, хотя
+   * он подключён. Камеру — только по кнопке: её огонёк пугает.
+   */
+  async showAudio(): Promise<void> {
+    await this.refresh();
+    if (this.#hidden.has('mic') || this.#hidden.has('speaker')) await this.#unlockAudio();
   }
 
   list(kind: DeviceKind): DeviceOption[] {
