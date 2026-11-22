@@ -213,12 +213,10 @@ async fn member_who_slept_through_rotation_catches_up() {
     alice.rotate_key(space).await.expect("смена 2");
     assert_eq!(alice.governance(space).unwrap().epoch, 2);
 
+    // Проснулся он со старым ключом, но проверять это нельзя: на быстрой
+    // машине Борис успевает догнать Алису ещё до следующей строки, и тест
+    // падал как раз от того, что догоняние сработало слишком быстро.
     let (boris, _nb) = App::start(&db_b).await.expect("Б снова");
-    assert_eq!(
-        boris.governance(space).unwrap().epoch,
-        0,
-        "проснулся со старым ключом"
-    );
     until(
         "Борис догнал ключ",
         Duration::from_secs(90),
