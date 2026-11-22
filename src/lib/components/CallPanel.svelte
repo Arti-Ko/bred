@@ -72,11 +72,10 @@
     class="call"
     class:expanded={call.expanded}
     class:fullscreen={call.fullscreen}
+    class:adq={prefs.adequate}
     aria-label="Звонок"
   >
-    {#if prefs.adequate}
-      <CallBar {hasScreen} />
-    {:else}
+    {#if !prefs.adequate}
     <header>
       <span class="dot blink">◉</span>
       {#if prefs.adequate}
@@ -213,7 +212,7 @@
         </div>
       {/if}
 
-      <div class="people">
+      <div class="faces">
         <figure class="tile self" class:speaking={call.speakingSelf}>
           <!-- svelte-ignore a11y_media_has_caption -->
           <video bind:this={selfVideo} muted playsinline autoplay class:hidden={!call.camOn}></video>
@@ -308,6 +307,11 @@
       </div>
     </div>
 
+    {#if prefs.adequate}
+      <!-- После сетки: подпись и полоска кнопок лежат поверх неё -->
+      <CallBar {hasScreen} />
+    {/if}
+
     {#if call.fullscreen}
       <!-- Подсказка живёт пару секунд и уходит: постоянная надпись поверх
            чужого экрана закрывает как раз ту строчку, ради которой смотрят. -->
@@ -342,7 +346,7 @@
     padding: var(--gap-4);
   }
   /* Развёрнутый звонок без демонстрации — это лица во весь экран. */
-  .call.expanded .grid:not(.with-screen) .people {
+  .call.expanded .grid:not(.with-screen) .faces {
     flex: 1;
     grid-template-columns: repeat(auto-fit, minmax(min(28rem, 46%), 1fr));
     align-content: center;
@@ -359,10 +363,10 @@
     height: 100%;
     max-height: none;
   }
-  .call.expanded .grid.with-screen .people .tile {
+  .call.expanded .grid.with-screen .faces .tile {
     width: 176px;
   }
-  .grid.only-screen .people {
+  .grid.only-screen .faces {
     display: none;
   }
 
@@ -406,17 +410,123 @@
   .call.fullscreen header:focus-within {
     opacity: 1;
   }
-  .call.fullscreen :global(.bar) {
-    position: absolute;
-    inset: 0 0 auto 0;
-    z-index: 3;
-    background: var(--bg);
+  /* В полном экране подпись и кнопки проявляются по наведению */
+  .call.fullscreen :global(.call-top),
+  .call.fullscreen :global(.call-dock) {
     opacity: 0;
     transition: opacity var(--fast) var(--ease);
   }
-  .call.fullscreen :global(.bar:hover),
-  .call.fullscreen :global(.bar:focus-within) {
+  .call.fullscreen :global(.call-top:hover),
+  .call.fullscreen :global(.call-dock:hover),
+  .call.fullscreen :global(.call-dock:focus-within) {
     opacity: 1;
+  }
+
+  /* ── адекватный режим: сцена как в Дискорде ─────────────────────────── */
+  .call.adq {
+    position: relative;
+    background: var(--bg);
+  }
+  .call.adq.expanded,
+  .call.adq.fullscreen {
+    position: fixed;
+  }
+  /* Место под подпись сверху и полоску кнопок снизу */
+  .call.adq .grid {
+    padding: 42px var(--gap-4) 74px;
+  }
+  .call.adq.fullscreen .grid {
+    padding: 0;
+  }
+  /* Свёрнутый звонок — лица в ряд, по центру; высота ограничена, чтобы
+     лента оставалась видна */
+  .call.adq .faces {
+    grid-template-columns: repeat(auto-fit, minmax(140px, 210px));
+    justify-content: center;
+    max-height: 40vh;
+    /* Место под кольцо говорящего: прокрутка иначе срезает его край */
+    padding: 6px;
+  }
+  /* Развёрнутый — лица делят всё место поровну и целиком помещаются над
+     полоской кнопок, без прокрутки */
+  .call.adq.expanded .grid:not(.with-screen) .faces {
+    grid-template-columns: repeat(auto-fit, minmax(min(24rem, 45%), 1fr));
+    grid-auto-rows: minmax(0, 1fr);
+    justify-content: stretch;
+    align-content: stretch;
+    max-height: none;
+    min-height: 0;
+  }
+  .call.adq.expanded .grid:not(.with-screen) .faces .tile {
+    aspect-ratio: auto;
+    min-height: 0;
+  }
+  .call.adq .tile {
+    aspect-ratio: 16 / 9;
+    border: none;
+    border-radius: 14px;
+    background: var(--bg-raised);
+    box-shadow: 0 0 0 1px var(--line);
+    transition: box-shadow var(--fast) var(--ease);
+  }
+  .call.adq .tile.wide {
+    background: #000;
+  }
+  /* Говорящий — зелёным кольцом: сразу видно, кто сейчас говорит */
+  .call.adq .tile.speaking {
+    box-shadow:
+      0 0 0 2px #7bd393,
+      0 0 0 6px color-mix(in srgb, #7bd393 18%, transparent);
+  }
+  /* Без камеры — аватар кружком по центру, а не на всю плитку */
+  .call.adq .face,
+  .call.adq .placeholder {
+    inset: auto;
+    top: 50%;
+    left: 50%;
+    width: clamp(48px, 34%, 96px);
+    height: auto;
+    aspect-ratio: 1;
+    transform: translate(-50%, -54%);
+    border-radius: 50%;
+  }
+  .call.adq .placeholder {
+    background: var(--lift, var(--bg));
+    color: var(--fg-dim);
+    font-size: clamp(16px, 3vw, 26px);
+    font-weight: 600;
+    letter-spacing: 0.04em;
+  }
+  /* Имя — плашкой в углу, а не белой полосой во всю ширину */
+  .call.adq figcaption {
+    left: 8px;
+    right: auto;
+    bottom: 8px;
+    max-width: calc(100% - 16px);
+    padding: 3px 8px;
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.62);
+    color: #fff;
+    font-weight: 560;
+    backdrop-filter: blur(6px);
+  }
+  .call.adq .grid.with-screen .faces .tile {
+    width: 150px;
+    aspect-ratio: 16 / 9;
+  }
+  .call.adq .alone {
+    align-items: center;
+    text-align: center;
+  }
+  .call.adq .err {
+    position: absolute;
+    left: 50%;
+    bottom: 70px;
+    transform: translateX(-50%);
+    z-index: 5;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--bg-raised);
   }
   /* Имя показывающего — тоже помеха поверх текста. Появляется по наведению. */
   .call.fullscreen figcaption {
@@ -534,7 +644,7 @@
     padding: var(--gap-3) var(--gap-4);
   }
 
-  .people {
+  .faces {
     display: grid;
     grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
     gap: var(--gap-3);
@@ -562,19 +672,19 @@
 
   /* С демонстрацией лица уходят полоской под неё: они здесь затем, чтобы
      видеть, кто говорит, а не чтобы их разглядывать. */
-  .grid.with-screen .people {
+  .grid.with-screen .faces {
     display: flex;
     gap: var(--gap-3);
     overflow-x: auto;
     overflow-y: hidden;
     max-height: none;
   }
-  .grid.with-screen .people .tile {
+  .grid.with-screen .faces .tile {
     flex: 0 0 auto;
     width: 132px;
     aspect-ratio: 16 / 10;
   }
-  .grid.with-screen .people figcaption {
+  .grid.with-screen .faces figcaption {
     font-size: 10px;
   }
 

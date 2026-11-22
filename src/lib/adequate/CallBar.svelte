@@ -64,82 +64,104 @@
   }
 </script>
 
-<div class="bar">
-  <div class="where">
-    <span class="live" aria-hidden="true"></span>
-    <div class="where-text">
-      <b>{channel}</b>
-      <span>{people(count)} в разговоре</span>
-    </div>
-    <button class="net {net.grade}" onclick={() => (linksOpen = true)} title="Связь в звонке: кто до кого как дотягивается">
-      <Icon name="signal" size={14} />
-      <span>{net.label}</span>
-    </button>
-  </div>
+<div class="call-top">
+  <span class="live" aria-hidden="true"></span>
+  <b>{channel}</b>
+  <span class="count">{people(count)}</span>
+  <button class="net {net.grade}" onclick={() => (linksOpen = true)} title="Связь в звонке: кто до кого как дотягивается">
+    <Icon name="signal" size={13} />
+    <span>{net.label}</span>
+  </button>
+</div>
 
-  <div class="controls" role="toolbar" aria-label="Управление звонком">
-    <button class="ctl" class:alert={call.micMuted} aria-pressed={!call.micMuted} onclick={() => call.toggleMic()}>
-      <span class="ic">
-        <Icon name={call.micMuted ? 'mic-off' : 'mic'} size={17} />
-        <!-- Своего голоса не слышно — эхоподавление на то и стоит. Полоска
-             в кнопке показывает, что звук идёт именно от вас. -->
-        <span class="lvl" class:live={call.speakingSelf}>
-          <i style="transform: scaleX({call.micMuted ? 0 : call.level})"></i>
-        </span>
-      </span>
-      <span class="cap">{call.micMuted ? 'Без звука' : 'Микрофон'}</span>
+<div class="call-dock" role="toolbar" aria-label="Управление звонком">
+  <button
+    class="round"
+    class:alert={call.micMuted}
+    aria-pressed={!call.micMuted}
+    aria-label={call.micMuted ? 'Включить микрофон' : 'Выключить микрофон'}
+    data-tip={call.micMuted ? 'Включить микрофон' : 'Выключить микрофон'}
+    onclick={() => call.toggleMic()}
+  >
+    <Icon name={call.micMuted ? 'mic-off' : 'mic'} size={18} />
+    <!-- Своего голоса не слышно — эхоподавление на то и стоит. Полоска в
+         кнопке показывает, что звук идёт именно от вас. -->
+    <span class="lvl" class:live={call.speakingSelf}>
+      <i style="transform: scaleX({call.micMuted ? 0 : call.level})"></i>
+    </span>
+  </button>
+  <button
+    class="round"
+    aria-pressed={call.camOn}
+    aria-label={call.camOn ? 'Выключить камеру' : 'Включить камеру'}
+    data-tip={call.camOn ? 'Выключить камеру' : 'Включить камеру'}
+    onclick={() => call.toggleCamera()}
+  >
+    <Icon name={call.camOn ? 'camera' : 'camera-off'} size={18} />
+  </button>
+  <button
+    class="round"
+    aria-pressed={call.screenOn}
+    aria-label={call.screenOn ? 'Остановить показ' : 'Показать экран'}
+    data-tip={call.screenOn ? 'Остановить показ' : 'Показать экран'}
+    onclick={() => call.toggleScreen()}
+  >
+    <Icon name="screen" size={18} />
+  </button>
+  {#if call.screenOn && call.screenAudioAvailable}
+    <button
+      class="round"
+      aria-pressed={call.screenAudio}
+      aria-label="Звук экрана"
+      data-tip={call.screenAudio ? 'Звук экрана идёт' : 'Звук экрана выключен'}
+      onclick={() => call.toggleScreenAudio()}
+    >
+      <Icon name="speaker" size={18} />
     </button>
-    <button class="ctl" aria-pressed={call.camOn} onclick={() => call.toggleCamera()}>
-      <span class="ic"><Icon name={call.camOn ? 'camera' : 'camera-off'} size={17} /></span>
-      <span class="cap">Камера</span>
-    </button>
-    <button class="ctl" aria-pressed={call.screenOn} onclick={() => call.toggleScreen()}>
-      <span class="ic"><Icon name="screen" size={17} /></span>
-      <span class="cap">{call.screenOn ? 'Идёт показ' : 'Экран'}</span>
-    </button>
-    {#if call.screenOn && call.screenAudioAvailable}
-      <button class="ctl" aria-pressed={call.screenAudio} onclick={() => call.toggleScreenAudio()}>
-        <span class="ic"><Icon name="speaker" size={17} /></span>
-        <span class="cap">Звук экрана</span>
-      </button>
-    {/if}
+  {/if}
 
-    <span class="sep" aria-hidden="true"></span>
+  <span class="sep" aria-hidden="true"></span>
 
-    <!-- У тех, кто в сети, зазвонит звонок с кнопкой «подключиться». -->
-    <button class="ctl" onclick={async () => (call.status = await call.ring())}>
-      <span class="ic"><Icon name="bell" size={17} /></span>
-      <span class="cap">Позвать</span>
+  <!-- У тех, кто в сети, зазвонит звонок с кнопкой «подключиться». -->
+  <button class="round" aria-label="Позвать всех" data-tip="Позвать всех" onclick={async () => (call.status = await call.ring())}>
+    <Icon name="bell" size={18} />
+  </button>
+  {#if SHARE_PLAYER}
+    <button
+      class="round"
+      aria-pressed={call.sharingMusic}
+      aria-label="Слушать вместе"
+      data-tip="Слушать вместе"
+      onclick={() => (call.sharingMusic ? call.stopMusic() : call.toggleMusicPicker())}
+    >
+      <Icon name="speaker" size={18} />
     </button>
-    {#if SHARE_PLAYER}
-      <button
-        class="ctl"
-        aria-pressed={call.sharingMusic}
-        onclick={() => (call.sharingMusic ? call.stopMusic() : call.toggleMusicPicker())}
-      >
-        <span class="ic"><Icon name="speaker" size={17} /></span>
-        <span class="cap">Плеер</span>
-      </button>
-    {/if}
-    {#if hasScreen && call.expanded}
-      <button class="ctl" aria-pressed={call.screenOnly} onclick={() => call.toggleScreenOnly()}>
-        <span class="ic"><Icon name="screen" size={17} /></span>
-        <span class="cap">Только экран</span>
-      </button>
-      <button class="ctl" aria-pressed={call.fullscreen} onclick={() => call.toggleFullscreen()}>
-        <span class="ic"><Icon name="expand" size={17} /></span>
-        <span class="cap">{call.fullscreen ? 'Из полного' : 'Весь экран'}</span>
-      </button>
-    {/if}
-    <button class="ctl" onclick={() => call.toggleExpanded()} title={call.expanded ? 'Esc — свернуть' : undefined}>
-      <span class="ic"><Icon name={call.expanded ? 'collapse' : 'expand'} size={17} /></span>
-      <span class="cap">{call.expanded ? 'Свернуть' : 'Развернуть'}</span>
+  {/if}
+  {#if hasScreen && call.expanded}
+    <button class="round" aria-pressed={call.screenOnly} aria-label="Только экран" data-tip="Только экран" onclick={() => call.toggleScreenOnly()}>
+      <Icon name="screen" size={18} />
     </button>
-    <button class="hangup" onclick={() => call.leave()}>
-      <Icon name="hangup" size={17} />
-      <span>Выйти</span>
+    <button
+      class="round"
+      aria-pressed={call.fullscreen}
+      aria-label={call.fullscreen ? 'Из полного экрана' : 'Во весь экран'}
+      data-tip={call.fullscreen ? 'Из полного экрана' : 'Во весь экран'}
+      onclick={() => call.toggleFullscreen()}
+    >
+      <Icon name="expand" size={18} />
     </button>
-  </div>
+  {/if}
+  <button
+    class="round"
+    aria-label={call.expanded ? 'Свернуть' : 'Развернуть'}
+    data-tip={call.expanded ? 'Свернуть · Esc' : 'Развернуть'}
+    onclick={() => call.toggleExpanded()}
+  >
+    <Icon name={call.expanded ? 'collapse' : 'expand'} size={18} />
+  </button>
+  <button class="hangup" aria-label="Выйти из звонка" data-tip="Выйти из звонка" onclick={() => call.leave()}>
+    <Icon name="hangup" size={20} />
+  </button>
 </div>
 
 {#if linksOpen}
@@ -147,24 +169,28 @@
 {/if}
 
 <style>
-  .bar {
+  .call-top,
+  .call-dock {
     --q-good: #7bd393;
     --q-fair: #e6bd5c;
     --q-bad: #f07467;
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    justify-content: space-between;
-    gap: 10px 16px;
-    padding: 10px 14px;
-    border-bottom: 1px solid var(--line);
+    position: absolute;
+    z-index: 4;
   }
 
-  .where {
+  /* Где идёт разговор — мелко в углу: это справка, а не главное */
+  .call-top {
+    top: 10px;
+    left: 14px;
+    right: 14px;
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
     min-width: 0;
+    pointer-events: none;
+  }
+  .call-top > * {
+    pointer-events: auto;
   }
   .live {
     flex: none;
@@ -172,40 +198,39 @@
     height: 8px;
     border-radius: 50%;
     background: var(--q-good);
-    box-shadow: 0 0 0 0 color-mix(in srgb, var(--q-good) 60%, transparent);
     animation: pulse 2s ease-out infinite;
   }
   @keyframes pulse {
-    to {
+    0% {
+      box-shadow: 0 0 0 0 color-mix(in srgb, var(--q-good) 60%, transparent);
+    }
+    100% {
       box-shadow: 0 0 0 7px transparent;
     }
   }
-  .where-text {
-    display: flex;
-    flex-direction: column;
-    min-width: 0;
-    line-height: 1.25;
-  }
-  .where-text b {
+  .call-top b {
     color: var(--fg-hi);
     font-weight: 640;
+    font-size: var(--text-sm);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .where-text span {
+  .count {
     color: var(--fg-dimmer);
     font-size: var(--text-xs);
+    white-space: nowrap;
   }
 
   .net {
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    margin-left: 4px;
-    padding: 4px 10px;
+    margin-left: auto;
+    padding: 3px 10px;
     border: 1px solid var(--line);
     border-radius: 999px;
+    background: color-mix(in srgb, var(--bg) 80%, transparent);
     color: var(--fg-dim);
     font-size: var(--text-xs);
     font-variant-numeric: tabular-nums;
@@ -214,7 +239,6 @@
   }
   .net:hover {
     border-color: var(--fg-dim);
-    color: var(--fg-hi);
   }
   .net.good {
     color: var(--q-good);
@@ -229,82 +253,112 @@
     border-color: color-mix(in srgb, var(--q-bad) 50%, var(--line));
   }
 
-  .controls {
+  /* Полоска управления — плавает внизу по центру, над плитками */
+  .call-dock {
+    bottom: 12px;
+    left: 50%;
+    transform: translateX(-50%);
     display: flex;
-    flex-wrap: wrap;
-    align-items: stretch;
-    gap: 4px;
+    align-items: center;
+    gap: 6px;
+    padding: 6px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--bg-raised) 92%, transparent);
+    backdrop-filter: blur(12px);
+    box-shadow: 0 18px 40px -20px #000;
+    max-width: calc(100% - 24px);
   }
   .sep {
     width: 1px;
-    margin: 4px 6px;
+    height: 24px;
+    margin: 0 4px;
     background: var(--line);
   }
 
-  .ctl {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 3px;
-    min-width: 62px;
-    padding: 6px 6px 5px;
-    border: 1px solid transparent;
-    border-radius: 10px;
-    color: var(--fg-dim);
-    transition: background var(--fast) var(--ease), color var(--fast) var(--ease), border-color var(--fast) var(--ease);
-  }
-  .ctl:hover {
-    background: var(--lift, var(--bg));
-    color: var(--fg-hi);
-  }
-  .ctl:focus-visible,
-  .net:focus-visible,
-  .hangup:focus-visible {
-    outline: 2px solid var(--edge);
-    outline-offset: 1px;
-  }
-  .ic {
+  .round,
+  .hangup {
     position: relative;
     display: grid;
     place-items: center;
-    width: 34px;
-    height: 28px;
-    border: 1px solid var(--line);
-    border-radius: 8px;
+    flex: none;
+    height: 42px;
+    border-radius: 999px;
+    transition: background var(--fast) var(--ease), color var(--fast) var(--ease), transform var(--fast) var(--ease);
+  }
+  .round {
+    width: 42px;
     background: var(--bg);
+    color: var(--fg-dim);
   }
-  .cap {
-    font-size: 11px;
-    white-space: nowrap;
-  }
-  /* Включённое — инверсией значка */
-  .ctl[aria-pressed='true'] .ic {
-    background: var(--inv-bg);
-    border-color: var(--inv-bg);
-    color: var(--inv-fg);
-  }
-  .ctl[aria-pressed='true'] {
+  .round:hover {
+    background: var(--lift, var(--bg));
     color: var(--fg-hi);
   }
-  /* Микрофон выключен — это предупреждение: говорите, а вас не слышно */
-  .ctl.alert .ic {
-    border-color: color-mix(in srgb, var(--q-bad) 60%, var(--line));
+  .round:active,
+  .hangup:active {
+    transform: scale(0.94);
+  }
+  /* Включённое — светлым кругом */
+  .round[aria-pressed='true'] {
+    background: var(--inv-bg);
+    color: var(--inv-fg);
+  }
+  /* Микрофон выключен — предупреждение: говорите, а вас не слышно */
+  .round.alert {
+    background: color-mix(in srgb, var(--q-bad) 18%, var(--bg));
     color: var(--q-bad);
   }
-  .ctl.alert .cap {
-    color: var(--q-bad);
+  .hangup {
+    width: 58px;
+    margin-left: 4px;
+    background: #d9534a;
+    color: #fff;
+  }
+  .hangup:hover {
+    background: #e8605a;
+  }
+  .round:focus-visible,
+  .hangup:focus-visible,
+  .net:focus-visible {
+    outline: 2px solid var(--edge);
+    outline-offset: 2px;
   }
 
-  /* Уровень своего голоса — тонкой полоской под значком микрофона */
+  /* Подпись кнопки — над ней при наведении */
+  [data-tip]::after {
+    content: attr(data-tip);
+    position: absolute;
+    bottom: calc(100% + 10px);
+    left: 50%;
+    transform: translate(-50%, 4px);
+    padding: 4px 8px;
+    border-radius: 6px;
+    background: var(--inv-bg);
+    color: var(--inv-fg);
+    font-size: 11px;
+    font-weight: 560;
+    white-space: nowrap;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity var(--fast) var(--ease), transform var(--fast) var(--ease);
+  }
+  [data-tip]:hover::after,
+  [data-tip]:focus-visible::after {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+
+  /* Уровень своего голоса — дужкой внизу кнопки микрофона */
   .lvl {
     position: absolute;
-    left: 5px;
-    right: 5px;
-    bottom: 3px;
+    left: 11px;
+    right: 11px;
+    bottom: 7px;
     height: 2px;
     border-radius: 2px;
     overflow: hidden;
-    background: color-mix(in srgb, currentColor 15%, transparent);
+    background: color-mix(in srgb, currentColor 18%, transparent);
   }
   .lvl i {
     position: absolute;
@@ -316,24 +370,6 @@
   }
   .lvl.live i {
     opacity: 1;
-  }
-
-  .hangup {
-    display: inline-flex;
-    align-items: center;
-    align-self: center;
-    gap: 8px;
-    margin-left: 6px;
-    padding: 9px 14px;
-    border: 1px solid color-mix(in srgb, var(--q-bad) 70%, transparent);
-    border-radius: 10px;
-    background: color-mix(in srgb, var(--q-bad) 16%, transparent);
-    color: var(--fg-hi);
-    font-weight: 620;
-    transition: background var(--fast) var(--ease);
-  }
-  .hangup:hover {
-    background: color-mix(in srgb, var(--q-bad) 32%, transparent);
   }
 
   @media (prefers-reduced-motion: reduce) {
