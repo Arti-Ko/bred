@@ -45,6 +45,10 @@ class DevicesStore {
    */
   unnamed = $state(false);
   error = $state('');
+  /** Виды устройств, список которых вебвью пока прячет. */
+  #hidden = new Set<DeviceKind>();
+  /** Идущий запрос доступа к звуку — один на всех, кто ждёт. */
+  #unlocking: Promise<void> | null = null;
   #watching = false;
 
   /**
@@ -65,13 +69,13 @@ class DevicesStore {
     try {
       const all = await navigator.mediaDevices.enumerateDevices();
       const lists: Record<DeviceKind, DeviceOption[]> = { mic: [], camera: [], speaker: [] };
-      let unnamed = false;
+      const hidden = new Set<DeviceKind>();
       all.forEach((device, index) => {
         if (isAlias(device)) {
-          if (!device.label && device.kind !== 'audiooutput') unnamed = true;
+          if (!device.label && device.kind !== 'audiooutput') hidden.add(KIND[device.kind]);
           return;
         }
-        if (!device.label) unnamed = true;
+        if (!device.label) hidden.add(KIND[device.kind]);
         lists[KIND[device.kind]].push({
           id: device.deviceId,
           label: device.label || `устройство ${index + 1}`,
@@ -80,7 +84,8 @@ class DevicesStore {
       this.mics = lists.mic;
       this.cameras = lists.camera;
       this.speakers = lists.speaker;
-      this.unnamed = unnamed;
+      this.#hidden = hidden;
+      this.unnamed = hidden.size > 0;
       this.error = '';
     } catch (issue) {
       this.error = issue instanceof Error ? issue.message : String(issue);
@@ -111,11 +116,19 @@ class DevicesStore {
    * Пусто — системное по умолчанию: и когда ничего не выбрано, и когда
    * выбранное сейчас не подключено. Звонок без наушников, которые остались
    * дома, должен идти через встроенный микрофон, а не не идти вовсе.
+   *
+   * Но «не подключено» надо знать наверняка. Пока в этом запуске не дано
+   * разрешение, WKWebView прячет список: ни id, ни названий. Раньше выбранный
+   * микрофон в таком списке «не находился», и звонок молча шёл через
+   * встроенный — а у ноутбука с закрытой крышкой тот заглушён, и человека не
+   * было слышно вовсе. Поэтому сначала открываем звук — он всё равно сейчас
+   * понадобится, — и только потом сверяемся.
    */
   async resolve(kind: DeviceKind): Promise<string> {
     const chosen = prefs.devices[kind];
     if (!chosen) return '';
     await this.refresh();
+    if (kind !== 'camera' && this.#hidden.has(kind)) await this.#unlockAudio();
     const list = this.list(kind);
     const exact = list.find((device) => device.id === chosen.id);
     if (exact) return exact.id;
@@ -124,7 +137,24 @@ class DevicesStore {
       prefs.setDevice(kind, { id: byName.id, label: byName.label });
       return byName.id;
     }
+    // Камеру ради списка не включаем — мигнул бы огонёк. Берём сохранённый
+    // id как есть: если устройства нет, openDevice сам возьмёт системное.
+    if (this.#hidden.has(kind)) return chosen.id;
     return '';
+  }
+
+  /** Разрешение на звук, чтобы вебвью показал микрофоны и колонки. */
+  async #unlockAudio(): Promise<void> {
+    this.#unlocking ??= (async () => {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((track) => track.stop());
+      } catch {
+        // Отказали или микрофона нет — останется системное.
+      }
+      await this.refresh();
+    })().finally(() => (this.#unlocking = null));
+    await this.#unlocking;
   }
 
   /** Подключено ли выбранное устройство прямо сейчас. */
