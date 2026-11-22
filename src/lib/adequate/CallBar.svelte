@@ -254,18 +254,22 @@
   }
 
   /* Полоска управления — плавает внизу по центру, над плитками */
+  /* По центру — полями, а не transform: сдвиг на -50% ставит слой на
+     полпикселя, и WKWebView рисует кнопки и значки мылом. По той же причине
+     без backdrop-filter — фон сплошной. */
   .call-dock {
     bottom: 12px;
-    left: 50%;
-    transform: translateX(-50%);
+    left: 0;
+    right: 0;
+    width: fit-content;
+    margin-inline: auto;
     display: flex;
     align-items: center;
     gap: 6px;
     padding: 6px;
     border: 1px solid var(--line);
     border-radius: 999px;
-    background: color-mix(in srgb, var(--bg-raised) 92%, transparent);
-    backdrop-filter: blur(12px);
+    background: var(--bg-raised);
     box-shadow: 0 18px 40px -20px #000;
     max-width: calc(100% - 24px);
   }
@@ -330,8 +334,10 @@
     content: attr(data-tip);
     position: absolute;
     bottom: calc(100% + 10px);
-    left: 50%;
-    transform: translate(-50%, 4px);
+    left: -60px;
+    right: -60px;
+    width: max-content;
+    margin-inline: auto;
     padding: 4px 8px;
     border-radius: 6px;
     background: var(--inv-bg);
@@ -341,12 +347,11 @@
     white-space: nowrap;
     opacity: 0;
     pointer-events: none;
-    transition: opacity var(--fast) var(--ease), transform var(--fast) var(--ease);
+    transition: opacity var(--fast) var(--ease);
   }
   [data-tip]:hover::after,
   [data-tip]:focus-visible::after {
     opacity: 1;
-    transform: translate(-50%, 0);
   }
 
   /* Уровень своего голоса — дужкой внизу кнопки микрофона */

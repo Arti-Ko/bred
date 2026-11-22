@@ -481,13 +481,12 @@
   /* Без камеры — аватар кружком по центру, а не на всю плитку */
   .call.adq .face,
   .call.adq .placeholder {
-    inset: auto;
-    top: 50%;
-    left: 50%;
+    /* По центру полями, а не translate: сдвиг на полпикселя мылит буквы */
+    inset: 0 0 8% 0;
+    margin: auto;
     width: clamp(48px, 34%, 96px);
     height: auto;
     aspect-ratio: 1;
-    transform: translate(-50%, -54%);
     border-radius: 50%;
   }
   .call.adq .placeholder {
@@ -505,10 +504,9 @@
     max-width: calc(100% - 16px);
     padding: 3px 8px;
     border-radius: 6px;
-    background: rgba(0, 0, 0, 0.62);
+    background: rgba(0, 0, 0, 0.72);
     color: #fff;
     font-weight: 560;
-    backdrop-filter: blur(6px);
   }
   .call.adq .grid.with-screen .faces .tile {
     width: 150px;
@@ -520,9 +518,11 @@
   }
   .call.adq .err {
     position: absolute;
-    left: 50%;
+    left: 0;
+    right: 0;
+    width: fit-content;
+    margin-inline: auto;
     bottom: 70px;
-    transform: translateX(-50%);
     z-index: 5;
     border: 1px solid var(--line);
     border-radius: 8px;
