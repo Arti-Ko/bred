@@ -1,6 +1,7 @@
 <script lang="ts">
   import { call, SHARE_PLAYER } from '../stores/call.svelte';
   import PlayerPanel from './PlayerPanel.svelte';
+  import CallBar from '../adequate/CallBar.svelte';
   import { prefs } from '../stores/prefs.svelte';
   import { session } from '../stores/session.svelte';
   import { previewUrl } from '../previews';
@@ -73,6 +74,9 @@
     class:fullscreen={call.fullscreen}
     aria-label="Звонок"
   >
+    {#if prefs.adequate}
+      <CallBar {hasScreen} />
+    {:else}
     <header>
       <span class="dot blink">◉</span>
       {#if prefs.adequate}
@@ -163,6 +167,7 @@
         {prefs.adequate ? 'Выйти' : 'выйти [^E]'}
       </button>
     </header>
+    {/if}
 
     <PlayerPanel />
 
@@ -288,7 +293,13 @@
           </figure>
         {/each}
 
-        {#if others.length === 0 && !hasScreen}
+        {#if others.length === 0 && !hasScreen && prefs.adequate}
+          <div class="alone">
+            <b>Пока вы одни</b>
+            <span>Позовите — у всех, кто в сети, зазвонит звонок.</span>
+            <button class="btn small" onclick={async () => (call.status = await call.ring())}>Позвать всех</button>
+          </div>
+        {:else if others.length === 0 && !hasScreen}
           <p class="empty">
             никого больше нет. позовите: <b>^I</b> — ссылка в пространство,
             <b>/визитка</b> — ссылка для связи один на один
@@ -393,6 +404,18 @@
   }
   .call.fullscreen header:hover,
   .call.fullscreen header:focus-within {
+    opacity: 1;
+  }
+  .call.fullscreen :global(.bar) {
+    position: absolute;
+    inset: 0 0 auto 0;
+    z-index: 3;
+    background: var(--bg);
+    opacity: 0;
+    transition: opacity var(--fast) var(--ease);
+  }
+  .call.fullscreen :global(.bar:hover),
+  .call.fullscreen :global(.bar:focus-within) {
     opacity: 1;
   }
   /* Имя показывающего — тоже помеха поверх текста. Появляется по наведению. */
@@ -717,6 +740,25 @@
     text-overflow: ellipsis;
   }
 
+  .alone {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 6px;
+    padding: 4px var(--gap-4);
+  }
+  .alone b {
+    color: var(--fg-hi);
+    font-weight: 620;
+  }
+  .alone span {
+    color: var(--fg-dimmer);
+    font-size: var(--text-sm);
+  }
+  .alone .btn {
+    margin-top: 4px;
+  }
   .empty {
     grid-column: 1 / -1;
     margin: 0;

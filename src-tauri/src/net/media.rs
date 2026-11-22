@@ -37,6 +37,7 @@ use std::{
 };
 use tokio::sync::mpsc::Sender;
 
+use super::quality::{self, LinkBook, LinkReport, LinkStat, Sample};
 use super::{
     ctx::{Ctx, Notice},
     wire::Presence,
@@ -622,6 +623,8 @@ pub struct Media {
     rtt_floor: Mutex<HashMap<EndpointId, (Duration, Instant)>>,
     /// Когда последний раз просили свой кодировщик о ключевом кадре.
     keyframe_asked: Mutex<Option<Instant>>,
+    /// Замеры связи: свои и присланные другими — для окна «Связь».
+    quality: Mutex<LinkBook>,
     links: AtomicU64,
     /// Отсчёт для отметок живости: `Instant` в атомик не положить.
     epoch: Instant,
@@ -648,6 +651,7 @@ impl Media {
             dialing: Mutex::new(HashMap::new()),
             governors: Mutex::new(HashMap::new()),
             keyframe_asked: Mutex::new(None),
+            quality: Mutex::new(LinkBook::default()),
             sent_at: Mutex::new(HashMap::new()),
             rtt_floor: Mutex::new(HashMap::new()),
             links: AtomicU64::new(0),
@@ -720,6 +724,7 @@ impl Media {
         self.reassembly.lock().clear();
         self.dialing.lock().clear();
         self.governors.lock().clear();
+        self.quality.lock().clear();
         tracing::info!("вышли из звонка");
     }
 
@@ -1018,6 +1023,8 @@ impl Media {
             // может ещё и нести просьбу о ключевом кадре.
             if keyframe_wanted_from(&data, self.ctx.identity.id()) {
                 self.want_keyframe();
+            } else if let Some(links) = quality::decode(&data) {
+                self.quality.lock().hear(link.author, links);
             }
             return;
         }
@@ -1079,7 +1086,10 @@ impl Media {
                 // Отметка живости — тем же тиком: отдельный таймер ради
                 // сорока пяти байт в секунду не нужен.
                 if self.call.read().is_some() {
-                    let _ = self.broadcast(Track::Ping, false, 0, 0, &[]);
+                    // Заодно — отчёт о своей связи: остальным видно, у кого
+                    // беда, а не только что мы живы.
+                    let report = quality::encode(&self.measure_links());
+                    let _ = self.broadcast(Track::Ping, false, 0, 0, &report);
                 }
             }
         });
@@ -1276,6 +1286,33 @@ impl Media {
                 }
             }
         });
+    }
+
+    /// Замерить связь со всеми собеседниками: задержка, потери, путь.
+    fn measure_links(&self) -> Vec<LinkStat> {
+        let samples: Vec<Sample> = self
+            .peers
+            .read()
+            .values()
+            .filter_map(|peer| {
+                let paths = peer.connection.paths();
+                let path = paths.iter().find(|path| path.is_selected())?;
+                let stats = path.stats();
+                Some(Sample {
+                    peer: peer.state.author,
+                    rtt: stats.rtt,
+                    relay: path.is_relay(),
+                    lost: stats.lost_packets,
+                    sent: stats.udp_tx.datagrams,
+                })
+            })
+            .collect();
+        self.quality.lock().measure(&samples).to_vec()
+    }
+
+    /// Связь в звонке для окна «Связь»: своя и та, что прислали другие.
+    pub fn link_report(&self) -> LinkReport {
+        self.quality.lock().report()
     }
 
     /// Растёт ли задержка хоть до кого-то и идёт ли кто-то через ретранслятор.

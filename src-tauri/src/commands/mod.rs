@@ -636,6 +636,12 @@ pub fn request_keyframe(app: State<'_, Arc<App>>, author: Id, track: String) -> 
         .map_err(|err| err.to_string())
 }
 
+/// Связь в звонке: своя с каждым и как её видят остальные.
+#[tauri::command]
+pub fn call_links(app: State<'_, Arc<App>>) -> crate::net::quality::LinkReport {
+    app.net.media().link_report()
+}
+
 /// Громкость общего плеера у себя.
 #[tauri::command]
 pub fn set_music_volume(app: State<'_, Arc<App>>, gain: f32) -> Answer<()> {

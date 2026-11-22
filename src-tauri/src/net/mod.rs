@@ -16,6 +16,7 @@ pub mod dns;
 pub mod invite;
 mod lan;
 pub mod media;
+pub mod quality;
 pub mod ring;
 pub mod sync;
 pub mod wire;

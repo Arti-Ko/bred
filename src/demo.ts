@@ -193,6 +193,19 @@ const HANDLERS: Record<string, (args: Args) => unknown> = {
     channel: id('standup'),
     participants: [ME, MEMBERS[0].id, MEMBERS[1].id],
   }),
+  call_links: () => {
+    const [marina, timur] = [MEMBERS[0].id, MEMBERS[1].id];
+    return {
+      mine: [
+        { peer: marina, rtt_ms: 38, relay: false, loss: 0 },
+        { peer: timur, rtt_ms: 312, relay: true, loss: 6 },
+      ],
+      others: [
+        { from: marina, age_ms: 400, links: [{ peer: ME, rtt_ms: 41, relay: false, loss: 0 }, { peer: timur, rtt_ms: 341, relay: true, loss: 6 }] },
+        { from: timur, age_ms: 700, links: [{ peer: ME, rtt_ms: 305, relay: true, loss: 7 }, { peer: marina, rtt_ms: 338, relay: true, loss: 9 }] },
+      ],
+    };
+  },
   get_message: () => null,
   mark_read: () => null,
   join_call: () => null,

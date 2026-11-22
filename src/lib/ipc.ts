@@ -213,6 +213,29 @@ export interface PlayerState {
 
 export type PlayerCommand = 'toggle' | 'next' | 'previous';
 
+/** Связь с одним собеседником, как её меряет ядро. */
+export interface LinkStat {
+  peer: Id;
+  /** Время туда и обратно, мс; 0 — ещё не измерено. */
+  rtt_ms: number;
+  /** Через ретранслятор, а не напрямую. */
+  relay: boolean;
+  /** Потери пакетов за последнюю секунду, проценты. */
+  loss: number;
+}
+
+/** Отчёт другого участника о его связи. */
+export interface PeerReport {
+  from: Id;
+  age_ms: number;
+  links: LinkStat[];
+}
+
+export interface LinkReport {
+  mine: LinkStat[];
+  others: PeerReport[];
+}
+
 export const api = {
   bootstrap: () => invoke<Bootstrap>('bootstrap'),
   lockState: () => invoke<boolean>('lock_state'),
@@ -303,6 +326,8 @@ export const api = {
   setVoiceVolume: (author: Id, gain: number) => invoke<void>('set_voice_volume', { author, gain }),
   requestKeyframe: (author: Id, track: 'video' | 'screen') =>
     invoke<void>('request_keyframe', { author, track }),
+  /** Связь в звонке: своя с каждым и как её видят остальные. */
+  callLinks: () => invoke<LinkReport>('call_links'),
   setMusicVolume: (gain: number) => invoke<void>('set_music_volume', { gain }),
   musicControl: (command: PlayerCommand) => invoke<void>('music_control', { command }),
   playerState: (space: Id) => invoke<PlayerState | null>('player_state', { space }),
