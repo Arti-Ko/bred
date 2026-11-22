@@ -1,6 +1,6 @@
 [package]
 name = "bred"
-version = "0.8.7"
+version = "0.8.8"
 description = "БРЕД — Быстрая Ретрансляция Электронных Данных"
 edition = "2021"
 rust-version = "1.91"
@@ -46,7 +46,7 @@ rusqlite = { version = "0.40", features = ["bundled-sqlcipher"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.151"
 socket2 = "0.6.5"
-tauri = { version = "2" }
+tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2.7.2"
 tauri-plugin-notification = "2.3.3"
 thiserror = "2.0.19"
