@@ -6,6 +6,7 @@
   // слышно», «как выглядит», «кто может прочитать», «что за версия» — и
   // открытый раздел помещается в окно целиком.
 
+  import { onDestroy, untrack } from 'svelte';
   import Avatar from './Avatar.svelte';
   import Dialog from './Dialog.svelte';
   import Icon from './Icon.svelte';
@@ -20,6 +21,7 @@
   import { report } from '../stores/report.svelte';
   import { session } from '../stores/session.svelte';
   import { updates } from '../stores/updates.svelte';
+  import { MicTest } from '../mictest';
 
   interface Props {
     onclose: () => void;
@@ -86,6 +88,43 @@
   $effect(() => {
     if (tab === 'space' && !session.spaceId) tab = 'profile';
   });
+
+  // Проверка микрофона: слышать себя и видеть уровень.
+  let test = $state<MicTest | null>(null);
+  let level = $state(0);
+  let testError = $state('');
+
+  async function startTest(): Promise<void> {
+    stopTest();
+    testError = '';
+    const fresh = new MicTest();
+    test = fresh;
+    try {
+      const [mic, speaker] = await Promise.all([devices.resolve('mic'), devices.resolve('speaker')]);
+      await fresh.start(mic, speaker, (value) => (level = value));
+    } catch (issue) {
+      if (test === fresh) stopTest();
+      testError = `микрофон не открылся: ${errorText(issue)}`;
+    }
+  }
+
+  function stopTest(): void {
+    test?.stop();
+    test = null;
+    level = 0;
+  }
+
+  async function pickDevice(kind: DeviceKind, id: string): Promise<void> {
+    await call.chooseDevice(kind, id);
+    // Сменили микрофон или колонки посреди проверки — слушать уже новые.
+    if (test && kind !== 'camera') await startTest();
+  }
+
+  // Ушли из раздела или закрыли настройки — микрофон отпускаем.
+  $effect(() => {
+    if (tab !== 'media') untrack(stopTest);
+  });
+  onDestroy(() => test?.stop());
 
   async function copy(value: string, what: string): Promise<void> {
     try {
@@ -176,7 +215,7 @@
                 <select
                   class="input"
                   value={devices.selected(row.kind)}
-                  onchange={(event) => void call.chooseDevice(row.kind, event.currentTarget.value)}
+                  onchange={(event) => void pickDevice(row.kind, event.currentTarget.value)}
                 >
                   <option value="">Как в системе</option>
                   {#each devices.choices(row.kind) as device (device.id)}
@@ -195,6 +234,22 @@
             </button>
           {/if}
           {#if devices.error}<p class="error">{devices.error}</p>{/if}
+        </div>
+        <div class="block">
+          <span class="field-label">Проверка микрофона</span>
+          <div class="mic-test">
+            <button class="btn" class:primary={!test} onclick={() => (test ? stopTest() : void startTest())}>
+              {test ? 'Остановить' : 'Послушать себя'}
+            </button>
+            <div class="meter" role="meter" aria-label="Уровень микрофона" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(level * 100)}>
+              <div class="meter-fill" style:transform="scaleX({level})"></div>
+            </div>
+          </div>
+          <p class="hint-text">
+            Звук пойдёт в выбранные колонки — так, как его слышат в звонке. Лучше в наушниках:
+            из колонок он вернётся в микрофон и засвистит.
+          </p>
+          {#if testError}<p class="error">{testError}</p>{/if}
         </div>
         <div class="block">
           <div class="switch">
@@ -495,6 +550,25 @@
   .field select.input {
     width: 100%;
     cursor: pointer;
+  }
+  .mic-test {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+  .meter {
+    flex: 1;
+    height: 8px;
+    border-radius: 999px;
+    background: var(--bg);
+    border: 1px solid var(--line);
+    overflow: hidden;
+  }
+  .meter-fill {
+    height: 100%;
+    background: var(--fg-hi);
+    transform-origin: left center;
+    transition: transform 60ms linear;
   }
   .input.muted {
     color: var(--fg-dimmer);

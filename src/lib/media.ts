@@ -272,7 +272,7 @@ export interface CaptureOptions {
  * Выбор в настройках — пожелание, а не условие: наушники могли остаться в
  * другой комнате, и звонок без них лучше, чем звонок, который не начался.
  */
-async function openDevice(
+export async function openDevice(
   kind: 'audio' | 'video',
   base: MediaTrackConstraints,
   deviceId: string | undefined,
@@ -292,7 +292,7 @@ async function openDevice(
   return navigator.mediaDevices.getUserMedia({ [kind]: base });
 }
 
-const MIC: MediaTrackConstraints = {
+export const MIC: MediaTrackConstraints = {
   echoCancellation: true,
   noiseSuppression: true,
   autoGainControl: true,
