@@ -79,6 +79,101 @@ pub fn track(mut current: Interface) {
     });
 }
 
+/// Как часто сторож смотрит на ретрансляторы.
+const GUARD_TICK: Duration = Duration::from_secs(10);
+/// За какое окно считаем неответившие пинги.
+const GUARD_WINDOW: Duration = Duration::from_secs(60);
+/// Сколько неответивших пингов за окно — уже не случайность, а заморозка.
+const GUARD_TIMEOUTS: u64 = 3;
+/// Не переключаемся чаще: после смены дороге нужно время показать себя.
+const GUARD_HOLD: Duration = Duration::from_secs(120);
+
+/// Сторож дороги: мимо VPN или через него.
+///
+/// Обход VPN спасает, когда туннель лежит. Но бывает наоборот: VPN жив, а
+/// напрямую ТСПУ замораживает соединения с ретрансляторами на зарубежных
+/// хостингах — пинги к ним раз за разом уходят без ответа, звук стоит по 15
+/// секунд (27.11.2026, друг на Windows). Тогда пускаем БРЕД через туннель. Если
+/// и там ретрансляторы молчат или туннель пропал — возвращаемся напрямую.
+pub fn guard(endpoint: iroh::Endpoint, direct: Interface) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(GUARD_TICK);
+        let mut samples: std::collections::VecDeque<(std::time::Instant, u64)> =
+            std::collections::VecDeque::new();
+        let mut switched = std::time::Instant::now();
+        let mut through_vpn = false;
+        loop {
+            ticker.tick().await;
+            if endpoint.is_closed() {
+                return;
+            }
+            let now = std::time::Instant::now();
+            samples.push_back((now, iroh::bred::relay_ping_timeouts()));
+            while samples
+                .front()
+                .is_some_and(|(at, _)| now.duration_since(*at) > GUARD_WINDOW)
+            {
+                samples.pop_front();
+            }
+            let frozen = recent_timeouts(&samples) >= GUARD_TIMEOUTS;
+            let held = now.duration_since(switched) >= GUARD_HOLD;
+            let tunnel = tunnel_present();
+
+            let next = decide(through_vpn, frozen, held, tunnel);
+            if next == through_vpn {
+                continue;
+            }
+            through_vpn = next;
+            switched = now;
+            samples.clear();
+            if through_vpn {
+                bred_netbind::set(None);
+                tracing::warn!("ретрансляторы напрямую замерзают — идём через VPN");
+            } else {
+                // Физический интерфейс мог смениться, пока шли через туннель.
+                let iface = physical()
+                    .into_iter()
+                    .find(|i| i == &direct)
+                    .or_else(|| physical().into_iter().next())
+                    .unwrap_or_else(|| direct.clone());
+                bred_netbind::set(Some(iface.index));
+                tracing::warn!(interface = %iface.name, "через VPN не лучше — снова мимо него");
+                track(iface);
+            }
+            // Привязка новая — iroh пересоздаёт сокеты и переподключает ретранслятор.
+            endpoint.network_change().await;
+        }
+    });
+}
+
+/// Сколько пингов осталось без ответа за окно выборок.
+fn recent_timeouts(samples: &std::collections::VecDeque<(std::time::Instant, u64)>) -> u64 {
+    match (samples.front(), samples.back()) {
+        (Some((_, first)), Some((_, last))) => last.saturating_sub(*first),
+        _ => 0,
+    }
+}
+
+/// Куда идти дальше: `true` — через VPN.
+fn decide(through_vpn: bool, frozen: bool, held: bool, tunnel: bool) -> bool {
+    if through_vpn {
+        // Туннель пропал — делать в нём нечего; молчит и там — пробуем напрямую.
+        !(!tunnel || (frozen && held))
+    } else {
+        frozen && held && tunnel
+    }
+}
+
+/// Есть ли в системе поднятый VPN-туннель.
+pub fn tunnel_present() -> bool {
+    netdev::get_interfaces().into_iter().any(|i| {
+        i.is_up()
+            && !i.is_loopback()
+            && !i.ipv4.is_empty()
+            && (i.is_tun() || i.is_point_to_point() || looks_like_tunnel(&i.name))
+    })
+}
+
 /// Физические интерфейсы со шлюзом, по порядку системы. Туннели, петля и
 /// точка-точка (PPP, большинство VPN) не годятся.
 fn physical() -> Vec<Interface> {
@@ -94,6 +189,14 @@ fn physical() -> Vec<Interface> {
             })
         })
         .collect()
+}
+
+/// IPv4-адрес интерфейса по его номеру — чтобы ходить по HTTP той же дорогой.
+pub fn ipv4_of(index: NonZeroU32) -> Option<std::net::Ipv4Addr> {
+    netdev::get_interfaces()
+        .into_iter()
+        .find(|i| i.index == index.get())
+        .and_then(|i| i.ipv4.first().map(|net| net.addr()))
 }
 
 /// Туннели, которые система честно туннелями не называет.
@@ -141,6 +244,37 @@ async fn online_via(index: NonZeroU32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn goes_through_vpn_only_when_relays_freeze_and_tunnel_is_up() {
+        // Мимо VPN: переключаемся, только если всё сразу.
+        assert!(decide(false, true, true, true));
+        assert!(!decide(false, true, true, false), "без туннеля некуда");
+        assert!(
+            !decide(false, true, false, true),
+            "рано после прошлой смены"
+        );
+        assert!(!decide(false, false, true, true), "ретрансляторы живы");
+        // Через VPN: остаёмся, пока туннель есть и там не хуже.
+        assert!(decide(true, false, true, true));
+        assert!(decide(true, true, false, true), "рано судить");
+        assert!(
+            !decide(true, false, false, false),
+            "туннель пропал — сразу назад"
+        );
+        assert!(!decide(true, true, true, true), "и там молчат — назад");
+    }
+
+    #[test]
+    fn counts_timeouts_within_window() {
+        let t = std::time::Instant::now();
+        let mut samples = std::collections::VecDeque::new();
+        assert_eq!(recent_timeouts(&samples), 0);
+        samples.push_back((t, 10));
+        samples.push_back((t, 11));
+        samples.push_back((t, 14));
+        assert_eq!(recent_timeouts(&samples), 4);
+    }
 
     #[test]
     fn tunnels_are_recognised_by_name() {

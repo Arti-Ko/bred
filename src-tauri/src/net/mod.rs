@@ -13,6 +13,7 @@ pub mod blobs;
 pub mod bypass;
 pub mod ctx;
 pub mod dns;
+mod hint;
 pub mod invite;
 mod lan;
 pub mod media;
@@ -216,7 +217,8 @@ impl Net {
     pub async fn spawn(ctx: Arc<Ctx>) -> Result<Arc<Self>> {
         // Мимо VPN — до того, как iroh создаст первый сокет: привязка
         // применяется к каждому новому сокету, старые она не трогает.
-        if let Some(interface) = bypass::engage().await {
+        let direct = bypass::engage().await;
+        if let Some(interface) = direct.clone() {
             bypass::track(interface);
         }
         let lookup = MemoryLookup::new();
@@ -252,6 +254,13 @@ impl Net {
         }
 
         let endpoint = builder.bind().await?;
+
+        if let Some(interface) = direct {
+            bypass::guard(endpoint.clone(), interface);
+        }
+        if !hide_ip {
+            hint::watch(endpoint.clone());
+        }
 
         let gossip = Gossip::builder().spawn(endpoint.clone());
         // Приёму гостей нужна сама сеть — разослать запись о входе. Сети ещё

@@ -19,10 +19,21 @@ use std::{
 };
 
 static INTERFACE: AtomicU32 = AtomicU32::new(0);
+/// Сколько раз привязка менялась: по нему `netwatch` понимает, что сокеты
+/// пора пересоздать, даже если сами интерфейсы остались прежними.
+static GENERATION: AtomicU32 = AtomicU32::new(0);
 
 /// Привязывать новые сокеты к интерфейсу с этим номером. `None` — не привязывать.
 pub fn set(index: Option<NonZeroU32>) {
-    INTERFACE.store(index.map_or(0, NonZeroU32::get), Ordering::Relaxed);
+    let value = index.map_or(0, NonZeroU32::get);
+    if INTERFACE.swap(value, Ordering::Relaxed) != value {
+        GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Номер поколения привязки — меняется при каждой смене интерфейса.
+pub fn generation() -> u32 {
+    GENERATION.load(Ordering::Relaxed)
 }
 
 /// Номер интерфейса, к которому сейчас привязываются сокеты.

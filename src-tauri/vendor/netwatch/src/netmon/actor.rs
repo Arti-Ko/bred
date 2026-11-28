@@ -94,6 +94,7 @@ impl Actor {
 
         let mut pending_change = false;
         let mut pending_time_jump = false;
+        let mut bind_generation = bred_netbind::generation();
         let debounce = time::sleep(DEBOUNCE);
         tokio::pin!(debounce);
         let mut wall_time_interval = time::interval(POLL_WALL_TIME_INTERVAL);
@@ -130,6 +131,13 @@ impl Actor {
                         Some(ActorMessage::NetworkChange) => {
                             trace!("external network activity detected");
                             pending_change = true;
+                            // bred: привязка сокетов сменилась (через VPN / мимо
+                            // него) — интерфейсы те же, но сокеты надо пересоздать.
+                            let generation = bred_netbind::generation();
+                            if generation != bind_generation {
+                                bind_generation = generation;
+                                pending_time_jump = true;
+                            }
                             debounce.as_mut().reset(Instant::now() + DEBOUNCE);
                         }
                         None => {

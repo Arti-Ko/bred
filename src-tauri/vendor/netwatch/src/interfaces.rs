@@ -317,6 +317,11 @@ impl State {
 
     /// Is this a major change compared to the `old` one?.
     pub fn is_major_change(&self, old: &State) -> bool {
+        // bred: пробуждение и принудительная смена привязки — тоже крупная
+        // смена: сокеты пересоздаются, ретранслятор проверяется заново.
+        if self.last_unsuspend != old.last_unsuspend {
+            return true;
+        }
         if self.have_v6 != old.have_v6
             || self.have_v4 != old.have_v4
             || self.is_expensive != old.is_expensive

@@ -1,6 +1,6 @@
 [package]
 name = "bred"
-version = "0.8.8"
+version = "0.8.9"
 description = "БРЕД — Быстрая Ретрансляция Электронных Данных"
 edition = "2021"
 rust-version = "1.91"
@@ -101,10 +101,12 @@ windows = { version = "0.62.2", features = [
 ] }
 
 [patch.crates-io]
-# Наши копии с одной правкой в каждой: сокеты идут мимо VPN (vendor/bred-netbind).
+# Наши копии с правками: сокеты мимо VPN (vendor/bred-netbind), частый пинг ретранслятора.
 # При обновлении iroh — скопировать свежие версии и перенести правки (ищи
 # «bred_netbind» в vendor/netwatch/src/udp.rs и vendor/iroh-relay/src/client/tls.rs).
 netwatch = { path = "vendor/netwatch" }
+# iroh — ради частого пинга ретранслятора (ищи «bred:» в vendor/iroh/src).
+iroh = { path = "vendor/iroh" }
 iroh-relay = { path = "vendor/iroh-relay" }
 
 [profile.dev]
